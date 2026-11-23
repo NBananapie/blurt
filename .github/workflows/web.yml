@@ -6,7 +6,7 @@ name: web
 # real WKWebView with the macos host.
 on:
   push:
-    branches: [main]
+    branches: [main, windows]
     paths: ["web/**", "skills/blurt/scripts/review.py", "skills/blurt/scripts/items.py", "skills/blurt/scripts/_common.py",
             "skills/blurt/scripts/review.html", "tests/fixtures/sessions/**", ".github/workflows/web.yml"]
   pull_request:

@@ -7,7 +7,7 @@ name: capture
 #   windows: crate build + tests (lavfi screen), the ffmpeg-engine unit tests, overlay windows open
 on:
   push:
-    branches: [main]
+    branches: [main, windows]
     paths:
       - "crates/blurt-capture/**"
       - "web/apps/overlays/**"

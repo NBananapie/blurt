@@ -4,7 +4,7 @@ name: check
 # Runs only when the skill or tests change; Linux + Windows (paths, encodings, console code pages differ), ~1 min each.
 on:
   push:
-    branches: [main]
+    branches: [main, windows]
     paths: ["skills/**", "tests/**", ".github/workflows/check.yml"]
   pull_request:
     paths: ["skills/**", "tests/**", ".github/workflows/check.yml"]
