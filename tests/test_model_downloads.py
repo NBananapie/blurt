@@ -7,6 +7,8 @@ setup ends with the app that started it. No network: urlopen is faked; the scrat
 from __future__ import annotations
 
 import contextlib
+import copy
+import hashlib
 import io
 import json
 import os
@@ -61,7 +63,7 @@ class FakeModelScope:
         if "/api/v1/models/" in url:
             listing = [{"Type": "blob", "Path": p, "Size": len(b)} for p, b in self.files.items()]
             return FakeResponse(json.dumps({"Data": {"Files": listing + [{"Type": "blob", "Path": "README.md", "Size": 3}]}}).encode())
-        name = url.rsplit("/", 1)[-1]
+        name = url.split("/resolve/master/", 1)[1] if "/resolve/master/" in url else url.rsplit("/", 1)[-1]
         self.opened.append((name, rng))
         if name == self.fail_on:
             raise urllib.error.URLError("connection reset")
@@ -119,6 +121,76 @@ class MirrorDownloadIsCompleteOrNotInstalled(unittest.TestCase):
         self.assertEqual(T.model_path(asr_entry(self.name)), self.dest)
 
 
+class ModelScopeRoutes(unittest.TestCase):
+    def setUp(self):
+        self.model = copy.deepcopy(T.entry("qwen3-asr-0.6b-onnx"))
+        self.files = self.model["install"]["modelscope"]["files"]
+        self.assertEqual(len(self.files), 6)
+        self.weights = {}
+        for spec in self.files.values():
+            self.assertRegex(spec["sha256"], r"^[a-f0-9]{64}$")
+            remote = spec["path"]
+            self.weights[remote] = remote.encode()
+            spec["sha256"] = hashlib.sha256(self.weights[remote]).hexdigest()
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        root = Path(temp.name)
+        self.dest = root / self.model["install"]["dir"]
+        for patch in (mock.patch.object(T, "MODELS_DIR", root),
+                      mock.patch.dict(os.environ, {"BLURT_HF_MIRROR": "1"})):
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def test_qwen_cpu_uses_the_original_archive_when_the_mirror_is_off(self):
+        def install_archive(_):
+            for name in self.files:
+                path = self.dest / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"archive file")
+
+        with mock.patch.dict(os.environ, {"BLURT_HF_MIRROR": ""}), \
+                mock.patch.object(T, "_install_archive", side_effect=install_archive) as archive, \
+                mock.patch.object(T, "_modelscope") as mirror:
+            self.assertEqual(T._install_unlocked(self.model), self.dest)
+        archive.assert_called_once_with(self.model)
+        mirror.assert_not_called()
+
+    def test_qwen_cpu_mirror_keeps_the_archive_layout_and_checks_all_required_files(self):
+        missing = FakeModelScope({"model_0.6B/conv_frontend.onnx": b"weights"})
+        with mock.patch.object(urllib.request, "urlopen", missing):
+            with self.assertRaisesRegex(T.Fail, "missing required files"):
+                T._install_unlocked(self.model)
+        self.assertEqual(missing.opened, [])
+        self.assertIsNone(T.model_path(self.model))
+
+        with mock.patch.object(urllib.request, "urlopen", FakeModelScope(self.weights)):
+            self.assertEqual(T._install_unlocked(self.model), self.dest)
+        for local, spec in self.files.items():
+            self.assertEqual((self.dest / local).read_bytes(), self.weights[spec["path"]])
+        (self.dest / "tokenizer/vocab.json").unlink()
+        self.assertIsNone(T.model_path(self.model))
+
+    def test_qwen_cpu_mirror_rejects_same_size_bad_content_and_retries_cleanly(self):
+        remote = self.files["tokenizer/vocab.json"]["path"]
+        bad = b"x" * len(self.weights[remote])
+        path = self.dest / "tokenizer/vocab.json"
+        fake = FakeModelScope({**self.weights, remote: bad})
+        with mock.patch.object(urllib.request, "urlopen", fake):
+            with self.assertRaisesRegex(T.Fail, "SHA-256 mismatch for tokenizer/vocab.json"):
+                T._install_unlocked(self.model)
+        self.assertFalse(path.exists())
+        self.assertFalse(path.with_name("vocab.json.part").exists())
+        self.assertFalse(T.installed(self.model))
+
+        path.write_bytes(bad)
+        fake = FakeModelScope(self.weights)
+        with mock.patch.object(urllib.request, "urlopen", fake):
+            self.assertEqual(T._install_unlocked(self.model), self.dest)
+        self.assertEqual(fake.opened, [(remote, None)])
+        self.assertEqual(path.read_bytes(), self.weights[remote])
+        self.assertTrue(T.installed(self.model))
+
+
 class HuggingFaceSnapshotIsCompleteOrNotInstalled(unittest.TestCase):
     """The Hugging Face cache side of transcribe.py's model_path: a snapshot that a setup cut short between files
     (no *.incomplete blob left, but a shard or the tokenizer missing) is not installed."""
@@ -173,13 +245,15 @@ class DictationNeedsTheVad(unittest.TestCase):
     server answers model_missing under BLURT_NO_DOWNLOAD — so it isn't "installed" for the dictation key."""
 
     def test_files_without_the_vad_are_not_installed(self):
-        vad = T.MODELS_DIR / "silero_vad.onnx"
-        had = vad.read_bytes() if vad.is_file() else None
-        self.addCleanup(lambda: vad.write_bytes(had) if had is not None else vad.unlink(missing_ok=True))
-        vad.unlink(missing_ok=True)
+        # a models folder of this test's own, and every model counted as Blurt's: the test used the folder itself,
+        # removing its silero_vad.onnx for a moment, and stood only after test_asr_select had left its stub of
+        # blurt_downloaded in (alone it failed: nothing was in the folder)
+        models = Path(tempfile.mkdtemp(prefix="blurt-vad-"))
+        vad = models / "silero_vad.onnx"
         # without the copy the skill ships (v1.0.6): what an install that lost it would see
-        with mock.patch.object(T, "installed", return_value=True), \
-                mock.patch.object(T, "BUNDLED_VAD", T.MODELS_DIR / "no-such-vad.onnx"):
+        with mock.patch.object(T, "MODELS_DIR", models), mock.patch.object(T, "blurt_downloaded", return_value=True), \
+                mock.patch.object(T, "installed", return_value=True), \
+                mock.patch.object(T, "BUNDLED_VAD", models / "no-such-vad.onnx"):
             d = T.dictation_models()
             self.assertFalse(d["vad"])
             local = [r for r in d["models"] if r["files"]]
@@ -289,3 +363,32 @@ class SetupEndsWithItsApp(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AFullDiskSaysSo(unittest.TestCase):
+    """A disk that fills up mid-download is `disk_full` (the app's "<size> needed, <free> free · Show Storage"), also
+    when a download helper wrapped the OSError into its own "network" failure."""
+
+    def test_enospc_is_found_through_the_chain(self):
+        import errno
+        self.assertTrue(C.disk_full(OSError(errno.ENOSPC, "No space left on device")))
+        try:
+            try:
+                raise OSError(errno.ENOSPC, "No space left on device")
+            except OSError as e:
+                raise T.Fail(f"could not download x: {e}", "network")
+        except T.Fail as f:
+            self.assertTrue(C.disk_full(f))
+        self.assertTrue(C.disk_full(P.Fail("could not download x: [Errno 28] No space left on device", "network")))
+        self.assertFalse(C.disk_full(T.Fail("could not download x: timed out", "network")))
+        self.assertFalse(C.disk_full(None))
+
+    def test_setup_says_disk_full(self):
+        import errno
+        out = io.StringIO()
+        with mock.patch.object(T, "install_model", side_effect=OSError(errno.ENOSPC, "No space left on device")), \
+                mock.patch.object(sys, "argv", ["transcribe.py", "setup", "--model-id", "sensevoice-small"]), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                T.main()
+        self.assertEqual(json.loads(out.getvalue().strip().splitlines()[-1])["code"], "disk_full")

@@ -114,6 +114,21 @@ public final class SkillCLI {
         }
     }
 
+    /// A read that needs nothing from the network (the model lists Settings and the first run show): offline first.
+    /// `uv run` asks PyPI about the script's packages again whenever its index cache has expired, and from a network
+    /// where PyPI is slow or a proxy hangs that took the whole timeout — "Reading the speech models took too long" on a
+    /// Mac where everything was already installed. With UV_OFFLINE=1 the cached packages are used as they are (0.2 s);
+    /// only when that fails (nothing cached yet: the first use ever) does it run again online, as before.
+    public func read(_ script: String, _ args: [String], timeout: TimeInterval = 60) async throws -> CLIResult {
+        let env = ScriptRunner.extraEnvironment().merging(["BLURT_LANG": Loc.language.hasPrefix("zh") ? "zh" : "en",
+                                                           "UV_OFFLINE": "1"]) { _, mine in mine }
+        if let r = try? await run(script, args, env: env, timeout: min(timeout, SkillCLI.offlineReadTimeout)), r.ok { return r }
+        return try await run(script, args, timeout: timeout)
+    }
+
+    /// How long the offline try of `read` may take: it touches no network, so longer than this is a stuck tool.
+    public static var offlineReadTimeout: TimeInterval = 30
+
     /// A long-running script: stdout and stderr lines (on the main queue), then the exit status (main queue).
     @discardableResult
     public func spawn(_ script: String, _ args: [String], with packages: [String] = [], env extra: [String: String] = [:],
@@ -174,8 +189,25 @@ public struct AgentStatus: Decodable, Hashable, Identifiable {
     public var why: String
     public var fix: String
     public var headless: Bool
+    /// "Use Blurt in your agent" (v1.0.26): its own config folder, its app (both nil when not found), whether either is
+    /// here, whether Blurt is set up in it (files say so), when its MCP client last started the blurt server, the
+    /// state that sums these up (connected | linked | found | missing), whether it is listed for Connect, which
+    /// edition (WorkBuddy 国内版 / 国际版), and whether the user added it.
+    public var home: String?
+    public var app: String?
+    public var found: Bool
+    public var linked: Bool
+    public var lastSeen: Double?
+    public var conn: String
+    public var connect: Bool
+    public var edition: String?
+    public var custom: Bool
 
-    enum CodingKeys: String, CodingKey { case id, name, installed, version, login, path, state, why, fix, headless }
+    enum CodingKeys: String, CodingKey {
+        case id, name, installed, version, login, path, state, why, fix, headless, home, app, found, linked, conn, connect,
+             edition, custom
+        case lastSeen = "last_seen"
+    }
     public init(from d: Decoder) throws {
         let c = try d.container(keyedBy: CodingKeys.self)
         id = try c.decode(String.self, forKey: .id)
@@ -188,10 +220,21 @@ public struct AgentStatus: Decodable, Hashable, Identifiable {
         why = try c.decodeIfPresent(String.self, forKey: .why) ?? ""
         fix = try c.decodeIfPresent(String.self, forKey: .fix) ?? ""
         headless = try c.decodeIfPresent(Bool.self, forKey: .headless) ?? true
+        home = try c.decodeIfPresent(String.self, forKey: .home)
+        app = try c.decodeIfPresent(String.self, forKey: .app)
+        found = try c.decodeIfPresent(Bool.self, forKey: .found) ?? installed
+        linked = try c.decodeIfPresent(Bool.self, forKey: .linked) ?? false
+        lastSeen = try c.decodeIfPresent(Double.self, forKey: .lastSeen)
+        conn = try c.decodeIfPresent(String.self, forKey: .conn) ?? (lastSeen != nil ? "connected" : linked ? "linked" : found ? "found" : "missing")
+        connect = try c.decodeIfPresent(Bool.self, forKey: .connect) ?? true
+        edition = try c.decodeIfPresent(String.self, forKey: .edition)
+        custom = try c.decodeIfPresent(Bool.self, forKey: .custom) ?? false
     }
     public init(id: String, name: String, installed: Bool, state: String) {
         self.id = id; self.name = name; self.installed = installed; self.state = state
         version = nil; login = "unknown"; path = nil; why = ""; fix = ""; headless = true
+        home = nil; app = nil; found = installed; linked = false; lastSeen = nil; conn = installed ? "found" : "missing"
+        connect = true; edition = nil; custom = false
     }
     /// can run (or at least be tried) headless
     public var usable: Bool { headless && ["ready", "configured", "unknown"].contains(state) }
@@ -231,6 +274,21 @@ public struct AgentModels: Decodable {
     public func name(_ id: String?) -> String? { id.flatMap { i in models.first { $0.id == i }?.name } }
 }
 
+/// `agents.py manual`
+public struct AgentManual: Decodable {
+    public var skill: String
+    public var skillOK: Bool
+    public var server: String
+    public var command: String
+    public var args: [String]
+    public var mcpJSON: String
+    public var prompt: String
+    enum CodingKeys: String, CodingKey {
+        case skill, server, command, args, prompt
+        case skillOK = "skill_ok", mcpJSON = "mcp_json"
+    }
+}
+
 /// `agents.py command`
 public struct AgentCommand: Decodable {
     public var id: String
@@ -259,7 +317,7 @@ public struct AgentCommand: Decodable {
 
 /// One entry of `agents.py install` → changes
 public struct InstallChange: Decodable, Hashable {
-    public var action: String         // symlink | exists | conflict | run | json_merge | error | manual
+    public var action: String         // symlink | exists | conflict | run | json_merge | toml_set | error | manual
     public var path: String?
     public var target: String?
     public var pointsTo: String?
@@ -272,8 +330,11 @@ public struct InstallChange: Decodable, Hashable {
     public var what: String?
     /// manual: what the user would run themselves (the MCP server's own command line)
     public var command: [String]?
+    /// toml_set (Codex): the tools whose calls stop asking for approval, and the config lines that say so
+    public var tools: [String]?
+    public var lines: [String]?
 
-    enum CodingKeys: String, CodingKey { case action, path, target, argv, key, ok, error, output, how, what, command, pointsTo = "points_to" }
+    enum CodingKeys: String, CodingKey { case action, path, target, argv, key, ok, error, output, how, what, command, tools, lines, pointsTo = "points_to" }
 
     public init(action: String, path: String? = nil, target: String? = nil, pointsTo: String? = nil, argv: [String]? = nil,
                 key: [String]? = nil, ok: Bool? = nil, what: String? = nil, how: String? = nil, command: [String]? = nil) {
@@ -281,7 +342,17 @@ public struct InstallChange: Decodable, Hashable {
         self.key = key; self.ok = ok; self.what = what; self.how = how; self.command = command
     }
 
-    public var changesSomething: Bool { action == "symlink" || action == "run" || action == "json_merge" }
+    public var changesSomething: Bool { action == "symlink" || action == "run" || action == "json_merge" || action == "toml_set" }
+    /// Codex's per-tool approval for the reporting tools (agents.json mcp.approve), to be written or already there
+    public var isApproval: Bool { action == "toml_set" || (action == "exists" && lines != nil) }
+    /// "~/.codex/config.toml: mcp_servers.blurt.tools.{mark_fixed,get_item}.approval_mode = "approve""
+    func approvalLine(_ t: (String) -> String) -> String? {
+        guard let p = path, let k = key else { return nil }
+        let names = tools ?? (lines ?? []).compactMap { l in l.split(separator: "]").first.map { String($0.split(separator: ".").last ?? "") } }
+        guard !names.isEmpty else { return nil }
+        let set = names.count == 1 ? names[0] : "{\(names.joined(separator: ","))}"
+        return "\(t(p)): \(k.joined(separator: ".")).\(set).approval_mode = \"approve\""
+    }
 
     /// What the change is about. agents.py names it only for `manual`; the rest follows from the shape: a link in the
     /// agent's skill folder is the skill, a command line or a config key is the MCP server.
@@ -319,6 +390,8 @@ public struct InstallChange: Decodable, Hashable {
         case "conflict": return path.map { "\(t($0)) → \(t(pointsTo ?? "?"))" }
         case "run": return argv.map(words)
         case "json_merge": return path.map { "\(t($0)): \((key ?? []).joined(separator: "."))" }
+        case "toml_set": return approvalLine(t)
+        case "exists" where lines != nil: return approvalLine(t)
         case "exists":
             if let a = argv { return words(a) }
             if let p = path, let k = key { return "\(t(p)): \(k.joined(separator: "."))" }
@@ -441,10 +514,11 @@ public final class Agents {
 
     /// Every registry id (agents.py detect only lists the configured order; agents left out of record.agents are
     /// still shown in Settings so they can be turned back on).
-    public func detectAll(login: Bool = true) async throws -> AgentDetect {
+    public func detectAll(login: Bool = true, fresh: Bool = false) async throws -> AgentDetect {
         let ids = registryIDs()
         var args = ["detect", "--lang", lang, "--ids", ids.joined(separator: ",")]
         if !login { args.append("--no-login") }
+        if fresh { args.append("--fresh") }
         let r = try await SkillCLI.shared.run("agents.py", args, timeout: 90)
         guard r.ok, var d = r.decode(AgentDetect.self) else { throw AgentError.script(r.errorText) }
         if login { rememberLogin(d) }
@@ -468,6 +542,35 @@ public final class Agents {
         }
         for k in ((Config.shared["record.agent_defs"] as? [String: Any]) ?? [:]).keys.sorted() where !ids.contains(k) { ids.append(k) }
         return ids
+    }
+
+    /// `agents.py manual`: what any other agent needs (the skill folder, the MCP server as JSON and as a command, a
+    /// prompt that has the agent set itself up).
+    public func manual() async throws -> AgentManual {
+        let r = try await SkillCLI.shared.run("agents.py", ["manual", "--lang", lang], timeout: 30)
+        guard r.ok, let m = r.decode(AgentManual.self) else { throw AgentError.script(r.errorText) }
+        return m
+    }
+
+    /// `agents.py custom NAME`: the user's own agent in record.agent_defs → its id.
+    public func addCustom(_ name: String) async throws -> String {
+        let r = try await SkillCLI.shared.run("agents.py", ["custom", name], timeout: 30)
+        guard r.ok, let id = r.json?["id"] as? String else { throw AgentError.script(r.errorText) }
+        return id
+    }
+
+    /// $BLURT_HOME/run/mcp-clients.json: client name → when it last started the blurt MCP server (the app's own runs
+    /// left out). agents.py record_mcp_client writes it.
+    public static func mcpClients(home: URL = BlurtPaths.home) -> [String: Double] {
+        guard let d = try? Data(contentsOf: home.appendingPathComponent("run/mcp-clients.json")),
+              let o = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
+              let c = o["clients"] as? [String: Any] else { return [:] }
+        var out: [String: Double] = [:]
+        for (k, v) in c {
+            guard let e = v as? [String: Any], e["via"] as? String != "app", let at = e["at"] as? Double else { continue }
+            out[k] = at
+        }
+        return out
     }
 
     /// record.agents (exclusive: only these, in this order). nil = the registry default.

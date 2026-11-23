@@ -36,7 +36,10 @@
 //    bubble docks beside it (BlurtCore BubbleDock: never over it, flipped near the screen's edges, the selection's
 //    display), its caret pointing at it. A plain drag draws, ⇧ a box, ⌥ an ellipse, holding still snaps a rough shape
 //    clean, ⌘Z (or the undo arrow by the chip, shown while the pointer is over the bubble) takes the last stroke
-//    back (InkView.swift). Done (⏎, the "Done ↩" button, a click outside): the
+//    back (InkView.swift). v1.0.23: the tool strip under the picture (InkStage / InkTools.swift) — arrow, text, mosaic,
+//    colours; ⌘P ⌘R ⌘O ⌘L ⌘T ⌘M choose a tool from here (bare letters type the note), ⇧⌘Z redoes a mark; a text box
+//    being typed has the keys. ⌘↩ (NoteKeys): saved, copied, done — no card (Snapper.copyAndDone; the footer and
+//    the strip's copy button say it). Done (⏎, the "Done ↩" button, a click outside): the
 //    marked picture flies from the selection to the notch and becomes the card. The ink is burnt into
 //    shots/NNN.marked.png (what a copy or a drag hands out); shots/NNN.png stays unmarked, the strokes stay editable.
 //  • r2 of the overlays redesign: one composer for a fresh snap and Edit Note (`layout`): the words on top (15 pt), the
@@ -53,6 +56,9 @@
 //    bubble; ⌘1–⌘4 set 问题 / 想法 / 笔记 / 待办 and ⌘0 clears it, from anywhere in the bubble (NoteKeys; the panel takes
 //    those keys before the main menu's ⌘1–⌘4). The keys are shown once, in the list. Saved with the note (shots.jsonl
 //    "kind"): Esc on an edit or a recording's note leaves the type as it was.
+//  • Recording & Items off (BlurtCore Capabilities: `filing` false): neither chip. A project and a type are an item's;
+//    without items a snap is a card with a note — the footer is the hover tools, the status and Done ↩, Tab only takes
+//    the grey words and ⌘0–⌘4 do nothing (NoteKeys.State.filing). A type a card already had is kept as it was.
 //  • ⌥A while it is open saves the note and takes the next shot. Listening starts the warm speech server
 //    (VoiceInput.warmSpeechModel), so the note's words come back in well under a second, not a cold model load.
 //  • every open has a generation: a close still fading out never orders out (or takes the focus from) a bubble opened
@@ -155,10 +161,12 @@ final class NoteVoice {
 
     init(url: URL) { self.url = url }
 
-    /// Tests (test commands only): BLURT_TEST_MIC_DENIED=1 acts as if microphone access had been turned off.
+    /// Tests (test commands only): BLURT_TEST_MIC_DENIED=1 — or BLURT_TEST_MICROPHONE=denied, the variable onboarding's
+    /// permission rows read (SystemAccess.testMic) — acts as if microphone access had been turned off: one variable
+    /// simulates the denial everywhere (dogfood 1.1.0: with only the second set, dictation listened anyway).
     static let testDenied: Bool = {
         let env = ProcessInfo.processInfo.environment
-        return env["BLURT_TEST_COMMANDS"] == "1" && env["BLURT_TEST_MIC_DENIED"] == "1"
+        return env["BLURT_TEST_COMMANDS"] == "1" && (env["BLURT_TEST_MIC_DENIED"] == "1" || env["BLURT_TEST_MICROPHONE"] == "denied")
     }()
 
     /// Microphone access was turned off for Blurt (System Settings → Privacy & Security → Microphone).
@@ -319,6 +327,12 @@ final class NoteVoice {
         }
         guard inFmt.sampleRate > 0, inFmt.channelCount > 0, let conv = AVAudioConverter(from: inFmt, to: fmt) else {
             return "no_input_format"
+        }
+        // A converter that keeps fewer channels than the device has (MiniFuse: two ins and its loopback pair) maps
+        // them all to -1 — the take hears silence and no error says so. Take the first channels instead.
+        if let fix = MicChannelMap.silenceFix(device: Int(inFmt.channelCount), kept: Int(fmt.channelCount),
+                                              map: conv.channelMap.map({ $0.intValue })) {
+            conv.channelMap = fix.map { NSNumber(value: $0) }
         }
         let rate = inFmt.sampleRate
         var err: NSError?
@@ -748,9 +762,13 @@ final class NotePanel: NSPanel {
         if e.type == .keyDown, onKey?(e) == true { return }
         super.sendEvent(e)
     }
-    /// ⌘-digits are the bubble's (the type) before the main menu's ⌘1–⌘4 (Go to Inbox…, the main window's) see them.
+    /// ⌘-digits are the bubble's (the type) before the main menu's ⌘1–⌘4 (Go to Inbox…, the main window's).
+    /// ⌘Z is the bubble's before the Edit menu's Undo (NoteKeys.takesCommandZBeforeTheMenu). Key equivalents
+    /// are routed before sendEvent, so a ⌘Z left to the menu undoes typing in the field editor and never reaches
+    /// the stroke undo below. That typing undo runs on this thread; layout during it used to record more undo,
+    /// so it never returned — and the frozen picture, which takes every click, stayed up.
     override func performKeyEquivalent(with e: NSEvent) -> Bool {
-        if e.type == .keyDown, NoteBubble.commandDigit(e) != nil, onKey?(e) == true { return true }
+        if e.type == .keyDown, NoteBubble.claimsBeforeTheMenu(e), onKey?(e) == true { return true }
         return super.performKeyEquivalent(with: e)
     }
 }
@@ -962,8 +980,16 @@ final class NoteBubble: NSObject, NSTextFieldDelegate {
     // MARK: open
 
     /// `inPlace`: the frozen selection of a fresh snap (InkStage is open on it): the bubble docks beside it.
-    func begin(_ s: Shot, mode m: Mode, anchor a: (() -> NSRect?)? = nil, inPlace: NSRect? = nil) {
+    /// v1.0.23 — a note offered after something was dropped on the island (`passive`): the bubble opens without
+    /// taking the keyboard (the user is often still typing in the app they dragged from); it takes it once the pointer
+    /// comes onto it or it is clicked. Never touched: it folds away after `passiveSeconds`; typed into: it stays until
+    /// ↩ / a click elsewhere, like any note.
+    private(set) var passive = false
+    static let passiveSeconds: Double = 6
+
+    func begin(_ s: Shot, mode m: Mode, anchor a: (() -> NSRect?)? = nil, inPlace: NSRect? = nil, passive p: Bool = false) {
         if isOpen { commit() }
+        passive = p
         generation += 1
         // a close of the bubble before this one may still be fading out: it never hides this one
         closeWork?.cancel()
@@ -995,6 +1021,7 @@ final class NoteBubble: NSObject, NSTextFieldDelegate {
         hovering = false
         penHint.alphaValue = 1
         inkUndoFirst = false
+        copyOut = false
         picking = false
         pickingKind = false
         editPicked = false
@@ -1010,6 +1037,9 @@ final class NoteBubble: NSObject, NSTextFieldDelegate {
             st.canvas.onStrokeBegan = { [weak self] in self?.strokeBegan() }
             st.canvas.onStrokeMoved = { [weak self] in self?.voice?.activity(grace: NoteBubble.inkGrace) }
             st.canvas.onStrokeEnded = { [weak self] in self?.strokeEnded() }
+            st.canvas.onTextEnded = { [weak self] in self?.textEnded() }
+            st.onCopy = { [weak self] in self?.copyAndFinish() }          // the strip's copy button: ⌘↩
+            st.onUndo = { [weak self] in self?.undoInk() }
             st.onClickOutside = { [weak self] in self?.commit() }        // a click outside the picture: done
         }
         load(s)
@@ -1044,6 +1074,7 @@ final class NoteBubble: NSObject, NSTextFieldDelegate {
         canvas.onStrokeBegan = { [weak self] in self?.strokeBegan() }
         canvas.onStrokeMoved = { [weak self] in self?.voice?.activity(grace: NoteBubble.inkGrace) }
         canvas.onStrokeEnded = { [weak self] in self?.strokeEnded() }
+        canvas.onTextEnded = { [weak self] in self?.textEnded() }
         root.addSubview(canvas)
         // the pen hint on the enlarged picture (Edit Note): the stage's one hint component (§3.1: 12 pt regular,
         // white 65 % on black 42 %, r 11), never a second style
@@ -1120,7 +1151,9 @@ final class NoteBubble: NSObject, NSTextFieldDelegate {
     private func load(_ s: Shot) {
         // in place the picture and its pen are on the stage; the bubble is the words
         canvas.image = s.kind == .voice || staged ? nil : s.image()
-        canvas.strokes = staged ? [] : s.strokes
+        canvas.marks = staged ? [] : s.marks
+        canvas.pictureScale = s.scale
+        canvas.pick = .pen
         canvas.editable = mode != .recording && s.kind != .voice && !staged
         // the enlarged picture draws the line as wide as the snap's own (scaled to the preview)
         if !staged, s.kind == .shot {
@@ -1166,7 +1199,7 @@ final class NoteBubble: NSObject, NSTextFieldDelegate {
     /// (Edit Note, when the note has a voice — without one the mic is the glyph column's button).
     private var hoverTools: [SymbolButton] {
         var t: [SymbolButton] = []
-        if !ink.strokes.isEmpty, mode != .recording { t.append(undoBtn) }
+        if !ink.marks.isEmpty, mode != .recording { t.append(undoBtn) }
         if mode == .listen { t.append(discardBtn) }
         if mode == .edit, hasVoice, voice?.running != true { t.append(micBtn) }
         return t
@@ -1175,7 +1208,12 @@ final class NoteBubble: NSObject, NSTextFieldDelegate {
     /// Edit Note: the note has a voice to play (a kept re-record, else the original)
     private var hasVoice: Bool { playURL.map { FileManager.default.fileExists(atPath: $0.path) } == true }
 
+    /// The place chip and the type chip belong to Recording & Items (projects and item types): gone with it.
+    private var filing: Bool { Capability.projectsShown }
+
     private func layout() {
+        // the switch went off with a list open: the lists go with their chips
+        if !filing, picking || pickingKind { picking = false; pickingKind = false }
         let pic = showsPicture
         let pv = pic ? previewSize() : .zero
         let m = NoteBubble.inset
@@ -1206,7 +1244,7 @@ final class NoteBubble: NSObject, NSTextFieldDelegate {
         penHint.stringValue = mode == .recording ? "" : "   " + Loc.t("capture.note.pen_hint", table: "Capture") + "   "
         penHint.sizeToFit()
         penHint.frame = NSRect(x: canvas.frame.minX + 8, y: canvas.frame.maxY - 30, width: penHint.frame.width, height: 22)
-        penHint.isHidden = !pic || mode == .recording || !canvas.strokes.isEmpty || penHintGone
+        penHint.isHidden = !pic || mode == .recording || !canvas.marks.isEmpty || penHintGone
         // row 1: the glyph column (how the note is being taken) and the words
         let rowY = pic ? canvas.frame.maxY + 10 : top + m
         let lineMid = rowY + ceil((field.font ?? .systemFont(ofSize: NoteBubble.fontSize)).boundingRectForFont.height) / 2 + 1
@@ -1226,27 +1264,35 @@ final class NoteBubble: NSObject, NSTextFieldDelegate {
         let footY = rowY + fieldH + 6
         let midY = footY + footH / 2
         doneBtn.isHidden = !composer
-        chip.isHidden = !composer
+        chip.isHidden = !composer || !filing
+        kindChip.isHidden = !filing
         var leftEnd = textX, rightEnd = right
         if composer {
             doneBtn.title = Loc.t(mode == .edit ? "capture.note.save" : "capture.note.done", table: "Capture")
-            doneBtn.toolTip = Loc.t(mode == .edit ? "capture.note.save_tip" : "capture.note.done_tip", table: "Capture")
+            // the footer's whole line first (its slot may have room for the keys only)
+            doneBtn.toolTip = (mode == .listen && !statusLine.full.isEmpty ? statusLine.full + "\n" : "")
+                + Loc.t(mode == .edit ? "capture.note.save_tip" : "capture.note.done_tip", table: "Capture")
             // while the list is open its ↩ is the action: the primary steps back (system.md: neutral fill, no gradient)
             doneBtn.isEnabled = !picking && !pickingKind
             doneBtn.alphaValue = 1
             let sz = doneBtn.intrinsicContentSize
             doneBtn.frame = NSRect(x: right - sz.width, y: midY - 11, width: sz.width, height: 22)
             rightEnd = doneBtn.frame.minX - 10
-            // the place leads the footer — its glyph on the glyph column, its name on the text column
-            chip.set(place, maxWidth: min(200, inner * 0.56))
-            chip.open = picking
-            chip.frame.origin = NSPoint(x: glyphX - ProjectChip.lead, y: footY)
-            leftEnd = chip.frame.maxX + 2
-            // the type, beside the place
-            kindChip.set(chosenKind)
-            kindChip.open = pickingKind
-            kindChip.frame.origin = NSPoint(x: leftEnd, y: footY)
-            leftEnd = kindChip.frame.maxX + 4
+            if filing {
+                // the place leads the footer — its glyph on the glyph column, its name on the text column
+                chip.set(place, maxWidth: min(200, inner * 0.56))
+                chip.open = picking
+                chip.frame.origin = NSPoint(x: glyphX - ProjectChip.lead, y: footY)
+                leftEnd = chip.frame.maxX + 2
+                // the type, beside the place
+                kindChip.set(chosenKind)
+                kindChip.open = pickingKind
+                kindChip.frame.origin = NSPoint(x: leftEnd, y: footY)
+                leftEnd = kindChip.frame.maxX + 4
+            } else {
+                // no chips: the hover tools lead, their glyphs on the glyph column (a 24 pt button round a 16 pt glyph)
+                leftEnd = glyphX - 4
+            }
             // the hover tools, after the chips (never over an open list)
             if hovering && !picking && !pickingKind {
                 for t in hoverTools {
@@ -1264,7 +1310,7 @@ final class NoteBubble: NSObject, NSTextFieldDelegate {
             kindChip.set(chosenKind)
             kindChip.open = pickingKind
             kindChip.frame.origin = NSPoint(x: glyphX - ProjectChip.lead, y: footY)
-            leftEnd = kindChip.frame.maxX + 6
+            leftEnd = filing ? kindChip.frame.maxX + 6 : glyphX
             var bx = right
             if recordingShots.count > 1 {
                 nextBtn.isHidden = false; nextBtn.frame.origin = NSPoint(x: bx - 24, y: midY - 12); bx -= 26
@@ -1276,8 +1322,9 @@ final class NoteBubble: NSObject, NSTextFieldDelegate {
         status.alignment = composer ? .right : .left
         let sh = ceil(status.attributedStringValue.size().height)
         status.frame = NSRect(x: leftEnd, y: midY - max(15, sh) / 2, width: max(0, rightEnd - leftEnd), height: max(15, sh))
-        // a line that doesn't fit beside the hover tools steps aside while they show (never cut mid-word)
-        status.isHidden = ceil(status.attributedStringValue.size().width) + 4 > status.frame.width
+        // a line that doesn't fit beside the hover tools says its keys alone, and only steps aside (never cut mid-word)
+        // when even they don't fit
+        fitStatus()
         pick.isHidden = !picking
         if picking {
             pick.frame = NSRect(x: x0, y: footY + footH + 4, width: inner, height: pick.height)
@@ -1297,20 +1344,37 @@ final class NoteBubble: NSObject, NSTextFieldDelegate {
     /// Done ↩.
     private func footerWidth() -> CGFloat {
         let m = NoteBubble.inset
+        // without the chips: the bin, the keys line, Done ↩
+        guard filing else {
+            let keys = NoteBubble.footerKeysWidth(copy: canCopyOut)
+            return m + 26 + 6 + keys + 10 + doneBtn.intrinsicContentSize.width + m
+        }
         chip.set(place, maxWidth: 200)
         // (sized for the widest kind name, so choosing one never widens the bubble)
         let kind = ([nil] + NoteKind.allCases.map { Optional($0) }).map { ProjectChip.width($0.map(KindChip.name) ?? kindChip.label) }.max() ?? 0
-        let keys = ceil(NoteBubble.keyLine(Loc.t("capture.note.st_voice", table: "Capture")).size().width) + 4
+        let keys = NoteBubble.footerKeysWidth(copy: canCopyOut)
         return m + (chip.frame.width - ProjectChip.lead) + 2 + kind + 4 + 26 + 6 + keys + 10 + doneBtn.intrinsicContentSize.width + m
     }
 
+    /// The status slot's widest line: the keys for the grey words, or (a snap of its own) ↩ / ⌘↩.
+    static func footerKeysWidth(copy: Bool) -> CGFloat {
+        let w = { (k: String) in ceil(NoteBubble.keyLine(Loc.t(k, table: "Capture")).size().width) + 4 }
+        return max(w("capture.note.st_voice"), copy ? w("capture.note.st_copy") : 0)
+    }
+
     private func fieldHeight(_ w: CGFloat, max cap: CGFloat) -> CGFloat {
-        // the live words take the placeholder's place, so they size the field as typed text does
-        let s = field.stringValue.isEmpty ? (field.placeholderAttributedString?.string ?? field.placeholderString ?? "x") : field.stringValue
+        // the live words take the placeholder's place, so they size the field as typed text does.
+        // measure a prefix: the field is at most a few lines (cap), and laying out an unbounded string here
+        // runs on the main thread under the frozen picture
+        var s = field.stringValue.isEmpty ? (field.placeholderAttributedString?.string ?? field.placeholderString ?? "x") : field.stringValue
+        if s.count > NoteBubble.measuredChars { s = String(s.prefix(NoteBubble.measuredChars)) }
         let r = (s as NSString).boundingRect(with: NSSize(width: w, height: 400), options: [.usesLineFragmentOrigin],
                                              attributes: [.font: field.font!])
         return min(cap, max(20, ceil(r.height) + 2))
     }
+
+    /// enough lines to hit the field's cap; past this, measuring the rest only stalls the main thread
+    static let measuredChars = 2_000
 
     private func position() {
         guard let p = panel else { return }
@@ -1361,6 +1425,7 @@ final class NoteBubble: NSObject, NSTextFieldDelegate {
             bg.caretAt = sel.midX - o.x
         }
         p.setFrameOrigin(o)
+        InkStage.shared.placeStrip(avoiding: p.frame)       // the tool strip never under the bubble
     }
 
     private func present() {
@@ -1388,9 +1453,20 @@ final class NoteBubble: NSObject, NSTextFieldDelegate {
         // the panel is non-activating: it takes the typing without activating Blurt, so Blurt's main window never
         // jumps above the app the user just snapped; close() still hands focus back
         if mode == .recording { snapper.rememberFrontApp() }
-        if !NoteBubble.testNoKey { p.makeKey() }
+        if !NoteBubble.testNoKey, !passive { p.makeKey() }
+        if passive {
+            let g = generation
+            DispatchQueue.main.asyncAfter(deadline: .now() + NoteBubble.passiveSeconds) { [weak self] in
+                guard let self = self, self.generation == g, self.passive, self.isOpen else { return }
+                self.close(save: true, flash: false)       // never touched: nothing to keep but the card as it was
+            }
+        }
         p.makeFirstResponder(field)
         field.currentEditor()?.selectedRange = NSRange(location: field.stringValue.count, length: 0)
+        // the panel is reused for every note, and its undo stack is the field editor's. A ⌘Z the bubble
+        // doesn't take (text, not a stroke) is the Edit menu's Undo of whatever is still on that stack.
+        // Drop the previous note's typing: one leftover undo, replayed under the frozen picture, never returned.
+        p.undoManager?.removeAllActions()
         ticker?.invalidate()
         ticker = Timer.scheduledTimer(withTimeInterval: 1.0 / 20, repeats: true) { [weak self] _ in self?.tick() }
         fadePenHint(for: shot, after: NoteBubble.penHintSeconds)
@@ -1484,6 +1560,12 @@ final class NoteBubble: NSObject, NSTextFieldDelegate {
             guard !ok else { return }
             emit(["event": "note_voice_start_failed", "n": s.n, "why": v.failReason ?? "unknown", "mode": "\(self.mode)"])
             self.voice = nil; self.dropStream(); self.retakeFell(); self.refreshStatus()
+            // macOS blocks the mic for Blurt: said once a run, with the way to turn it on (the note only said "Mic
+            // unavailable", with no cause and no way to fix it)
+            if NoteVoice.denied, !NoteBubble.saidMicDenied {
+                NoteBubble.saidMicDenied = true
+                NoteVoice.toastUnavailable()
+            }
         }
         refreshStatus()
     }
@@ -1595,11 +1677,14 @@ final class NoteBubble: NSObject, NSTextFieldDelegate {
 
     private func strokeEnded() {
         inkUndoFirst = true
+        inkRedoFirst = false
         voice?.activity(grace: NoteBubble.inkGrace)
     }
 
     private func resignedKey() {
         guard isOpen, mode != .recording else { return }
+        // a text box on the frozen picture took the keys: the user is still here (they come back when it ends)
+        if staged, InkStage.shared.canvas.isEditingText { return }
         emit(["event": "note_resign", "n": shot?.n ?? 0, "app_active": NSApp.isActive])
         // tests on a shared machine: another app coming forward isn't the tester leaving the bubble
         guard !NoteBubble.testIgnoresResign else { return }
@@ -1714,7 +1799,8 @@ final class NoteBubble: NSObject, NSTextFieldDelegate {
             } else if micGone {
                 plainPlaceholder(Loc.t("capture.note.ph_mic_gone", table: "Capture"))
             } else if !voiceDone {
-                plainPlaceholder(Loc.t("capture.note.ph_no_mic", table: "Capture"))      // it never listened
+                // it never listened: macOS's switch for Blurt is off, or the mic didn't start
+                plainPlaceholder(Loc.t(NoteVoice.denied ? "capture.note.ph_mic_off" : "capture.note.ph_no_mic", table: "Capture"))
             } else {
                 plainPlaceholder(Loc.t("capture.note.placeholder_optional", table: "Capture"))
             }
@@ -1724,6 +1810,8 @@ final class NoteBubble: NSObject, NSTextFieldDelegate {
                 line = Loc.t("capture.note.st_voice", table: "Capture")
             } else if listening {
                 line = fmt(t)
+            } else if canCopyOut {
+                line = Loc.t("capture.note.st_copy", table: "Capture")         // "↩ Save as card · ⌘↩ Copy and finish"
             }
         case .edit:
             chip?.set(place, maxWidth: min(200, (panel?.frame.width ?? 400) * 0.56))
@@ -1739,8 +1827,40 @@ final class NoteBubble: NSObject, NSTextFieldDelegate {
         }
         // (the slot is pinned against the primary: right-aligned, set on the string itself — an attributed value
         // carries its own paragraph style, the field's `alignment` alone doesn't hold)
-        status.attributedStringValue = NoteBubble.keyLine(line, alignment: mode == .recording ? .left : .right)
-        if status.frame.width > 0 { status.isHidden = ceil(status.attributedStringValue.size().width) + 4 > status.frame.width }
+        statusLine = (line, NoteBubble.shortLine(line), mode == .recording ? .left : .right)
+        status.attributedStringValue = NoteBubble.keyLine(line, alignment: statusLine.alignment)
+        if status.frame.width > 0 { fitStatus() }
+    }
+
+    /// The mic-off line went up once this run (the placeholder says it every time).
+    static var saidMicDenied = false
+
+    /// The footer's line as set (refreshStatus), with its keys-only form for a narrow slot.
+    private var statusLine: (full: String, short: String?, alignment: NSTextAlignment) = ("", nil, .right)
+
+    /// The line in the slot it has: whole, else its keys alone ("Tab accept", "↩ Save · ⌘↩ Copy") — the default
+    /// bubble's slot between the type chip and Done was narrower than either line, so the keys never showed — else
+    /// hidden.
+    private func fitStatus() {
+        let room = status.frame.width
+        let fits = { (a: NSAttributedString) in ceil(a.size().width) + 4 <= room }
+        let full = NoteBubble.keyLine(statusLine.full, alignment: statusLine.alignment)
+        if fits(full) || statusLine.full.isEmpty {
+            status.attributedStringValue = full
+            status.isHidden = !fits(full)
+            return
+        }
+        if let s = statusLine.short {
+            let short = NoteBubble.keyLine(s, alignment: statusLine.alignment)
+            if fits(short) { status.attributedStringValue = short; status.isHidden = false; return }
+        }
+        status.isHidden = true
+    }
+
+    /// The keys-only form of a footer line (nil: it has none).
+    static func shortLine(_ line: String) -> String? {
+        let pairs = [("capture.note.st_voice", "capture.note.st_voice_short"), ("capture.note.st_copy", "capture.note.st_copy_short")]
+        return pairs.first { Loc.t($0.0, table: "Capture") == line }.map { Loc.t($0.1, table: "Capture") }
     }
 
     /// The footer line, the way macOS menus set their keys: the keys (⏎ ↩ ⌘Z ↑↓ Esc …) in medium, the words regular,
@@ -1751,7 +1871,7 @@ final class NoteBubble: NSObject, NSTextFieldDelegate {
         ps.alignment = alignment
         ps.lineBreakMode = .byTruncatingTail
         let a = NSMutableAttributedString(string: s, attributes: [.font: font, .foregroundColor: NSColor.secondaryLabelColor, .paragraphStyle: ps])
-        let keys = ["⌘Z", "↑↓", "⏎", "↩", "Esc", "Tab", "⇧", "⌥", "⌘←", "⌘→"]
+        let keys = ["⌘Z", "⌘↩", "↑↓", "⏎", "↩", "Esc", "Tab", "⇧", "⌥", "⌘←", "⌘→"]
         let ns = s as NSString
         for k in keys {
             var r = ns.range(of: k)
@@ -1787,6 +1907,13 @@ final class NoteBubble: NSObject, NSTextFieldDelegate {
     private func hover(_ on: Bool) {
         guard hovering != on, isOpen else { return }
         hovering = on
+        if on, passive, let p = panel {
+            // the pointer came onto a note offered after a drop: now it takes the typing (and gives it back on close)
+            passive = false
+            snapper.rememberFrontApp()
+            if !NoteBubble.testNoKey { p.makeKey() }
+            p.makeFirstResponder(field)
+        }
         let quiet = hoverTools
         if on { quiet.forEach { $0.alphaValue = 0 } }
         layout()
@@ -1824,7 +1951,8 @@ final class NoteBubble: NSObject, NSTextFieldDelegate {
         let typedPart = (accepted || wordsInField != nil) && !typed ? "" : field.stringValue
         return NoteKeys.State(mode: mode == .listen ? .fresh : mode == .edit ? .edit : .recording, voice: v, typed: typedPart,
                               composing: (field.currentEditor() as? NSTextView)?.hasMarkedText() == true, picking: picking,
-                              pickingKind: pickingKind)
+                              pickingKind: pickingKind, filing: filing, canCopy: canCopyOut,
+                              hasText: !field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
     }
 
     /// Does what NoteKeys decided; false when the key isn't the bubble's (it goes on to the field, the IME, the list).
@@ -1835,6 +1963,7 @@ final class NoteBubble: NSObject, NSTextFieldDelegate {
         switch a {
         case .pass, .ignore: break
         case .commit: commit()
+        case .copyAndFinish: copyAndFinish()
         case .newLine: lineBreak()
         case .takeWords(let newLine):
             takeWords()
@@ -1852,7 +1981,17 @@ final class NoteBubble: NSObject, NSTextFieldDelegate {
         return true
     }
 
+    /// layout() sets the field's frame from inside the field editor's own text-change. Doing that while an
+    /// undo is open records another undo into the group being undone, so one ⌘Z never returns.
+    private var applyingTextChange = false
+
     func controlTextDidChange(_ n: Notification) {
+        if applyingTextChange { return }
+        applyingTextChange = true
+        defer { applyingTextChange = false }
+        let undo = field.window?.undoManager
+        undo?.disableUndoRegistration()
+        defer { undo?.enableUndoRegistration() }
         let marked = (field.currentEditor() as? NSTextView).flatMap { $0.hasMarkedText() ? $0.markedRange() : nil }
         let committed = NoteTyping.committed(field.stringValue, marked: marked)
         var now = NoteTyping.typed(field.stringValue, marked: marked)
@@ -1870,7 +2009,7 @@ final class NoteBubble: NSObject, NSTextFieldDelegate {
             takenRaw = nil
             emit(["event": "note_words_untaken", "n": shot?.n ?? 0])
         }
-        if field.stringValue != (wordsInField ?? "") { inkUndoFirst = false }
+        if field.stringValue != (wordsInField ?? "") { inkUndoFirst = false; inkRedoFirst = false }
         typed = now
         refreshStatus()
         layout()
@@ -1890,12 +2029,19 @@ final class NoteBubble: NSObject, NSTextFieldDelegate {
     }
 
     private func key(_ e: NSEvent) -> Bool {
-        // ↩ ⇧↩ Tab Esc: NoteKeys (an IME composition and the open place list keep their own)
+        // a text box on the picture (Edit Note's) has the keys while it is typed in: its ↩ / Esc end it
+        if ink.isEditingText { return false }
+        // ↩ ⇧↩ ⌘↩ Tab Esc: NoteKeys (an IME composition and the open place list keep their own)
         let mods = e.modifierFlags.intersection([.command, .option, .control, .shift])
+        // ⌘ and a tool's letter (BlurtCore InkPick; bare letters always type the note)
+        if let t = NoteBubble.toolKey(e), ink.editable, !picking, (ink.window as? NSPanel)?.isVisible == true {
+            ink.pick = t
+            return true
+        }
         var k: NoteKeys.Key?
         switch Int(e.keyCode) {
         case kVK_Escape: k = .escape
-        case kVK_Return, kVK_ANSI_KeypadEnter: k = mods.isEmpty ? .returnKey : mods == .shift ? .shiftReturn : nil
+        case kVK_Return, kVK_ANSI_KeypadEnter: k = mods.isEmpty ? .returnKey : mods == .shift ? .shiftReturn : mods == .command ? .commandReturn : nil
         case kVK_Tab: k = mods.isEmpty ? .tab : nil
         case kVK_UpArrow: k = mods.isEmpty ? .up : nil
         case kVK_DownArrow: k = mods.isEmpty ? .down : nil
@@ -1905,8 +2051,14 @@ final class NoteBubble: NSObject, NSTextFieldDelegate {
         if picking { return false }
         // ⌘Z: the last stroke goes when drawing was the last thing done (or there is no text to undo)
         if e.modifierFlags.contains(.command), !e.modifierFlags.contains(.shift), e.charactersIgnoringModifiers == "z",
-           !ink.strokes.isEmpty, inkUndoFirst || field.stringValue.isEmpty {
+           !ink.marks.isEmpty, inkUndoFirst || field.stringValue.isEmpty {
             undoInk(); return true
+        }
+        // ⇧⌘Z: the mark undone last comes back, while undoing marks was the last thing done (else the menu's Redo)
+        if mods == [.command, .shift], e.charactersIgnoringModifiers?.lowercased() == "z", ink.canRedo,
+           inkRedoFirst || field.stringValue.isEmpty {
+            if ink.redo() { inkUndoFirst = true; layout() }
+            return true
         }
         if mode == .recording, e.modifierFlags.contains(.command) {
             if e.keyCode == UInt16(kVK_LeftArrow) { step(-1); return true }
@@ -1952,8 +2104,28 @@ final class NoteBubble: NSObject, NSTextFieldDelegate {
 
     private func undoInk() {
         guard ink.undo() else { return }
-        if ink.strokes.isEmpty { inkUndoFirst = false }
+        inkRedoFirst = true
+        if ink.marks.isEmpty { inkUndoFirst = false }
         layout()
+    }
+    /// ⇧⌘Z redoes a mark: the last ⌘Z took one back (and nothing was typed since)
+    private var inkRedoFirst = false
+
+    /// A text box on the picture ended: the note's field has the keys again.
+    private func textEnded() {
+        guard isOpen else { return }
+        if staged { InkStage.shared.textEnded() }
+        if let p = panel, !NoteBubble.testNoKey, !passive { p.makeKey() }
+        panel?.makeFirstResponder(field)
+        field.currentEditor()?.selectedRange = NSRange(location: (field.stringValue as NSString).length, length: 0)
+    }
+
+    /// ⌘ and a tool's letter, nothing else held (BlurtCore InkPick.forCommandKey).
+    static func toolKey(_ e: NSEvent) -> InkPick? {
+        guard e.type == .keyDown else { return nil }
+        let f = e.modifierFlags
+        return InkPick.forCommandKey(e.charactersIgnoringModifiers, command: f.contains(.command), shift: f.contains(.shift),
+                                     option: f.contains(.option), control: f.contains(.control))
     }
 
     // MARK: the chip: where it goes
@@ -1963,7 +2135,7 @@ final class NoteBubble: NSObject, NSTextFieldDelegate {
     private func togglePick() { picking ? closePick() : openPick() }
 
     private func openPick() {
-        guard mode != .recording, let s = shot, !picking else { return }
+        guard filing, mode != .recording, let s = shot, !picking else { return }
         if pickingKind { closeKinds() }
         picking = true
         pick.current = placeID
@@ -1994,6 +2166,20 @@ final class NoteBubble: NSObject, NSTextFieldDelegate {
 
     // MARK: the type chip: what it is
 
+    /// ⌘-digit or ⌘Z: the panel answers these in performKeyEquivalent, before the main menu.
+    static func claimsBeforeTheMenu(_ e: NSEvent) -> Bool {
+        if commandDigit(e) != nil { return true }
+        let mods = e.modifierFlags.intersection([.command, .option, .control, .shift])
+        // the markup's ⌘-letters, ⌘↩ (copy and done), ⇧⌘Z (a mark's redo): the bubble's first — it hands back what isn't
+        // its own (no picture to mark, no mark to redo), and the menu has them then
+        if toolKey(e) != nil { return true }
+        if mods == .command, e.keyCode == UInt16(kVK_Return) || e.keyCode == UInt16(kVK_ANSI_KeypadEnter) { return true }
+        if mods == [.command, .shift], e.charactersIgnoringModifiers?.lowercased() == "z" { return true }
+        return NoteKeys.takesCommandZBeforeTheMenu(shift: mods.contains(.shift),
+                                                    charactersIgnoringModifiers: e.charactersIgnoringModifiers)
+            && mods.contains(.command) && !mods.contains(.option) && !mods.contains(.control)
+    }
+
     /// ⌘ and a digit, the top row or the keypad, nothing else held: the digit (0–9); nil for any other key.
     static func commandDigit(_ e: NSEvent) -> Int? {
         guard e.type == .keyDown, e.modifierFlags.intersection([.command, .option, .control, .shift]) == .command else { return nil }
@@ -2007,7 +2193,7 @@ final class NoteBubble: NSObject, NSTextFieldDelegate {
 
     /// The type list under the footer; the note's field keeps the keyboard (↑↓ ↩ Esc come here through NoteKeys).
     private func openKinds() {
-        guard let s = shot, !pickingKind else { return }
+        guard filing, let s = shot, !pickingKind else { return }
         if picking { closePick() }
         pickingKind = true
         kindPick.current = chosenKind
@@ -2032,7 +2218,7 @@ final class NoteBubble: NSObject, NSTextFieldDelegate {
 
     /// ⌘1–⌘4 / ⌘0, or a row of the list: the chip says it at once; the shot takes it when the note is saved.
     private func setKind(_ k: NoteKind?, via: String) {
-        guard let s = shot else { return }
+        guard filing, let s = shot else { return }
         chosenKind = k
         kindChip.set(k)
         if pickingKind { closeKinds() }
@@ -2126,6 +2312,14 @@ final class NoteBubble: NSObject, NSTextFieldDelegate {
                 let top = [kVK_ANSI_0, kVK_ANSI_1, kVK_ANSI_2, kVK_ANSI_3, kVK_ANSI_4, kVK_ANSI_5, kVK_ANSI_6, kVK_ANSI_7, kVK_ANSI_8, kVK_ANSI_9]
                 return (top[d], "\(d)", [.command])
             }
+            // cmd-return (⌘↩) · cmd-shift-z (⇧⌘Z) · cmd-L, cmd-T… (a tool's letter)
+            if name == "cmd-return" { return (kVK_Return, "\r", [.command]) }
+            if name == "cmd-shift-z" { return (kVK_ANSI_Z, "Z", [.command, .shift]) }
+            if name.hasPrefix("cmd-"), name.count == 5, let c = name.last?.lowercased() {
+                let codes: [String: Int] = ["p": kVK_ANSI_P, "r": kVK_ANSI_R, "o": kVK_ANSI_O, "l": kVK_ANSI_L, "t": kVK_ANSI_T,
+                                            "m": kVK_ANSI_M, "a": kVK_ANSI_A]
+                return (codes[c] ?? kVK_ANSI_P, c, [.command])
+            }
             switch name {
             case "esc": return (kVK_Escape, "\u{1B}", [])
             case "tab": return (kVK_Tab, "\t", [])
@@ -2202,6 +2396,30 @@ final class NoteBubble: NSObject, NSTextFieldDelegate {
         }
     }
 
+    /// The markup tools (test commands only): `tool NAME` / `color NAME` / `undo` / `copy` — a click on the strip's control
+    /// (in place) or, without a strip (Edit Note), the same choice; `text X,Y TEXT` — a text box there, typed, ↩;
+    /// `textopen X,Y TEXT` — the same left open (being typed); `redo` — ⇧⌘Z. Then the stage's state ("stage_state").
+    func testTool(_ arg: String) {
+        guard isOpen else { return }
+        let a = arg.split(separator: " ", maxSplits: 2).map(String.init)
+        let what = a.first ?? ""
+        switch what {
+        case "tool", "color", "undo", "copy":
+            if staged { InkStage.shared.strip.testClick(what, a.count > 1 ? a[1] : "") }
+            else if what == "tool", let t = InkPick(rawValue: a.count > 1 ? a[1] : "") { ink.pick = t }
+            else if what == "color", let c = InkColor(rawValue: a.count > 1 ? a[1] : "") { ink.color = c }
+            else if what == "undo" { undoInk() }
+        case "text", "textopen":
+            let xy = (a.count > 1 ? a[1] : "0.5,0.5").split(separator: ",").compactMap { Double($0) }
+            ink.pick = .text
+            ink.testText(at: CGPoint(x: xy.first ?? 0.5, y: xy.count > 1 ? xy[1] : 0.5), a.count > 2 ? a[2] : "", end: what == "text")
+        case "redo": testKey("cmd-shift-z")
+        default: break
+        }
+        emit(["event": "stage_state"].merging(InkStage.shared.testState) { $1 }.merging(["note_status": status.stringValue,
+              "first_responder": "\(type(of: panel?.firstResponder as Any))"]) { $1 })
+    }
+
     /// A click on the undo button by the bin (in place), when it shows.
     func testUndoButton() {
         guard isOpen, let b = undoBtn, !b.isHidden else { emit(["event": "note_undo_button", "shown": false]); return }
@@ -2215,6 +2433,8 @@ final class NoteBubble: NSObject, NSTextFieldDelegate {
               let e = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [.command], timestamp: ProcessInfo.processInfo.systemUptime,
                                        windowNumber: p.windowNumber, context: nil, characters: "z", charactersIgnoringModifiers: "z",
                                        isARepeat: false, keyCode: UInt16(kVK_ANSI_Z)) else { return }
+        // a real ⌘Z is a key equivalent first — the Edit menu's Undo — before sendEvent
+        if p.performKeyEquivalent(with: e) { return }
         p.sendEvent(e)
     }
 
@@ -2292,9 +2512,10 @@ final class NoteBubble: NSObject, NSTextFieldDelegate {
          "field": field.stringValue, "placeholder": field.placeholderAttributedString?.string ?? field.placeholderString ?? "",
          "status": status.stringValue, "listening": isListening, "typed": typed, "words_in_field": wordsInField ?? NSNull(),
          "voice_busy": voiceBusy, "strokes": ink.strokes.count, "drawing": ink.isDrawing, "generation": generation,
-         "in_place": staged, "dock": dockSide?.rawValue ?? NSNull(), "chip": chip?.title ?? "", "picking": picking, "undo_button": undoBtn.map { !$0.isHidden } ?? false,
+         "in_place": staged, "dock": dockSide?.rawValue ?? NSNull(), "chip": chip?.isHidden == false ? chip.title : "", "picking": picking,
+         "filing": filing, "undo_button": undoBtn.map { !$0.isHidden } ?? false,
          "project": shot?.project ?? NSNull(), "kind": chosenKind?.rawValue ?? NSNull(), "picking_kind": pickingKind,
-         "kind_chip": kindChip?.label ?? "", "frame": panel.map { [$0.frame.minX, $0.frame.minY, $0.frame.width, $0.frame.height] } ?? [],
+         "kind_chip": kindChip?.isHidden == false ? kindChip.label : "", "frame": panel.map { [$0.frame.minX, $0.frame.minY, $0.frame.width, $0.frame.height] } ?? [],
          "voice_done": voiceDone, "waiting_words": waitingWords, "voice_kept": voiceKept, "taken": accepted,
          "heard": heard.committed + heard.pending, "keys": "\(keyState.voice)", "mic_gone": micGone,
          "recording_paused": island.rec.map { $0.isPaused as Any } ?? NSNull(), "resume_on_close": recordingResume as Any? ?? NSNull()]
@@ -2308,6 +2529,16 @@ final class NoteBubble: NSObject, NSTextFieldDelegate {
 
     /// Blurt is quitting: saved now, no "Saved" moment.
     func commitNow() { if isOpen { close(save: true, flash: false) } }
+
+    /// ⌘↩ (NoteKeys .copyAndFinish, the strip's copy button): saved as ↩ saves it, then onto the clipboard and done —
+    /// no card under the notch (Snapper.copyAndDone: History has it).
+    private var copyOut = false
+    private var canCopyOut: Bool { staged && mode == .listen && shot?.batch?.inRecording == false }
+    func copyAndFinish() {
+        guard isOpen, canCopyOut else { return }
+        copyOut = true
+        close(save: true, flash: false)
+    }
 
     /// Esc on a shot with nothing typed, the bin: a fresh shot is discarded (with Undo); an edit puts things back.
     func cancel() { if isOpen { close(save: false, flash: false) } }
@@ -2422,8 +2653,12 @@ final class NoteBubble: NSObject, NSTextFieldDelegate {
             // in place: the marked picture flies from the selection up to the notch and becomes the card (discarded:
             // the stage just fades)
             dock = nil
-            InkStage.shared.close(flying: !discard)
-            if !discard {
+            // (Cards off — a take's snap: no card catches it, the picture fades with the stage)
+            InkStage.shared.close(flying: !discard && Capability.cards.isOn && !copyOut)
+            if !discard && copyOut {
+                copyOut = false
+                snapper.copyAndDone(s)                  // ⌘↩: the clipboard, no card
+            } else if !discard {
                 // the marked picture as it is on the screen (full size: it starts at the selection's size)
                 let img = s.markedURL.flatMap { FileManager.default.fileExists(atPath: $0.path) ? loadCGImage($0) : nil } ?? s.image()
                 hanging.catchCapture(s, from: sel, image: img)
@@ -2440,11 +2675,15 @@ final class NoteBubble: NSObject, NSTextFieldDelegate {
         let g = generation
         let cb = onClose
         onClose = nil
+        // a note offered after a drop that never took the keyboard has no focus to hand back (the app remembered may
+        // be one from a snap hours ago)
+        let hadKey = !passive
+        passive = false
         // only the newest open may hide the panel and hand the focus back (a bubble opened meanwhile owns them)
         let done = { [weak self] in
             if self?.generation == g, self?.isOpen == false {
                 p?.orderOut(nil)
-                snapper.restoreFocus()
+                if hadKey { snapper.restoreFocus() }
             }
             cb?()
         }
@@ -2482,13 +2721,14 @@ final class NoteBubble: NSObject, NSTextFieldDelegate {
 
     /// Strokes changed → (re)write NNN.marked.png, or drop it when the ink was undone.
     private func applyInk(_ s: Shot) {
-        let strokes = ink.strokes
-        guard strokes != s.strokes || (s.marked == nil && !strokes.isEmpty) else { return }
-        s.strokes = strokes
+        let marks = ink.marks
+        guard marks != s.marks || (s.marked == nil && !marks.isEmpty) else { return }
+        s.marks = marks
+        s.strokes = InkMark.strokes(marks)
         guard let dir = s.batch?.dir else { return }
         let rel = "shots/\(ShotBatch.name(s.n)).marked.png"
         let url = dir.appendingPathComponent(rel)
-        if strokes.isEmpty {
+        if marks.isEmpty {
             try? FileManager.default.removeItem(at: url)
             s.marked = nil
             s.markedThumb = nil
@@ -2497,7 +2737,7 @@ final class NoteBubble: NSObject, NSTextFieldDelegate {
         guard let img = s.image() else { return }
         // the line as wide in the picture as it was drawn (in place: the display's width at the picture's scale)
         let lw = ink.lineWidth * CGFloat(img.width) / max(1, ink.bounds.width)
-        guard let m = renderMarked(img, strokes: strokes, lineWidthPx: lw), let d = pngData(m, scale: s.scale) else { return }
+        guard let m = renderMarks(img, marks: marks, lineWidthPx: lw, pixelsPerPoint: s.scale), let d = pngData(m, scale: s.scale) else { return }
         try? d.write(to: url)
         s.marked = rel
         s.markedThumb = thumbnail(m, maxPixels: 520)

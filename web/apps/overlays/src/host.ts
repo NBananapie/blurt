@@ -56,6 +56,13 @@ export interface Card {
   kind?: 'shot' | 'voice';
   /** the shots batch it belongs to */
   session?: string | null;
+  /** a file card (something dropped on the island that isn't a picture): the file it refers to; `src` is only its face
+   *  — the file's thumbnail with its name on a band */
+  ref?: string | null;
+  /** a text card (text or a link dropped on the island): a voice card with no recording */
+  textCard?: boolean;
+  /** a file card whose file isn't where it was (moved, deleted): "Original file not found" */
+  missing?: boolean;
 }
 
 export interface ProjectRef {
@@ -96,6 +103,8 @@ export interface IslandState {
   cardPrefs?: { snapSound?: boolean; drag?: 'paste' | 'caption' | 'picture' };
   /** Settings → General → "Show the island when idle" (app.island_idle); false: nothing stands at rest */
   idle?: boolean;
+  /** the capabilities turned off (apps/desktop/src-tauri/src/capabilities.rs ids): their buttons and hints don't show */
+  off?: string[];
   /** tests / demo: start expanded */
   expanded?: boolean;
 }
@@ -108,14 +117,14 @@ export type IslandOp =
   | { op: 'cards'; cards: Card[] }
   /** a new capture flies up and a thread catches it; pull = straight on into the island (a project is current) */
   /** `from`: where the capture was taken (the island page's CSS px; island.rs screen_to_css) — it flies from there */
-  | { op: 'card'; card: Card; pull: boolean; from?: CssRect | null }
+  | { op: 'card'; card: Card; pull: boolean; from?: CssRect | null; /** one thing dropped and hung: its note is offered (passive) */ offerNote?: boolean }
   | { op: 'toast'; kind: 'sorted' | 'failed' | 'error'; n?: number; job?: string; code?: string; type?: string }
   /** a card dragged into another app (island.rs): taken, Undo puts it back; `note`: its note went on the clipboard */
   | { op: 'toast'; kind: 'taken'; cards: { n: number; session?: string | null }[]; what?: 'picture' | 'note' | 'text' | 'files' | 'files_note' | 'paths' | 'words' }
   /** a dictation line: `msg` a catalog key, `vars` its values, `action` one button (sent back as `data-a`); `key` what
    *  it is about (a newer line with the same key replaces it; dictation/flow.rs `toast_keys`), `passive` a tip or a
    *  reminder that never covers another line, `mark` the ok check for a done line */
-  | { op: 'toast'; kind: 'dictation'; msg: string; vars?: Record<string, string>; action?: { a: string; label: string; vars?: Record<string, string>; extra?: Record<string, unknown> }; second?: { a: string; label: string; vars?: Record<string, string> }; ms?: number; key?: string; passive?: boolean; mark?: 'mic' | 'check' | 'warning' | 'spinner' | 'folder'; moment?: 'keyboard'; project?: string }
+  | { op: 'toast'; kind: 'dictation'; msg: string; vars?: Record<string, string>; /** a catalog key said on a second line ("You can retry it later from the tray menu") */ more?: string; action?: { a: string; label: string; vars?: Record<string, string>; extra?: Record<string, unknown> }; second?: { a: string; label: string; vars?: Record<string, string> }; ms?: number; key?: string; passive?: boolean; mark?: 'mic' | 'check' | 'warning' | 'spinner' | 'folder'; moment?: 'keyboard'; project?: string }
   /** dictation: what the island says under these keys is over */
   | { op: 'toast_drop'; keys: string[] }
   | { op: 'switcher'; open: boolean }
@@ -126,7 +135,10 @@ export type IslandOp =
   | { op: 'status'; line: StatusLine }
   | { op: 'level'; rms: number }
   /** the system's drag of a card ended: `dropped` in another app (taken), else `cancel` (it comes back) */
-  | { op: 'dragout'; n: number; session?: string | null; result: 'dropped' | 'cancel' }
+  | { op: 'dragout'; n: number; session?: string | null; cards?: { n: number; session?: string | null }[]; result: 'dropped' | 'cancel' }
+  /** another app's drag over the notch (island_drop_win.rs): `enter` with what it carries, `open` the drawer, `over`
+   *  the pointer (CSS px), `close` (it left), `end` (dropped or gone) */
+  | { op: 'ext'; phase: 'enter' | 'open' | 'over' | 'close' | 'end'; what?: { pictures: number; files: number; text: boolean; folders: number }; x?: number; y?: number }
   /** the cards come down and stay a while (a hotkey, the tray, the main window) */
   /** `open`: the island opens too (the main window's "Choose projects…"), until the pointer has come and gone */
   | { op: 'reveal'; open?: boolean }
@@ -148,7 +160,7 @@ export type IslandOp =
   /** a capture's line (a snap, Copy Text / Translate, a recording, a filing): as `dictation`, but it never leads with
    *  the mic — `mark` the ok check, the attention triangle, or nothing (a working line ending in "…" gets the spinner);
    *  `action.extra` rides along with the button's action */
-  | { op: 'toast'; kind: 'capture'; msg: string; vars?: Record<string, string>; action?: { a: string; label: string; extra?: Record<string, unknown> }; ms?: number; key?: string; passive?: boolean; mark?: 'check' | 'warning' | 'peep'; /** where it went: the project's folder in its colour leads the line (`inbox`: Unassigned) */ project?: string }
+  | { op: 'toast'; kind: 'capture'; msg: string; vars?: Record<string, string>; action?: { a: string; label: string; extra?: Record<string, unknown> }; /** quieter choices left of it (the third leftmost) */ second?: { a: string; label: string }; third?: { a: string; label: string }; ms?: number; key?: string; passive?: boolean; mark?: 'check' | 'warning' | 'peep' | 'spinner'; /** where it went: the project's folder in its colour leads the line (`inbox`: Unassigned) */ project?: string }
   /** a picker, a snap's note or a take starting is up: the island steps back; its waiting lines hold until after */
   | { op: 'busy'; on: boolean }
   /** Copy Text / Translate read what was dragged over: Peep thinks in the ear until its line comes */

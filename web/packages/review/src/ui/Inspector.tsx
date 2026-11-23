@@ -3,12 +3,13 @@ import { KindIcon, StatusRing } from "@blurt/ui/react";
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { FixRecord, Item, WorkRecord } from "../host";
 import { fieldLabel } from "../fields";
+import { attachedFiles, fileFolder, fileKind, fileName, nameParts } from "../files";
 import { isEnter } from "../ime";
 import { listKey, type ListKey } from "../listedit";
 import { isTitle, kindOf, SEV, type ReviewStore } from "../store";
-import { Icon, type IconName } from "./Icon";
+import { FileIcon, Icon, type IconName } from "./Icon";
 import { cx, useStore } from "./ctx";
-import { agentName, StateControl } from "./Queue";
+import { namedAgent, StateControl } from "./Queue";
 import { isMacLike } from "./TopBar";
 import { MovePicker } from "./Views";
 
@@ -21,6 +22,8 @@ const RESERVED = new Set(["id", "uid", "kind", "title", "quote", "time", "frames
   "updated", "path", "store", "aliases", "language", "assignee", "enrich"]);
 /** shown by the kind's own layout (issue: its code refs): never repeated as a generic field */
 const CUSTOM = new Set(["code_refs"]);
+/** shown by a layout of their own on every kind (attached files: one row a file, AttachedFiles) */
+const OWN = new Set(["attachments"]);
 
 function format(i: Item, k: string, type: FieldType): string {
   if (type === "src") return i.source?.url || "";
@@ -376,7 +379,7 @@ function WorkPanel({ i }: { i: Item }) {
     if (back !== null) autosize(noteRef.current, 160);
   }, [back]);
   if (!rec || st === "new" || st === "discarded") return null;
-  const agent = rec.agent && rec.agent !== "human" ? agentName(s, rec.agent) : null;
+  const agent = namedAgent(s, rec.agent);
   const who = rec.by === "user" ? s.t("work.by_you") : agent ? s.t("work.by", { who: agent }) : "";
   const when = rec.at ? s.ago(rec.at) : "";
   // while it is with the agent a host banner may say so (the app windows)
@@ -567,7 +570,7 @@ function WorkHistory({ i }: { i: Item }) {
           <li key={n} className={"s-" + (f.state ?? "todo")}>
             <span className="wls">{s.stateLabel(f.state ?? "todo")}</span>
             {/* a hand-off was the user's, to the agent: "Handed off · to Claude Code", not "by" it */}
-            {f.agent && f.agent !== "human" ? <span className="wla">{s.t(f.state === "handed_off" ? "work.to" : "work.by", { who: agentName(s, f.agent) })}</span> : null}
+            {namedAgent(s, f.agent) ? <span className="wla">{s.t(f.state === "handed_off" ? "work.to" : "work.by", { who: namedAgent(s, f.agent)! })}</span> : null}
             {f.commit ? <code>{shortSha(f.commit)}</code> : null}
             {f.pr ? (
               <a href={f.pr} target="_blank" rel="noreferrer">
@@ -584,7 +587,7 @@ function WorkHistory({ i }: { i: Item }) {
   );
 }
 
-const SOURCE_ICON: Record<string, IconName> = { recording: "video", snap: "snap", voice: "waveform", dictation: "mic", url: "external-link", import: "download", service: "agent" };
+const SOURCE_ICON: Record<string, IconName> = { manual: "pencil", recording: "video", snap: "snap", voice: "waveform", dictation: "mic", url: "external-link", import: "download", service: "agent" };
 
 /** "com.apple.TextEdit" → "TextEdit": an older dictation row stored the app's bundle id; people see its last part */
 export const appLabel = (app: string) => (/^[a-z0-9-]+(\.[A-Za-z0-9-]+){2,}$/.test(app) ? app.split(".").pop()! : app);
@@ -627,8 +630,10 @@ function Provenance({ i }: { i: Item }) {
       </span>,
     );
   // the Mac's own account name ("by john") is you: never the raw login
-  if (src.by)
-    line.push(<span key="b">{String(src.by).toLowerCase() === String(s.data.me ?? "").toLowerCase() ? s.t("work.by_you") : s.t("source.by_who", { who: String(src.by) })}</span>);
+  // "Added by hand" by you says itself: no "by you" after it
+  const byMe = String(src.by ?? "").toLowerCase() === String(s.data.me ?? "").toLowerCase();
+  if (src.by && !(type === "manual" && byMe))
+    line.push(<span key="b">{byMe ? s.t("work.by_you") : s.t("source.by_who", { who: String(src.by) })}</span>);
   const rows: [string, React.ReactNode][] = [];
   if (src.app) rows.push([s.t("source.app"), appLabel(String(src.app))]);
   // the page once: not again when a field of the item already holds the same address (its Source link)
@@ -694,6 +699,88 @@ function Provenance({ i }: { i: Item }) {
   );
 }
 
+/** The item's attached files (`attachments`: a dropped PDF, video, document — absolute paths), one row a file: its
+    kind's icon, its name (cut in the middle, the extension stays), the folder it is in (dim, the home folder as ~, cut
+    from the left). The row is a button: Quick Look where the host has it, else Show in Finder / in folder, else it
+    copies the path. At its end, on hover or focus (their room is always kept, nothing moves): Show in Finder and
+    Remove — one undoable field edit, like any other; ⌫ on the row removes too. A read-only item has no Remove. */
+function AttachedFiles({ i }: { i: Item }) {
+  const s = useStore();
+  const h = s.host;
+  const list = useRef<HTMLUListElement>(null);
+  const refocus = useRef(-1);
+  const files = attachedFiles(i.attachments);
+  useEffect(() => {
+    const n = refocus.current;
+    refocus.current = -1;
+    // the keyboard stays in the list after a Remove: the row that took the removed one's place, else the one before
+    if (n >= 0) list.current?.querySelectorAll<HTMLElement>(".file-open")[Math.min(n, files.length - 1)]?.focus();
+  });
+  if (!files.length) return null;
+  const label = fieldLabel("attachments", s.i18n);
+  const revealL = s.label(h.host === "macos" ? "media.reveal_mac" : "media.reveal");
+  const openL = h.quickLook ? s.label("media.quick_look") : h.reveal ? revealL : s.label("files.copy_path");
+  const editable = !s.readOnly(i);
+  const remove = (at: number, row: number, name: string) => {
+    if (list.current?.contains(document.activeElement)) refocus.current = row;
+    const all = Array.isArray(i.attachments) ? i.attachments : [i.attachments];
+    s.beginEdit(i, "attachments");
+    s.setField(i, "attachments", all.filter((_, n) => n !== at));
+    s.endEdit(i);
+    s.showToast(s.t("files.removed", { name }), true);
+  };
+  return (
+    <section className="files" id="files" aria-labelledby="filesH">
+      <h4 className="sec-h" id="filesH">{label}</h4>
+      <ul ref={list}
+        // a key pressed on a row is the row's: never also the page's (Enter keeps the item, Space plays, ⌫ discards it)
+        onKeyDown={(e) => {
+          const del = e.key === "Backspace" || e.key === "Delete";
+          if ((!del && e.key !== "Enter" && e.key !== " ") || e.metaKey || e.ctrlKey || e.altKey) return;
+          e.stopPropagation();
+          const row = del ? (e.target as HTMLElement).closest<HTMLElement>(".file-open")?.parentElement : null;
+          if (!row) return;
+          e.preventDefault();
+          const k = [...row.parentElement!.children].indexOf(row);
+          if (editable && files[k]) remove(files[k][0], k, fileName(files[k][1]));
+        }}>
+        {files.map(([at, path], row) => {
+          const name = fileName(path);
+          const [head, tail] = nameParts(name);
+          const dir = fileFolder(path);
+          return (
+            <li className="file" key={at + path}>
+              <button className="file-open" title={path} aria-label={s.t("files.act", { action: openL, name })} aria-keyshortcuts={editable ? "Backspace" : undefined}
+                onClick={() => (h.quickLook ? h.quickLook(path) : h.reveal ? h.reveal(path) : s.copy(path))}>
+                <span className="file-ic"><FileIcon kind={fileKind(path)} /></span>
+                <span className="file-n">
+                  <span>{head}</span>
+                  {tail && <span>{tail}</span>}
+                </span>
+                {/* about as wide as its words, a fifth of the row at most: what a long name always leaves it */}
+                {dir && <span className="file-d" style={{ minWidth: `min(${Math.ceil(dir.length * 0.5)}em, 22%)` }}><span>{dir}</span></span>}
+              </button>
+              <span className="file-a">
+                {h.quickLook && h.reveal && (
+                  <button title={revealL} aria-label={s.t("files.act", { action: revealL, name })} onClick={() => h.reveal!(path)}>
+                    <Icon name="reveal" />
+                  </button>
+                )}
+                {editable && (
+                  <button className="file-rm" title={s.label("files.remove")} aria-label={s.t("files.act", { action: s.label("files.remove"), name })}
+                    onClick={() => remove(at, row, name)}>
+                    <Icon name="x" />
+                  </button>
+                )}
+              </span>
+            </li>
+          );
+        })}
+      </ul>
+    </section>
+  );
+}
+
 /** One field of the inspector: key, label, editor type, class; `pair` sets two short ones side by side. */
 type Spec = { k: string; label: string; type?: FieldType; cls?: string; pair?: string };
 
@@ -726,7 +813,7 @@ function specsOf(i: Item, kind: string, s: ReviewStore): { body: Spec; prompt: s
   // (another kind's field — an idea's `expected` after a kind change — included)
   const own = new Set([body.k, ...rest.map((f) => f.k)]);
   for (const [k, v] of Object.entries(i)) {
-    if (RESERVED.has(k) || own.has(k) || k.startsWith("_") || (kind === "issue" && CUSTOM.has(k))) continue;
+    if (RESERVED.has(k) || OWN.has(k) || own.has(k) || k.startsWith("_") || (kind === "issue" && CUSTOM.has(k))) continue;
     if (typeof v === "string") rest.push({ k, label: fieldLabel(k, s.i18n) });
     else if (Array.isArray(v) && v.every((x) => typeof x === "string")) rest.push({ k, label: fieldLabel(k, s.i18n), type: "list" });
   }
@@ -849,6 +936,14 @@ export function Inspector({ media }: { media?: React.ReactNode } = {}) {
   }
   const typeChoices: [string, string][] = kind === "issue" && !i.type ? s.types.map((t) => [t, s.typeLabel(t)]) : [];
   body.push(<AddField key="add" specs={[...(mainShown ? [] : [main]), ...rest.filter((f) => !shown.includes(f))]} types={typeChoices} onAdd={(k) => open(k, true)} onType={s.setType} />);
+  // …and next to it, the way in for a picture or a file from disk (the host's picker; a drop or a paste does the same)
+  if (s.host.addFiles && i.uid && !s.readOnly(i))
+    body.push(
+      <button key="addfile" id="addFiles" className="btn sm ghost addf addfile" onClick={() => s.host.addFiles!(String(i.uid))}>
+        <Icon name="plus" size={14} />
+        {s.t("files.add")}
+      </button>,
+    );
 
   const item = s.mode === "item";
   const props = (
@@ -954,6 +1049,8 @@ export function Inspector({ media }: { media?: React.ReactNode } = {}) {
         </section>
       )}
       <div className="fields">{body}</div>
+      {/* before the pictures: a tall screenshot would push the files out of sight (an item that is its PDF) */}
+      <AttachedFiles i={i} />
       {media}
       <WorkHistory i={i} />
       <Provenance i={i} />

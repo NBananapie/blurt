@@ -370,6 +370,10 @@ public final class HotkeyCenter {
     public var suspended = false { didSet { apply() } }
     /// Actions that should not be offered or registered here (e.g. openMain before there is a main window).
     public var disabled: Set<Action> = []
+    /// Actions whose keys are set and fine but not held as global keys right now: the recording's own (Pause, Draw,
+    /// Finish) while nothing is being recorded, so ⌥P / ⌥D / ⌥S stay the front app's (Capability.whileRecording).
+    /// They keep their place in the checks (a duplicate of one is still a duplicate) and read as set everywhere.
+    public var standby: Set<Action> = []
 
     public var onFire: ((Action) -> Void)?
     /// The keys of an action were let go (only voice input cares: push-to-talk)
@@ -493,6 +497,7 @@ public final class HotkeyCenter {
             // where the app shows its keys, never registered (the Blurt in use keeps its own)
             if HotkeyCenter.testKeysFree { states[a] = system.contains(s) ? .system : .ok; continue }
             if let o = others.first(where: { $0.keys.contains(s) }) { states[a] = .taken(o.pid); continue }
+            if standby.contains(a) { states[a] = system.contains(s) ? .system : .ok; continue }
             let st = registerRaw(a.carbonID, code: s.code, mods: s.mods)
             if st != noErr { states[a] = .failed(st); continue }
             states[a] = system.contains(s) ? .system : .ok
@@ -515,16 +520,18 @@ public final class HotkeyCenter {
     public func markWarned() { if !conflicts.isEmpty { Config.shared.set("record.hotkeys_warned", conflictSignature) } }
 
     /// A one-time toast per distinct set of conflicts (remembered in config, so it doesn't nag every launch).
-    public func warnOnce(_ toast: (String) -> Void) {
+    /// `alsoTaken`: other keys that don't work here, counted with them as Settings → Shortcuts and the welcome line
+    /// count them (the dictation key another copy of Blurt listens to) — one number everywhere.
+    public func warnOnce(alsoTaken: Int = 0, _ toast: (String) -> Void) {
         let c = conflicts
         let sig = conflictSignature
         guard !c.isEmpty, Config.shared["record.hotkeys_warned"] as? String != sig else { return }
         Config.shared.set("record.hotkeys_warned", sig)
         // the first line is what the island shows: one key by name, several by how many (the list is in Settings —
         // eleven names never fit the island's row)
-        let first = c[0], why = states[first]?.text ?? ""
-        let head = c.count == 1 ? Loc.t("capture.keys.wont_work", table: "Capture", label(first))
-            : Loc.t("capture.keys.wont_work_many", table: "Capture", "\(c.count)")
+        let first = c[0], why = states[first]?.text ?? "", n = c.count + max(alsoTaken, 0)
+        let head = n == 1 ? Loc.t("capture.keys.wont_work", table: "Capture", label(first))
+            : Loc.t("capture.keys.wont_work_many", table: "Capture", "\(n)")
         toast(head + "\n"
               + (c.count == 1 ? Loc.t("capture.keys.why", table: "Capture", label(first), why) : Loc.t("capture.keys.taken_or_twice", table: "Capture"))
               + Loc.t("capture.keys.change_it", table: "Capture"))
@@ -569,6 +576,9 @@ public final class HotkeyCenter {
         if let r = ref { refs[id] = r }
         return st
     }
+
+    /// tests: whether `id` is registered with Carbon now
+    public func isRegisteredRaw(_ id: UInt32) -> Bool { refs[id] != nil }
 
     public func unregisterRaw(_ id: UInt32) {
         if let r = refs.removeValue(forKey: id) { UnregisterEventHotKey(r) }

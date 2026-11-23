@@ -1,3 +1,14 @@
+# Working on Blurt
+
+- **User-facing copy** (any string a user sees, in any language, on any platform): follow
+  [docs/design/copy.md](docs/design/copy.md). Run `python3 tools/copy-check.py` and read every line it prints before sending a change.
+  When you hand work that touches strings to another agent, include that file and the agreed terms in its brief.
+- **Design docs** in docs/design say why things are the way they are, with measurements. Read the one for the area you change, and update it.
+- **The phone ↔ computer wire** has three implementations kept in sync by `tests/remote-vectors/vectors.json`
+  ([docs/design/remote-protocol.md](docs/design/remote-protocol.md)).
+
+---
+
 # Blurt Windows Fork 协作与开发守则
 
 本文件用于约束在此仓库（`NBananapie/blurt`）进行持续开发、测试与向 `AGIHunt/blurt` 提交 PR 时的仓库规范。
@@ -9,7 +20,7 @@
 * **隔离 Fork 专属提交**：以下内容仅保留在 `windows` 分支，不得混入发往上游的 PR：
   * `apps/desktop/src-tauri/tauri.conf.json` 中清空官方 `updater.endpoints` / `pubkey` 的配置
   * `.github/workflows/*.yml` 中为触发 `windows` 分支 CI 所做的 `branches` 扩展
-  * `WINDOWS.md` 与 `AGENTS.md`
+  * `WINDOWS.md` 与 `AGENTS.md` 中的 Fork 专属段落
 * **禁止提交产物与锁文件**：不得提交 `.blurt/`、`/dist/`、模型权重文件以及 `pnpm-lock.yaml`。
 
 ## 2. Windows 编码与架构约定

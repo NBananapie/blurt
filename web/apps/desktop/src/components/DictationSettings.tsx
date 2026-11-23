@@ -3,31 +3,56 @@
 //   Dictation       the switch, the key, how it starts and stops, the sounds · the style (Verbatim / Light) · what
 //                   double-tap Ctrl translates into and the model that translates · the history (how long, clear)
 //                   and the models dictation runs on (chosen in Models)
-//   Copy Text …     what Alt+Shift+T translates into (its own target, not dictation's) and the model that translates
+//   Text & Trans…   what Alt+Shift+T translates into (its own target, not dictation's; under Auto, where other
+//                   languages go) and the model that translates; how long the history keeps what was read, Open
+//                   History… (the Text & Translation page) and Clear History…
 //   Models          the recommended download while it is missing · the cloud models you connected (the key in
 //                   Windows Credential Manager, never in a file; Add Cloud Model… is a sheet with Test) · the model
 //                   each job uses · every speech model on this PC
 // What the Mac has here that Windows doesn't (yet): docs/design/windows-parity/settings.md.
 import { useEffect, useRef, useState } from 'react';
 import { api, builds, listen, type AgentSetupState, type AgentSetupStep, type AppStatus, type AsrModel, type CloudSummary, type CuratedOption, type DictationHistory, type PolishModels, type VoiceprintEvent, type VoiceprintStatus } from '../api';
-import { t } from '../i18n';
+import { plural, t } from '../i18n';
+import { wouldPrune } from '../dictation';
 import { Icon } from '@blurt/icons';
-import { Group, Line, Page, Popup, Row, S, Switch, TextLink, Toggle } from '../settings/kit';
-import { mb, ModelProgress, useDictationModels, usePolishModels } from './ModelDownload';
+import { Group, lang, Line, Page, Popup, Row, S, Switch, TextLink, Toggle } from '../settings/kit';
+import { Confirm } from '../settings/PhonePane';
+import { mb, ModelProgress, roomLine, useDictationModels, usePolishModels } from './ModelDownload';
+import { goSettingsPane } from './SettingsView';
 import { openWordsTab } from './DictationView';
 import { Menu, type MenuAt, type MenuEntry } from './Menu';
 import { KeyCaps } from './SettingsView';
-import { detectKey, endpointOf, hostOf, isCustom, isRegional, systemRegion, TEXT_PRESETS, textPreset, type Region } from '../settings/cloudPresets';
+import { addSheetServices, CURATED, detectKey, dictatesOn, endpointOf, hostOf, isCustom, isRegional, listIn, offersDictation, RECOGNISER, sheetJobs, SPEECH_PRESETS, systemRegion,
+  TEXT_PRESETS, textPreset, usesOf, type Endpoint, type Region, type TextJob, type TextPreset } from '../settings/cloudPresets';
 
 type Save = (patch: Record<string, unknown>) => Promise<void>;
 
-/** The translate targets (the Mac's DictationTranslateTarget), each by its own name. Auto is the pair Windows' polish
- * server uses for "auto": Chinese ↔ English. */
+/** The translate targets (the Mac's DictationTranslateTarget), each by its own name. */
 const TARGETS: [string, string][] = [
   ['en', 'English'], ['zh', '简体中文'], ['zh-Hant', '繁體中文'], ['ja', '日本語'], ['ko', '한국어'], ['fr', 'Français'],
   ['de', 'Deutsch'], ['es', 'Español'], ['pt', 'Português'], ['it', 'Italiano'], ['ru', 'Русский'],
 ];
-const targetChoices = (): [string, string][] => [['auto', S('dictation.translate.target.auto', '简体中文', 'English')], ...TARGETS];
+const endonym = (code: string) => TARGETS.find(([k]) => k === code)?.[1] ?? code;
+/** Auto: the user's own language ↔ the other one (screen_text/direction.rs `Pair::of`, the Mac's TranslateAutoPair:
+ *  Blurt's language when picked, else the system's; the other is English, or for an English user their next system
+ *  language, or none). Read again when Blurt's language changes. */
+export type AutoPair = { home: string; other: string | null };
+function useAutoPair(lang: unknown): AutoPair {
+  const [p, setP] = useState<AutoPair>({ home: 'en', other: null });
+  useEffect(() => {
+    api.translateAutoPair().then(setP, () => {});
+  }, [String(lang ?? '')]);
+  return p;
+}
+/** "Auto: 简体中文 ↔ English" / "Auto: into English" (the Mac's auto_one: a key ending in _one reads as a plural form here), then every language by its own name. */
+const targetChoices = (p: AutoPair): [string, string][] => [
+  ['auto', p.other ? S('dictation.translate.target.auto', endonym(p.home), endonym(p.other)) : S('dictation.translate.target.auto_into', endonym(p.home))],
+  ...TARGETS,
+];
+/** The row's line under Auto: without a pair, how to translate text in your own language; with one (Alt+Shift+T's
+ *  row only), where other languages go. */
+const autoNote = (target: string, p: AutoPair) => (target === 'auto' && !p.other ? S('dictation.translate.target.auto_one.note', endonym(p.home)) : undefined);
+const autoOthers = (target: string, p: AutoPair) => (target === 'auto' && p.other ? S('dictation.translate.target.auto_others', endonym(p.home)) : undefined);
 /** what an older Windows build wrote ("zh-Hans") in the Mac's words */
 const normTarget = (v: unknown) => (v === 'zh-Hans' ? 'zh' : typeof v === 'string' && [...TARGETS.map(([k]) => k), 'auto'].includes(v) ? v : 'auto');
 
@@ -124,6 +149,7 @@ export function DictationPane({ cfg, save, goModels, goTranslate, keyOf, portalK
   portalKey?: string | null;
 }) {
   const d = cfg.record?.dictation ?? {};
+  const pair = useAutoPair(cfg.lang);
   const set = (patch: Record<string, unknown>) => save({ record: { dictation: { ...d, ...patch } } });
   // record.dictation.* as dictation/prefs.rs reads it (the Mac's keys; the engine reloads them when the file changes)
   const key = normDictationKey(d.key);
@@ -146,6 +172,14 @@ export function DictationPane({ cfg, save, goModels, goTranslate, keyOf, portalK
   const [words, setWords] = useState<{ term: string; state: string; source?: string }[] | null>(null);
   const [byApp, setByApp] = useState(false);
   const [confirmClear, setConfirmClear] = useState(false);
+  // a shorter period (or Don't keep) that would delete saved dictations: asked first, as Clear History is (the Mac's
+  // chooseRetention) — it used to delete them at once
+  const [askKeep, setAskKeep] = useState<{ days: number; n: number } | null>(null);
+  const chooseKeep = (v: number) => {
+    const n = (v < days || v === 0) && hist ? wouldPrune(hist.entries, v) : 0;
+    if (n > 0) setAskKeep({ days: v, n });
+    else set({ retention_days: v === 30 ? undefined : v });
+  };
   const loadHist = () => api.dictationHistory().then(setHist, () => {});
   const loadWords = () => api.dictationWords().then((w) => setWords(w.terms), () => {});
   useEffect(() => {
@@ -351,8 +385,8 @@ export function DictationPane({ cfg, save, goModels, goTranslate, keyOf, portalK
 
       <Group id="dictation.translation">
         <div className={`st-set ${on ? '' : 'off'}`} inert={!on}>
-          <Row id="dictation.translate">
-            <Popup label={S('dictation.translate.settings.title')} value={normTarget(d.translate_target)} wide dividers={[1]} choices={targetChoices()}
+          <Row id="dictation.translate" detail={autoNote(normTarget(d.translate_target), pair)}>
+            <Popup label={S('dictation.translate.settings.title')} value={normTarget(d.translate_target)} wide dividers={[1]} choices={targetChoices(pair)}
               onChange={(v) => set({ translate_target: v === 'auto' ? undefined : v })} />
           </Row>
         </div>
@@ -370,8 +404,27 @@ export function DictationPane({ cfg, save, goModels, goTranslate, keyOf, portalK
           <Popup label={S('dictation.history.keep')} value={days} dividers={hist?.entries.length ? [4, 5] : [4]}
             choices={[...[7, 30, 90, 365].map((n) => [n, S('dictation.history.days', n)] as [number, string]), [0, S('dictation.history.dont_keep')] as [number, string],
               ...(hist?.entries.length ? [[-1, S('dictation.history.clear')] as [number, string]] : [])]}
-            onChange={(v) => (v === -1 ? setConfirmClear(true) : set({ retention_days: v === 30 ? undefined : v }))} />
+            onChange={(v) => (v === -1 ? setConfirmClear(true) : chooseKeep(v))} />
         </Row>
+        {askKeep && (
+          <div className="overlay" onClick={() => setAskKeep(null)}>
+            <div className="sheet dict-confirm" role="alertdialog" aria-modal="true" onClick={(e) => e.stopPropagation()}
+              onKeyDown={(e) => e.key === 'Escape' && setAskKeep(null)}>
+              <h3>{plural('dictation_page.keep.title', askKeep.n)}</h3>
+              <p>{askKeep.days === 0 ? t('dictation_page.keep.off') : t('dictation_page.keep.days', { days: plural('dictation_page.days', askKeep.days) })}
+                {' '}{t('dictation_page.clear.undo')}</p>
+              <div className="dict-confirm-foot">
+                <button autoFocus className="dict-confirm-cancel" onClick={() => setAskKeep(null)}>{t('dictation_page.clear.cancel')}</button>
+                <button className="dict-danger-tint" onClick={async () => {
+                  const v = askKeep.days;
+                  setAskKeep(null);
+                  await set({ retention_days: v === 30 ? undefined : v });
+                  loadHist();
+                }}>{t('dictation_page.keep.confirm')}</button>
+              </div>
+            </div>
+          </div>
+        )}
         {confirmClear && (
           <div className="overlay" onClick={() => setConfirmClear(false)}>
             <div className="sheet dict-confirm" role="alertdialog" aria-modal="true" onClick={(e) => e.stopPropagation()}
@@ -517,10 +570,37 @@ function VoiceprintSheet({ ready, onClose, onLearned }: { ready: boolean; onClos
   );
 }
 
-// ------------------------------------------------------------------ Copy Text from Screen
+// ------------------------------------------------------------------ Text & Translation
 
-export function ScreenTextPane({ cfg, save, goTranslate, linux = false }: { cfg: Record<string, any>; save: Save; goTranslate: () => void; linux?: boolean }) {
+export function ScreenTextPane({ cfg, save, goTranslate, openHistory, linux = false }: { cfg: Record<string, any>; save: Save; goTranslate: () => void; openHistory?: () => void; linux?: boolean }) {
   const st = cfg.record?.screen_text ?? {};
+  const pair = useAutoPair(cfg.lang);
+  // the history (screen_text/history.rs): how long (record.screen_text.history_days: 7, 30 — the default, no key —,
+  // -1 forever, 0 not kept), how many; reading it prunes it to what is kept
+  const days: number = typeof st.history_days === 'number' ? st.history_days : 30;
+  const [count, setCount] = useState<number | null>(null);
+  const [times, setTimes] = useState<number[]>([]);
+  const [confirmClear, setConfirmClear] = useState(false);
+  // a shorter period, or Don't keep, that would delete entries asks first ("Delete 12 entries?", 2026-11-21)
+  const [confirmDays, setConfirmDays] = useState<{ days: number; n: number } | null>(null);
+  const loadCount = () => api.screenTextHistory().then((h) => { setCount(h.count); setTimes(h.entries.map((e) => e.time)); },
+    () => setCount(0));
+  useEffect(() => {
+    void loadCount();
+    return listen('screen-text://changed', () => void loadCount());
+  }, [days]);
+  const setDays = (d: number) => {
+    const { history_days: _, ...rest } = st;
+    void save({ record: { screen_text: { ...rest, ...(d === 30 ? {} : { history_days: d }) } } });
+  };
+  const wouldDelete = (d: number) => d < 0 ? 0 : d === 0 ? times.length : times.filter((t) => t < Date.now() / 1000 - d * 86400).length;
+  const pickDays = (d: number) => {
+    if (d === days) return;
+    const n = wouldDelete(d);
+    if (n > 0) setConfirmDays({ days: d, n });
+    else setDays(d);
+  };
+  const CLEAR = -9;
   // Linux: GNOME asks once before Blurt may take screenshots, and only with Blurt in front — so it is asked here
   // (screen_text_allow; the island's "Allow…" opens this row)
   const [allowed, setAllowed] = useState<boolean | null>(null);
@@ -574,14 +654,67 @@ export function ScreenTextPane({ cfg, save, goTranslate, linux = false }: { cfg:
         </Row>
       </Group>
       <Group id="screentext.translation">
-        <Row id="screentext.translate">
-          {/* the same 240 px as dictation's target (the Mac's TranslateTargets.popupWidth): "Auto: 简体中文 ⇄ English" whole */}
-          <Popup label={S('settings.screen_text.translate', '')} value={normTarget(tr.target)} wide dividers={[1]} choices={targetChoices()}
+        <Row id="screentext.translate" detail={autoNote(normTarget(tr.target), pair) ?? autoOthers(normTarget(tr.target), pair)}>
+          {/* the same 240 px as dictation's target (the Mac's TranslateTargets.popupWidth): "Auto: 简体中文 ↔ English" whole */}
+          <Popup label={S('settings.screen_text.translate', '')} value={normTarget(tr.target)} wide dividers={[1]} choices={targetChoices(pair)}
             onChange={(v) => save({ record: { screen_text: { ...st, translate: { cloud: tr.cloud ?? true, ...(v === 'auto' ? {} : { target: v }) } } } })} />
         </Row>
         <Row id="screentext.translate_model" detail={uses(sum, 'translate', curated, polish)}>
           <button onClick={goTranslate}>{S('models.uses.change')}</button>
         </Row>
+      </Group>
+      <Group id="screentext.history_section">
+        {/* how long, and — under a line, last — Clear History… (as dictation's history row: never a destructive
+            button at rest) */}
+        <Row id="screentext.history_keep"
+          detail={days === 0 ? S('settings.screen_text.history.summary.off') : count === null ? undefined
+            : days < 0 ? S('settings.screen_text.history.summary.forever', count) : S('settings.screen_text.history.summary', count, S('dictation.history.days', days))}>
+          <Popup label={S('settings.screen_text.history.keep')} value={days} dividers={count ? [3, 4] : [3]}
+            choices={[[7, S('dictation.history.days', 7)] as [number, string], [30, S('dictation.history.days', 30)] as [number, string],
+              [-1, S('settings.screen_text.history.forever')] as [number, string], [0, S('dictation.history.dont_keep')] as [number, string],
+              ...(count ? [[CLEAR, S('settings.screen_text.history.clear')] as [number, string]] : [])]}
+            onChange={(v) => (v === CLEAR ? setConfirmClear(true) : pickDays(v))} />
+        </Row>
+        {openHistory && days !== 0 && (
+          <Row id="screentext.history">
+            <button onClick={openHistory}>{S('settings.screen_text.history.open')}</button>
+          </Row>
+        )}
+        {confirmDays && (
+          <div className="overlay" onClick={() => setConfirmDays(null)}>
+            <div className="sheet dict-confirm" role="alertdialog" aria-modal="true" onClick={(e) => e.stopPropagation()}
+              onKeyDown={(e) => e.key === 'Escape' && setConfirmDays(null)}>
+              <h3>{S('settings.screen_text.history.shorten.title', confirmDays.n)}</h3>
+              <p>{confirmDays.days === 0 ? S('settings.screen_text.history.shorten.off', confirmDays.n)
+                : S('settings.screen_text.history.shorten.message', S('dictation.history.days', confirmDays.days))}</p>
+              <div className="dict-confirm-foot">
+                <button autoFocus className="dict-confirm-cancel" onClick={() => setConfirmDays(null)}>{S('settings.screen_text.history.cancel')}</button>
+                <button className="dict-danger-tint" onClick={() => {
+                  const d = confirmDays.days;
+                  setConfirmDays(null);
+                  setDays(d);
+                }}>{S('settings.screen_text.history.shorten.confirm')}</button>
+              </div>
+            </div>
+          </div>
+        )}
+        {confirmClear && (
+          <div className="overlay" onClick={() => setConfirmClear(false)}>
+            <div className="sheet dict-confirm" role="alertdialog" aria-modal="true" onClick={(e) => e.stopPropagation()}
+              onKeyDown={(e) => e.key === 'Escape' && setConfirmClear(false)}>
+              <h3>{S('settings.screen_text.history.clear.title')}</h3>
+              <p>{S('settings.screen_text.history.clear.message', count ?? 0)}</p>
+              <div className="dict-confirm-foot">
+                <button autoFocus className="dict-confirm-cancel" onClick={() => setConfirmClear(false)}>{S('settings.screen_text.history.cancel')}</button>
+                <button className="dict-danger-tint" onClick={async () => {
+                  setConfirmClear(false);
+                  await api.screenTextHistoryClear().catch(() => {});
+                  void loadCount();
+                }}>{S('settings.screen_text.history.clear.confirm')}</button>
+              </div>
+            </div>
+          </div>
+        )}
       </Group>
     </Page>
   );
@@ -589,7 +722,6 @@ export function ScreenTextPane({ cfg, save, goTranslate, linux = false }: { cfg:
 
 // ------------------------------------------------------------------ Models
 
-type TextJob = 'polish' | 'translate' | 'vision';
 /** the curated services (CloudServiceSheetModel.curated); Volcengine Speech is speech-only, with an App ID and an Access
  *  Token kept together as one Credential Manager item (housekeeping.rs `cloud_connect_speech`) */
 const PRESETS = [
@@ -605,6 +737,21 @@ const volcOffered = () => {
 };
 /** a preset's string key: "volcengine-speech" → models.preset.volcengine_speech */
 const presetKey = (p: string) => p.replace(/-/g, '_');
+export const presetName = (p: string) => S(`models.preset.${presetKey(p)}`);
+/** a job by its row's title (听写, 听写润色, 翻译, 截图取字) */
+const jobTitle = (j: string) => S(j === 'polish' ? 'speech.purpose.polish' : j === 'translate' ? 'models.job.translate' : j === 'vision' ? 'models.job.vision' : 'speech.purpose.dictation');
+/** a Custom Model check's failure in a line (cloud_custom_connect's codes) */
+const customFailure = (code?: string) => S(({
+  address: 'models.check.address', model_id: 'models.check.model_id', no_key: 'models.check.no_key', key_spaces: 'models.key.spaces',
+  key_characters: 'models.key.characters', auth: 'models.check.auth', network: 'models.check.network', timeout: 'models.check.network',
+  rate_limited: 'models.check.rate', model: 'models.check.model', vision: 'models.check.vision', empty: 'models.check.empty',
+} as Record<string, string>)[code ?? ''] ?? 'models.check.other');
+/** Custom Model's lead, then where a new key is kept */
+const customLead = (newKey: boolean) =>
+  newKey ? [S('models.custom.lead'), S('models.sheet.note')].join(/[。！？]$/.test(S('models.custom.lead')) ? '' : ' ') : S('models.custom.lead');
+/** the model ids to suggest for a service: Blurt's measured ones for these jobs there, then the ones its docs name */
+const knownModels = (curated: Record<string, CuratedOption[]>, jobs: TextJob[], preset: string, ep?: Endpoint) =>
+  [...new Set([...jobs.flatMap((j) => (curated[j] ?? []).filter((o) => o.service === preset).map((o) => o.model)), ...(ep?.known ?? [])])];
 type Service = CloudSummary['services'][number];
 /** what a connected service is called: its preset's name, or for the user's own address its name, else its host (the
  *  Mac's CloudStore.name) */
@@ -618,8 +765,6 @@ const splitPick = (v: string): [string, string] => {
   return [v.slice(0, i), v.slice(i + 1)];
 };
 
-/** The Add Cloud Model sheet as the setup assistant opens it (the Mac's welcome row opens the same sheet as
- *  Settings → Models): the curated services not connected yet, or all of them. */
 /** Dictation on a cloud recogniser (windows-models.md §Cloud recognition on a weak PC): Model Studio's measured speech
  *  model (asr.cloud, null = Qwen3-ASR Flash) or Volcengine's Seed-ASR. Only when the user chose it. */
 export function dictateInCloud(service: string, model: string) {
@@ -634,15 +779,22 @@ export function speechOffers(curated: Record<string, CuratedOption[]>): CuratedO
 
 /** Add a cloud service for dictation: only the services that recognise speech, the sheet saying the recording goes there. */
 export function AddSpeechCloud({ service, onClose, onDone }: { service?: string; onClose: () => void; onDone: (s: CloudSummary, service: string) => void }) {
-  const ps = PRESETS.filter((p) => (p.id === 'dashscope' || (p.id === 'volcengine-speech' && volcOffered())));
-  const presets = service ? [...ps.filter((p) => p.id === service), ...ps.filter((p) => p.id !== service)] : ps;
-  return <AddCloudSheet speech presets={presets} onClose={onClose} onDone={(s, p) => onDone(s, p)} />;
+  const ps = ['dashscope', ...(volcOffered() ? ['volcengine-speech'] : [])];
+  const presets = service ? [...ps.filter((p) => p === service), ...ps.filter((p) => p !== service)] : ps;
+  return <AddCloudSheet speech curated={presets} onClose={onClose} onDone={(s, p) => onDone(s, p)} />;
 }
 
+/** The Add Cloud Model sheet as the setup assistant opens it (the Mac's welcome row opens the same sheet as
+ *  Settings → Models): every service not added yet, the curated ones first. */
 export function AddCloudModel({ connected, onClose, onDone }: { connected: CloudSummary | null; onClose: () => void; onDone: (s: CloudSummary) => void }) {
-  const taken = new Set(connected?.services.map((s) => s.preset) ?? []);
-  const left = PRESETS.filter((p) => !taken.has(p.id) && (p.id !== 'volcengine-speech' || volcOffered()));
-  return <AddCloudSheet onClose={onClose} onDone={onDone} presets={left.length ? left : PRESETS.filter((p) => !p.pair || volcOffered())} />;
+  const { curated, others } = addSheetServices(connected?.services.map((s) => s.preset) ?? [], volcOffered());
+  const models = useCurated();
+  const [jobs, setJobs] = useState<{ job: TextJob; on: boolean }[] | null>(null);
+  useEffect(() => {
+    api.status().then((st) => setJobs(sheetJobs(builds(st))), () => setJobs([]));
+  }, []);
+  if (!jobs) return null;
+  return <AddCloudSheet onClose={onClose} onDone={onDone} curated={curated} others={jobs.length ? others : []} jobs={jobs} models={models} />;
 }
 
 /** Stop, beside a download's progress (dictation/commands.rs model_download_cancel: the child ends, partial files go). */
@@ -667,14 +819,19 @@ export function ModelsPane({ status, onToast }: { status: AppStatus; onToast: (m
   useEffect(() => {
     api.detect({ login: false }).then((d) => setHasAgent(d.agents.some((a) => a.installed)), () => {});
   }, []);
-  const { models, err, dl, failed, failedId, load, download } = useDictationModels();
+  const { models, err, dl, failed, failedId, room, load, download } = useDictationModels();
   const { polish, load: loadPolish, download: downloadPolish } = usePolishModels();
   const rec = models?.models.find((m) => m.id === models.recommended);
   const polishRec = polish?.models.find((m) => m.id === polish.recommended && m.local_supported);
   const localPolishes = polish?.models.filter((m) => m.local_supported) ?? [];
   const installedPolishes = localPolishes.filter((m) => m.installed);
-  const taken = new Set(sum?.services.map((s) => s.preset) ?? []);
-  const left = PRESETS.filter((p) => !taken.has(p.id) && (p.id !== 'volcengine-speech' || volcOffered()));
+  // Add Cloud Model: every service not added yet (the curated ones first), its 用于 boxes the text jobs built here
+  const { curated: addCurated, others: addOthers } = addSheetServices(sum?.services.map((s) => s.preset) ?? [], volcOffered());
+  const jobsHere = sheetJobs({ dictation: dict, screenText });
+  const canAdd = addCurated.length > 0 || jobsHere.length > 0 || !sum?.services.length;
+  // Remove…'s confirm; Use for Dictation's question (`later`: asked by itself right after the service was added)
+  const [removing, setRemoving] = useState<Service | null>(null);
+  const [askSpeech, setAskSpeech] = useState<{ preset: string; name: string; later: boolean } | null>(null);
   const installed = models?.models.filter((m) => m.installed) ?? [];
   // the speech jobs (transcribe.py: asr.models per purpose, asr.auto) and the text jobs (record.cloud.jobs)
   const [asr, setAsr] = useState<{ auto: boolean; selected: Record<string, string>; models: AsrModel[] } | null>(null);
@@ -710,6 +867,29 @@ export function ModelsPane({ status, onToast }: { status: AppStatus; onToast: (m
       return setAddSpeech({ service, model });
     }
     return v === DS || v.startsWith(`${DS}|`) ? api.dictationDashscopeModel(v.split('|')[1] ?? null) : api.dictationUse(v === 'auto' ? null : v);
+  };
+  /** A connected service's line: what uses it ("用于听写、翻译" / "未使用"), then where it is (region, host), whether it
+   *  recognises speech (unless its Use for Dictation is beside it or dictation is on it already), Not tested. */
+  const serviceLine = (s: Service): string => {
+    if (!s.has_key) return S('models.service.no_key');
+    const used = usesOf(s, sum?.routes ?? {}, jobsHere.map((j) => j.job), models);
+    const p = textPreset(s.preset);
+    const parts = [used.length ? S('models.service.uses', listIn(used.map(jobTitle), lang())) : S('models.service.unused')];
+    if (p && isCustom(p)) parts.push(hostOf(s.base_url ?? ''));
+    else if (p && isRegional(p)) {
+      const r = s.region ?? endpointOf(p, null)?.region;
+      if (r) parts.push(S(`models.region.${r}`));
+    }
+    if (p && !isCustom(p) && s.base_url) parts.push(hostOf(s.base_url));
+    if (SPEECH_PRESETS.includes(s.preset) && !offersDictation(s.preset, s.has_key, dict, models) && !dictatesOn(s.preset, models)) parts.push(S('models.service.speech'));
+    const measured = (CURATED as readonly string[]).includes(s.preset) || Object.values(curated).some((os) => os.some((o) => o.service === s.preset));
+    if (!measured) parts.push(S('models.untested'));
+    return parts.filter(Boolean).join(' · ');
+  };
+  const dictateOnService = async (preset: string) => {
+    setAskSpeech(null);
+    await dictateInCloud(preset, RECOGNISER[preset]).catch((e) => onToast(String(e)));
+    load();
   };
   const asrName = (id?: string) => (asr?.models.find((m) => m.id === id)?.name as string | undefined) ?? id ?? S('speech.purpose.none_yet');
   const choosePurpose = async (p: string, id: string) => {
@@ -807,7 +987,7 @@ export function ModelsPane({ status, onToast }: { status: AppStatus; onToast: (m
         : none;
     return (
       <Row key={job} id={`speech.${job}`} icon={icon} detail={detail}>
-        <Popup label={S(job === 'polish' ? 'speech.purpose.polish' : `models.job.${job}`)} value={jobValue(job)} {...jobMenu(job)} onChange={(v) => setJob(job, v)} />
+        <Popup label={jobTitle(job)} value={jobValue(job)} {...jobMenu(job)} onChange={(v) => setJob(job, v)} />
       </Row>
     );
   };
@@ -817,17 +997,23 @@ export function ModelsPane({ status, onToast }: { status: AppStatus; onToast: (m
       {dict && ((rec && !rec.installed) || (polishRec && !polishRec.installed && !routeOf(sum, 'polish'))) && (
         <Group id="speech.use" title={S('speech.section.mac')}>
           {rec && !rec.installed && (
+            /* with no speech model on this PC at all, dictation can't run: the line says so in the attention mark (the
+               Dictation pane's notice), the Download beside it the one way out */
             <Line title={S('speech.rec.title_size', mb(rec.size_mb))}
-              detail={failed && failedId === rec.id ? S('win.models.failed_row') : !installed.length && !dl ? S('dictation.nomodel.notice', rec.name) : S('speech.rec.line', S('speech.purpose.dictation'), rec.name)}
+              detail={failed && failedId === rec.id ? (room ? roomLine(room) : S('win.models.failed_row')) : !installed.length && !dl ? S('dictation.nomodel.notice', rec.name) : S('speech.rec.line', S('speech.purpose.dictation'), rec.name)}
               warn={(failed && failedId === rec.id) || (!installed.length && !dl)}>
-              {dl?.id === rec.id ? <><ModelProgress dl={dl} /><StopDownload /></> : <button className="primary" disabled={!!dl} onClick={() => download(rec.id)}>{S(failed && failedId === rec.id ? 'speech.rec.retry' : 'speech.download.button')}</button>}
+              {dl?.id === rec.id ? <><ModelProgress dl={dl} /><StopDownload /></>
+                : failed && failedId === rec.id && room ? <button onClick={() => goSettingsPane('storage')}>{S('models.show_storage')}</button>
+                : <button className="primary" disabled={!!dl} onClick={() => download(rec.id)}>{S(failed && failedId === rec.id ? 'speech.rec.retry' : 'speech.download.button')}</button>}
             </Line>
           )}
           {polishRec && !polishRec.installed && !routeOf(sum, 'polish') && (
             <Line title={S('speech.rec.title_size', mb(polishRec.size_mb))}
-              detail={failed && failedId === polishRec.id ? S('win.models.failed_row') : S('speech.rec.line', S('speech.purpose.polish'), polishRec.name)}
+              detail={failed && failedId === polishRec.id ? (room ? roomLine(room) : S('win.models.failed_row')) : S('speech.rec.line', S('speech.purpose.polish'), polishRec.name)}
               warn={failed && failedId === polishRec.id}>
-              {dl?.id === polishRec.id ? <><ModelProgress dl={dl} /><StopDownload /></> : <button className={!rec || rec.installed ? 'primary' : ''} disabled={!!dl} onClick={() => downloadPolish(polishRec.id)}>{S(failed && failedId === polishRec.id ? 'speech.rec.retry' : 'speech.download.button')}</button>}
+              {dl?.id === polishRec.id ? <><ModelProgress dl={dl} /><StopDownload /></>
+                : failed && failedId === polishRec.id && room ? <button onClick={() => goSettingsPane('storage')}>{S('models.show_storage')}</button>
+                : <button className={!rec || rec.installed ? 'primary' : ''} disabled={!!dl} onClick={() => downloadPolish(polishRec.id)}>{S(failed && failedId === polishRec.id ? 'speech.rec.retry' : 'speech.download.button')}</button>}
             </Line>
           )}
         </Group>
@@ -836,17 +1022,21 @@ export function ModelsPane({ status, onToast }: { status: AppStatus; onToast: (m
       <Group id="speech.services" footer={S('models.sheet.note')}>
         {sum?.services.map((s) => (
           <Line key={s.id} icon="cloud" title={serviceName(s)} badge={PRESETS.find((p) => p.id === s.preset)?.recommended ? S('models.recommended') : undefined}
-            detail={s.has_key ? S('models.service.connected') : S('models.service.no_key')} warn={!s.has_key} flash={`speech_service_${s.id}`}>
-            <button onClick={async () => setSum(await api.cloudDisconnect(s.id))}>{S('win.cloud.remove')}</button>
+            detail={serviceLine(s)} warn={!s.has_key} flash={`speech_service_${s.id}`}>
+            {/* recognition goes to the cloud only by this click (and its question) */}
+            {offersDictation(s.preset, s.has_key, dict, models) && (
+              <button onClick={() => setAskSpeech({ preset: s.preset, name: serviceName(s), later: false })}>{S('models.service.use_dictation')}</button>
+            )}
+            <button onClick={() => setRemoving(s)}>{S('win.cloud.remove')}</button>
           </Line>
         ))}
-        {(left.length > 0 || !sum?.services.length) ? (
+        {canAdd ? (
           <Line icon="plus" title={S('models.services.add.title')} detail={!sum?.services.length ? S('models.services.empty') : undefined}>
             {win && hasAgent && <button onClick={() => setAgentSheet(true)}>{S('models.agent.button')}</button>}
             <button className={sum?.services.length ? '' : 'primary'} onClick={() => setAdding(true)}>{S('models.services.add')}</button>
           </Line>
         ) : win && hasAgent && (
-          // every curated service is in, so the Add row is gone: Set Up with Agent… keeps a row of its own
+          // nothing left to add (a build with no text jobs, every curated service in): Set Up with Agent… keeps a row of its own
           <Line icon="terminal" title={S('models.agent.sheet.title')} flash="speech_agent_setup_start">
             <button onClick={() => setAgentSheet(true)}>{S('models.agent.button')}</button>
           </Line>
@@ -910,7 +1100,30 @@ export function ModelsPane({ status, onToast }: { status: AppStatus; onToast: (m
           })}
         </Group>
       )}
-      {adding && <AddCloudSheet onClose={() => setAdding(false)} onDone={(s) => (setSum(s), setAdding(false))} presets={left.length ? left : PRESETS.filter((p) => !p.pair || volcOffered())} />}
+      {adding && <AddCloudSheet onClose={() => setAdding(false)} curated={addCurated} others={jobsHere.length ? addOthers : []} jobs={jobsHere} models={curated}
+        onDone={(s, p) => {
+          setSum(s);
+          setAdding(false);
+          loadJobs();
+          // a service that recognises speech: asked once, never switched without the click
+          if (offersDictation(p, true, dict, models)) setAskSpeech({ preset: p, name: presetName(p), later: true });
+        }} />}
+      {removing && (
+        <Confirm title={S('models.remove.title', serviceName(removing))} detail={S('models.remove.message')} cancel={S('models.cancel')} ok={S('models.remove.confirm')}
+          onClose={() => setRemoving(null)}
+          onOk={async () => {
+            const id = removing.id;
+            setRemoving(null);
+            setSum(await api.cloudDisconnect(id));
+            loadJobs();
+            load();
+          }} />
+      )}
+      {askSpeech && (
+        <Confirm danger={false} title={S('models.speech.ask.title', askSpeech.name)} detail={S('models.speech.ask.message', askSpeech.name)}
+          cancel={S(askSpeech.later ? 'models.speech.ask.later' : 'models.cancel')} ok={S('models.speech.ask.use')}
+          onClose={() => setAskSpeech(null)} onOk={() => dictateOnService(askSpeech.preset)} />
+      )}
       {customJob && <CustomModelSheet job={customJob} sum={sum} curated={curated} onClose={() => setCustomJob(null)}
         onDone={(s) => (setSum(s), loadJobs(), setCustomJob(null))} />}
       {agentSheet && <AgentSetupSheet onClose={() => setAgentSheet(false)} onToast={onToast} />}
@@ -927,78 +1140,199 @@ export function ModelsPane({ status, onToast }: { status: AppStatus; onToast: (m
   );
 }
 
+/** A new service's Region (a preset with two addresses) or Name and Address (the user's own): the same rows in Add
+ *  Cloud Model and Custom Model. */
+function NewServiceRows({ preset, region, setRegion, name, setName, baseUrl, setBaseUrl }: {
+  preset: TextPreset;
+  region: Region;
+  setRegion: (r: Region) => void;
+  name: string;
+  setName: (n: string) => void;
+  baseUrl: string;
+  setBaseUrl: (b: string) => void;
+}) {
+  return (
+    <>
+      {isRegional(preset) && (
+        <>
+          <label className="cs-l">{S('models.sheet.region')}</label>
+          <Popup label={S('models.sheet.region')} value={region} choices={[['china', S('models.region.china')], ['global', S('models.region.global')]]}
+            onChange={(r) => setRegion(r as Region)} />
+        </>
+      )}
+      {isCustom(preset) && (
+        <>
+          <label className="cs-l" htmlFor="cm-name">{S('models.sheet.name')}</label>
+          <input id="cm-name" className="st-field" autoComplete="off" spellCheck={false} placeholder={S('models.sheet.name.placeholder')} value={name}
+            onChange={(e) => setName(e.target.value)} />
+          <label className="cs-l" htmlFor="cm-base">{S('models.sheet.base_url')}</label>
+          <input id="cm-base" className="st-field" autoComplete="off" spellCheck={false} placeholder="https://example.com/v1" value={baseUrl}
+            onChange={(e) => setBaseUrl(e.target.value)} />
+        </>
+      )}
+    </>
+  );
+}
+
+/** The Model ID row, the ids worth suggesting under it. */
+function ModelIdRow({ value, onChange, known, onEnter, autoFocus = false }: { value: string; onChange: (v: string) => void; known: string[]; onEnter: () => void; autoFocus?: boolean }) {
+  return (
+    <>
+      <label className="cs-l" htmlFor="cm-model">{S('models.other.placeholder')}</label>
+      <input id="cm-model" className="st-field" autoComplete="off" spellCheck={false} placeholder={S('models.other.placeholder')} value={value}
+        list={known.length ? 'cm-models' : undefined} autoFocus={autoFocus}
+        onChange={(e) => onChange(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && onEnter()} />
+      {known.length > 0 && <datalist id="cm-models">{known.map((m) => <option key={m} value={m} />)}</datalist>}
+    </>
+  );
+}
+
 /** Add Cloud Model (the Mac's CloudServiceSheet): the service, the API key — or for Volcengine Speech its App ID and
- *  Access Token — and Test before it is saved. */
-function AddCloudSheet({ presets, onClose, onDone, speech = false }: { presets: readonly (typeof PRESETS)[number][]; onClose: () => void; onDone: (s: CloudSummary, preset: string) => void; speech?: boolean }) {
-  const [preset, setPreset] = useState<string>(presets[0].id);
+ *  Access Token — and Test before it is saved. `curated`: the services Blurt measured, as before; `others` (after a
+ *  divider): any other service, which adds Custom Model's rows (Region / Name and Address), a Model ID and 用于 — the
+ *  jobs it is for, each one checked on the model before anything is saved (cloud_custom_connect with `jobs`). A pasted
+ *  key whose start names a service in the list picks it. */
+function AddCloudSheet({ curated, others = [], jobs = [], models = {}, onClose, onDone, speech = false }: {
+  curated: string[];
+  others?: string[];
+  jobs?: { job: TextJob; on: boolean }[];
+  models?: Record<string, CuratedOption[]>;
+  onClose: () => void;
+  onDone: (s: CloudSummary, preset: string) => void;
+  speech?: boolean;
+}) {
+  const offered = [...curated, ...others];
+  const [preset, setPreset] = useState<string>(offered[0] ?? 'deepseek');
   const [key, setKey] = useState('');
   const [appId, setAppId] = useState('');
+  const [region, setRegion] = useState<Region>(() => systemRegion());
+  const [baseUrl, setBaseUrl] = useState('');
+  const [name, setName] = useState('');
+  const [model, setModel] = useState('');
+  const [checked, setChecked] = useState<Set<TextJob>>(() => new Set(jobs.filter((j) => j.on).map((j) => j.job)));
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState<{ ok: boolean; text: string } | null>(null);
-  const info = PRESETS.find((p) => p.id === preset)!;
+  const info = PRESETS.find((p) => p.id === preset);
+  // a service Blurt never measured: Custom Model's way, for the jobs checked
+  const tp = info ? undefined : textPreset(preset);
+  const ep = tp ? endpointOf(tp, isRegional(tp) ? region : null) : undefined;
+  const pair = !!info?.pair;
   useEffect(() => {
-    const k = (e: KeyboardEvent) => e.key === 'Escape' && onClose();
+    const k = (e: KeyboardEvent) => e.key === 'Escape' && !busy && onClose();
     window.addEventListener('keydown', k);
     return () => window.removeEventListener('keydown', k);
-  }, [onClose]);
+  }, [onClose, busy]);
   useEffect(() => {
     // the App ID is no secret: shown again, so a new token can go with it
-    if (info.pair) api.cloudSpeechAppId().then((a) => a && setAppId((x) => x || a), () => {});
-  }, [info.pair]);
+    if (pair) api.cloudSpeechAppId().then((a) => a && setAppId((x) => x || a), () => {});
+  }, [pair]);
+  const pick = (v: string) => {
+    if (v === preset) return;
+    setPreset(v);
+    setBaseUrl('');
+    setMsg(null);
+  };
+  const keyChanged = (k: string) => {
+    setKey(k);
+    setMsg(null);
+    // a key whose start names its service: that service when it is in the list (not over an address the user typed
+    // for their own); one already added says where it goes instead
+    const d = detectKey(k);
+    if (!d || d === preset || (tp && isCustom(tp) && baseUrl.trim())) return;
+    if (offered.includes(d)) pick(d);
+    else if (!speech) setMsg({ ok: false, text: S('models.key.custom', presetName(d)) });
+  };
   const failure = (code?: string) =>
     S(code === 'auth' ? 'models.check.auth' : code === 'network' ? 'models.check.network' : code === 'quota' ? 'models.check.rate'
       : code === 'app_id' ? 'models.check.app_id' : code === 'no_token' ? 'models.check.no_token' : code === 'token' ? 'models.token.invalid' : 'models.check.other');
+  const picked = jobs.filter((j) => checked.has(j.job)).map((j) => j.job);
   const connect = async () => {
     const k = key.trim();
-    if (/\s/.test(k)) return setMsg({ ok: false, text: S(info.pair ? 'models.token.invalid' : 'models.key.spaces') });
+    if (info && /\s/.test(k)) return setMsg({ ok: false, text: S(pair ? 'models.token.invalid' : 'models.key.spaces') });
     setBusy(true);
     setMsg(null);
     try {
-      const r = info.pair ? await api.cloudConnectSpeech(appId.trim(), k) : await api.cloudConnect(preset, k);
-      if (r.ok) onDone(r.summary ?? (await api.cloudSummary()), preset);
-      else setMsg({ ok: false, text: failure(r.code) });
+      if (tp) {
+        // the address, the model id, the key first; then each checked job in turn; nothing saved unless all pass
+        const own = isCustom(tp);
+        const r = await api.cloudCustomConnect({ jobs: picked, preset: tp.id, region: isRegional(tp) ? region : null,
+          baseUrl: own ? baseUrl.trim() : null, name: own ? name.trim() : null, key: k, model: model.trim() });
+        if (r.ok) return onDone(r.summary ?? (await api.cloudSummary()), preset);
+        setMsg({ ok: false, text: r.job ? S('models.check.job_failed', jobTitle(r.job), customFailure(r.code)) : customFailure(r.code) });
+      } else {
+        const r = pair ? await api.cloudConnectSpeech(appId.trim(), k) : await api.cloudConnect(preset, k);
+        if (r.ok) return onDone(r.summary ?? (await api.cloudSummary()), preset);
+        setMsg({ ok: false, text: failure(r.code) });
+      }
     } catch (e) {
       setMsg({ ok: false, text: String(e) });
     }
     setBusy(false);
   };
-  const ready = info.pair ? !!appId.trim() && !!key.trim() : !!key.trim();
-  const svcName = S(`models.preset.${presetKey(preset)}`);
-  const getKey = <TextLink ink onClick={() => api.openUrl(info.page)}>{S('models.sheet.key.get', svcName)}</TextLink>;
+  const ready = tp
+    ? !!key.trim() && !!model.trim() && picked.length > 0 && (!isCustom(tp) || !!baseUrl.trim())
+    : pair ? !!appId.trim() && !!key.trim() : !!key.trim();
+  const page = info?.page ?? ep?.page;
+  const getKey = page && <TextLink ink onClick={() => api.openUrl(page)}>{S('models.sheet.key.get', presetName(preset))}</TextLink>;
+  const label = (id: string) => (PRESETS.find((p) => p.id === id)?.recommended ? S('models.preset.recommended', presetName(id)) : presetName(id));
+  if (!offered.length) return null;
   return (
-    <div className="overlay" onMouseDown={(e) => e.target === e.currentTarget && onClose()}>
+    <div className="overlay" onMouseDown={(e) => e.target === e.currentTarget && !busy && onClose()}>
       <div className="sheet st-sheet cloud-sheet" role="dialog" aria-label={S('models.sheet.add_title')} data-testid="cloud-sheet">
         <div className="st-col" style={{ padding: '20px 24px' }}>
           <h1 className="st-title">{S(speech ? 'models.sheet.speech_title' : 'models.sheet.add_title')}</h1>
           {/* what it is for, what goes there and where the key stays — before the key is asked for */}
           <p className="st-foot cs-lead">{speech
-            ? `${S('models.sheet.lead.speech')} ${S(info.pair ? 'models.sheet.note.pair' : 'models.sheet.note')}`
-            : info.pair ? S('models.sheet.note.pair') : S('models.sheet.lead')}</p>
+            ? `${S('models.sheet.lead.speech')} ${S(pair ? 'models.sheet.note.pair' : 'models.sheet.note')}`
+            : tp ? [S('models.sheet.lead.other'), S('models.sheet.note')].join(/[。！？]$/.test(S('models.sheet.lead.other')) ? '' : ' ') : pair ? S('models.sheet.note.pair') : S('models.sheet.lead')}</p>
           {/* one form grid: the labels right-aligned in one column, every control the same width beside them, the
               link to get a key under the field it fills (the Mac's sheet) */}
           <div className="cs-form">
             <label className="cs-l">{S('models.sheet.service')}</label>
-            <Popup label={S('models.sheet.service')} value={preset}
-              choices={presets.map((p) => [p.id, p.recommended ? S('models.preset.recommended', S(`models.preset.${presetKey(p.id)}`)) : S(`models.preset.${presetKey(p.id)}`)] as [string, string])}
-              onChange={(v) => (setPreset(v), setMsg(null))} />
-            {info.pair && (
+            <Popup label={S('models.sheet.service')} value={preset} choices={offered.map((id) => [id, label(id)] as [string, string])}
+              dividers={[...(curated.length && others.length ? [curated.length] : []),
+                ...(offered.findIndex((id) => id.startsWith('custom-')) > 0 ? [offered.findIndex((id) => id.startsWith('custom-'))] : [])]} onChange={pick} />
+            {tp && <NewServiceRows preset={tp} region={region} setRegion={(r) => (setRegion(r), setMsg(null))} name={name} setName={setName}
+              baseUrl={baseUrl} setBaseUrl={(b) => (setBaseUrl(b), setMsg(null))} />}
+            {pair && (
               <>
                 <label className="cs-l" htmlFor="cs-app">{S('models.sheet.app_id')}</label>
                 <input id="cs-app" className="st-field" autoComplete="off" spellCheck={false} placeholder={S('models.sheet.app_id.placeholder')} value={appId} autoFocus
                   onChange={(e) => (setAppId(e.target.value), setMsg(null))} />
               </>
             )}
-            <label className="cs-l" htmlFor="cs-key">{S(info.pair ? 'models.sheet.token' : 'models.sheet.key')}</label>
+            <label className="cs-l" htmlFor="cs-key">{S(pair ? 'models.sheet.token' : 'models.sheet.key')}</label>
             <div className="cs-f">
-              <input id="cs-key" className="st-field" type="password" autoComplete="off" spellCheck={false} autoFocus={!info.pair}
-                placeholder={S(info.pair ? 'models.sheet.token.placeholder' : 'models.sheet.key.placeholder')} value={key}
-                onChange={(e) => (setKey(e.target.value), setMsg(null))} onKeyDown={(e) => e.key === 'Enter' && ready && !busy && connect()} />
-              <span className="cs-get">{getKey}</span>
+              <input id="cs-key" className="st-field" type="password" autoComplete="off" spellCheck={false} autoFocus={!pair}
+                placeholder={S(pair ? 'models.sheet.token.placeholder' : 'models.sheet.key.placeholder')} value={key}
+                onChange={(e) => keyChanged(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && ready && !busy && connect()} />
+              {getKey && <span className="cs-get">{getKey}</span>}
             </div>
+            {tp && (
+              <>
+                <ModelIdRow value={model} onChange={(v) => (setModel(v), setMsg(null))} known={knownModels(models, picked, tp.id, ep)}
+                  onEnter={() => ready && !busy && connect()} />
+                <label className="cs-l cs-jobs-l">{S('models.sheet.jobs')}</label>
+                <div className="cs-jobs" role="group" aria-label={S('models.sheet.jobs')}>
+                  {jobs.map(({ job }) => (
+                    <label key={job} className="cs-job">
+                      <input type="checkbox" checked={checked.has(job)}
+                        onChange={(e) => (setChecked((c) => {
+                          const n = new Set(c);
+                          if (e.target.checked) n.add(job);
+                          else n.delete(job);
+                          return n;
+                        }), setMsg(null))} />
+                      <span>{jobTitle(job)}</span>
+                    </label>
+                  ))}
+                </div>
+              </>
+            )}
           </div>
           {msg && <p className={`st-foot ${msg.ok ? '' : 'st-warn'}`}>{msg.text}</p>}
           <div className="st-ctl" style={{ marginTop: 16 }}>
-            <button onClick={onClose}>{S('capture.keys.swap.cancel')}</button>
+            <button disabled={busy} onClick={onClose}>{S('capture.keys.swap.cancel')}</button>
             <button className="primary" disabled={!ready || busy} onClick={connect}>{busy ? S('win.cloud.testing') : S('models.sheet.connect')}</button>
           </div>
         </div>
@@ -1039,8 +1373,7 @@ function CustomModelSheet({ job, sum, curated, onClose, onDone }: {
   const preset = textPreset(existing ? existing.preset : choice.slice(4)) ?? TEXT_PRESETS[TEXT_PRESETS.length - 1];
   const reg: Region | null = existing ? ((existing.region as Region | undefined) ?? null) : isRegional(preset) ? region : null;
   const ep = endpointOf(preset, reg);
-  // suggestions: the ids the service's docs name, and Blurt's measured ones for this job there
-  const known = [...new Set([...(curated[job] ?? []).filter((o) => o.service === preset.id).map((o) => o.model), ...(ep?.known ?? [])])];
+  const known = knownModels(curated, [job], preset.id, ep);
   useEffect(() => {
     const k = (e: KeyboardEvent) => e.key === 'Escape' && !busy && onClose();
     window.addEventListener('keydown', k);
@@ -1059,11 +1392,6 @@ function CustomModelSheet({ job, sum, curated, onClose, onDone }: {
     const d = existing ? null : detectKey(k);
     if (d && d !== preset.id && fresh.some((p) => p.id === d) && !(isCustom(preset) && baseUrl.trim())) pick(`new:${d}`);
   };
-  const failure = (code?: string) => S(({
-    address: 'models.check.address', model_id: 'models.check.model_id', no_key: 'models.check.no_key', key_spaces: 'models.key.spaces',
-    key_characters: 'models.key.characters', auth: 'models.check.auth', network: 'models.check.network', timeout: 'models.check.network',
-    rate_limited: 'models.check.rate', model: 'models.check.model', vision: 'models.check.vision', empty: 'models.check.empty',
-  } as Record<string, string>)[code ?? ''] ?? 'models.check.other');
   const ready = !!model.trim() && (!!existing || (!!key.trim() && (!isCustom(preset) || !!baseUrl.trim())));
   const save = async () => {
     setBusy(true);
@@ -1073,7 +1401,7 @@ function CustomModelSheet({ job, sum, curated, onClose, onDone }: {
       const r = await api.cloudCustomConnect({ job, service: existing?.id ?? null, preset: existing ? null : preset.id, region: existing ? null : reg,
         baseUrl: own ? baseUrl.trim() : null, name: own ? name.trim() : null, key: key.trim(), model: model.trim() });
       if (r.ok) return onDone(r.summary ?? (await api.cloudSummary()));
-      setMsg(failure(r.code));
+      setMsg(customFailure(r.code));
     } catch (e) {
       setMsg(String(e));
     }
@@ -1081,35 +1409,20 @@ function CustomModelSheet({ job, sum, curated, onClose, onDone }: {
   };
   const choices: [string, string][] = [
     ...services.map((x) => [`svc:${x.id}`, serviceName(x)] as [string, string]),
-    ...fresh.map((p) => [`new:${p.id}`, S(`models.preset.${presetKey(p.id)}`)] as [string, string]),
+    ...fresh.map((p) => [`new:${p.id}`, presetName(p.id)] as [string, string]),
   ];
-  const svcName = existing ? serviceName(existing) : S(`models.preset.${presetKey(preset.id)}`);
+  const svcName = existing ? serviceName(existing) : presetName(preset.id);
   return (
     <div className="overlay" onMouseDown={(e) => e.target === e.currentTarget && !busy && onClose()}>
       <div className="sheet st-sheet cloud-sheet" role="dialog" aria-label={S('models.custom.title')} data-testid="custom-model-sheet">
         <div className="st-col" style={{ padding: '20px 24px' }}>
           <h1 className="st-title">{S('models.custom.title')}</h1>
-          <p className="st-foot cs-lead">{existing ? S('models.custom.lead') : [S('models.custom.lead'), S('models.sheet.note')].join(/[。！？]$/.test(S('models.custom.lead')) ? '' : ' ')}</p>
+          <p className="st-foot cs-lead">{customLead(!existing)}</p>
           <div className="cs-form">
             <label className="cs-l">{S('models.sheet.service')}</label>
             <Popup label={S('models.sheet.service')} value={choice} choices={choices} dividers={services.length ? [services.length] : []} onChange={pick} />
-            {!existing && isRegional(preset) && (
-              <>
-                <label className="cs-l">{S('models.sheet.region')}</label>
-                <Popup label={S('models.sheet.region')} value={region} choices={[['china', S('models.region.china')], ['global', S('models.region.global')]]}
-                  onChange={(r) => (setRegion(r as Region), setMsg(null))} />
-              </>
-            )}
-            {!existing && isCustom(preset) && (
-              <>
-                <label className="cs-l" htmlFor="cm-name">{S('models.sheet.name')}</label>
-                <input id="cm-name" className="st-field" autoComplete="off" spellCheck={false} placeholder={S('models.sheet.name.placeholder')} value={name}
-                  onChange={(e) => setName(e.target.value)} />
-                <label className="cs-l" htmlFor="cm-base">{S('models.sheet.base_url')}</label>
-                <input id="cm-base" className="st-field" autoComplete="off" spellCheck={false} placeholder="https://example.com/v1" value={baseUrl}
-                  onChange={(e) => (setBaseUrl(e.target.value), setMsg(null))} />
-              </>
-            )}
+            {!existing && <NewServiceRows preset={preset} region={region} setRegion={(r) => (setRegion(r), setMsg(null))} name={name} setName={setName}
+              baseUrl={baseUrl} setBaseUrl={(b) => (setBaseUrl(b), setMsg(null))} />}
             {!existing && (
               <>
                 <label className="cs-l" htmlFor="cm-key">{S('models.sheet.key')}</label>
@@ -1120,11 +1433,7 @@ function CustomModelSheet({ job, sum, curated, onClose, onDone }: {
                 </div>
               </>
             )}
-            <label className="cs-l" htmlFor="cm-model">{S('models.other.placeholder')}</label>
-            <input id="cm-model" className="st-field" autoComplete="off" spellCheck={false} placeholder={S('models.other.placeholder')} value={model}
-              list={known.length ? 'cm-models' : undefined} autoFocus={!!existing}
-              onChange={(e) => (setModel(e.target.value), setMsg(null))} onKeyDown={(e) => e.key === 'Enter' && ready && !busy && save()} />
-            {known.length > 0 && <datalist id="cm-models">{known.map((m) => <option key={m} value={m} />)}</datalist>}
+            <ModelIdRow value={model} onChange={(v) => (setModel(v), setMsg(null))} known={known} onEnter={() => ready && !busy && save()} autoFocus={!!existing} />
           </div>
           {msg && <p className="st-foot st-warn">{msg}</p>}
           <div className="st-ctl" style={{ marginTop: 16 }}>
@@ -1141,7 +1450,7 @@ function CustomModelSheet({ job, sum, curated, onClose, onDone }: {
 
 /** One step of what the agent did, in the Mac's words (AgentSetupProgress.text). */
 function stepText(s: AgentSetupStep): string {
-  const job = (j: string) => S(j === 'polish' ? 'speech.purpose.polish' : j === 'translate' ? 'models.job.translate' : j === 'vision' ? 'models.job.vision' : 'speech.purpose.dictation');
+  const job = jobTitle;
   const name = s.name || s.subject;
   switch (s.kind) {
     case 'connect': return S(s.state === 'running' ? 'models.agent.step.connecting' : s.state === 'done' ? 'models.agent.step.connected' : 'models.agent.step.connect_failed', name);

@@ -263,3 +263,164 @@ final class CardDropTargetTests: XCTestCase {
         XCTAssertNil(ComposerPick.nearest([], to: .zero))
     }
 }
+
+/// DropWindows: the window under a drag. The 1.0.22 report — every card dropped into Claude Code / Codex arrived as the
+/// picture alone: macOS 26.5's Notification Center window (full screen, transparent, layer 21) was taken for the app.
+final class DropWindowsTests: XCTestCase {
+    let full = CGRect(x: 0, y: 0, width: 1728, height: 1117)
+    let me = 87047
+
+    func testNotificationCenterAndTheMenuBarAreNeverTheTarget() {
+        let ws: [DropWindows.Window] = [
+            .init(pid: 83774, ownerName: "Bartender 6", layer: 26, alpha: 0, bounds: CGRect(x: 0, y: -1, width: 1728, height: 34)),
+            .init(pid: 581, bundleID: "com.apple.controlcenter", layer: 25, bounds: CGRect(x: 1395, y: 0, width: 56, height: 33)),
+            .init(pid: 166, ownerName: "Window Server", layer: 24, bounds: CGRect(x: 0, y: 0, width: 1728, height: 33)),
+            .init(pid: 547, bundleID: "com.apple.notificationcenterui", layer: 21, bounds: full),
+            .init(pid: 23477, bundleID: "com.anthropic.claudefordesktop", bounds: CGRect(x: 0, y: 33, width: 1728, height: 1084)),
+        ]
+        XCTAssertEqual(DropWindows.pick(ws, at: CGPoint(x: 800, y: 600), me: me), .app(23477))
+        // over the menu bar: nothing that takes a drop
+        XCTAssertEqual(DropWindows.pick(ws, at: CGPoint(x: 1400, y: 10), me: me), .nothing)
+    }
+
+    func testAnOverlayProcessIsSkippedAtAnyLevel() {
+        let ws: [DropWindows.Window] = [
+            .init(pid: 547, bundleID: "com.apple.notificationcenterui", layer: 0, bounds: full),
+            .init(pid: 9, bundleID: "com.openai.codex", bounds: full),
+        ]
+        XCTAssertEqual(DropWindows.pick(ws, at: CGPoint(x: 5, y: 500), me: me), .app(9))
+    }
+
+    func testOurWindowsAreAnInAppDropUnlessMouseTransparent() {
+        let island = DropWindows.Window(pid: me, layer: 27, bounds: CGRect(x: 544, y: 0, width: 640, height: 470))
+        let cards = DropWindows.Window(pid: me, layer: 25, bounds: CGRect(x: 300, y: 0, width: 1100, height: 300), oursTakesMouse: false)
+        let main = DropWindows.Window(pid: me, bounds: CGRect(x: 205, y: 127, width: 1277, height: 889))
+        let app = DropWindows.Window(pid: 9, bundleID: "com.openai.codex", bounds: full)
+        XCTAssertEqual(DropWindows.pick([island, app], at: CGPoint(x: 600, y: 100), me: me), .ours)
+        XCTAssertEqual(DropWindows.pick([cards, app], at: CGPoint(x: 400, y: 100), me: me), .app(9), "the cards take no drops")
+        XCTAssertEqual(DropWindows.pick([cards, main, app], at: CGPoint(x: 400, y: 200), me: me), .ours, "the main window under the cards")
+        let dragImage = DropWindows.Window(pid: me, layer: 500, bounds: full)
+        XCTAssertEqual(DropWindows.pick([dragImage, app], at: CGPoint(x: 400, y: 600), me: me), .app(9))
+    }
+}
+
+/// Several cards dragged as one (v1.0.23), and file cards (a referenced PDF / video).
+final class MultiCardDragTests: XCTestCase {
+    let a = CardPasteboard.Card(image: URL(fileURLWithPath: "/s/shots/001.png"), note: "header overlaps")
+    let b = CardPasteboard.Card(image: URL(fileURLWithPath: "/s/shots/003.png"), note: "button\ntoo small")
+    let pdf = CardPasteboard.Card(image: URL(fileURLWithPath: "/s/shots/004.png"), note: "the spec",
+                                  ref: URL(fileURLWithPath: "/Users/me/Documents/spec v2.pdf"))
+    let words = CardPasteboard.Card(image: nil, note: "also check dark mode")
+
+    func testAnAgentGetsALinePerCardATerminalOneLine() {
+        let agent = CardPasteboard.drag(into: DragLanding(cls: .terminal, lines: true), cards: [a, b, pdf, words])
+        XCTAssertEqual(agent.first, .init(text: "/s/shots/001.png header overlaps\n/s/shots/003.png button too small\n'/Users/me/Documents/spec v2.pdf' the spec\nalso check dark mode", tag: true))
+        XCTAssertEqual(agent.count, 4, "one item per card: the count badge says 4")
+        XCTAssertTrue(agent.allSatisfy(\.tag), "every item names the cards (an in-app drop reads any of them)")
+        let term = CardPasteboard.drag(into: DragLanding(cls: .terminal), cards: [a, b])
+        XCTAssertEqual(term.first?.text, "/s/shots/001.png header overlaps  /s/shots/003.png button too small")
+        XCTAssertFalse(term.first?.text?.contains("\n") ?? true, "never a newline at a shell prompt")
+    }
+
+    func testAChatAppGetsEveryFileInOrderAndTheNotesAfter() {
+        let items = CardPasteboard.drag(into: DragLanding(cls: .chat, kind: .web), cards: [a, words, pdf])
+        XCTAssertEqual(items.map(\.file?.path), ["/s/shots/001.png", nil, "/Users/me/Documents/spec v2.pdf"])
+        XCTAssertEqual(items.map(\.image?.path), ["/s/shots/001.png", nil, nil], "a file card's thumbnail never goes out")
+        XCTAssertTrue(items.allSatisfy(\.tag))
+        XCTAssertEqual(CardTransfer.followUpNotes([a, words, pdf]), "1. header overlaps\n2. the spec\nalso check dark mode")
+        XCTAssertEqual(CardTransfer.followUpNotes([a, words]), "header overlaps\nalso check dark mode", "one picture: no numbers")
+    }
+
+    func testARichAppGetsOneRichItemAndTheFinderTheFiles() {
+        let rich = CardPasteboard.drag(into: DragLanding(cls: .rich), cards: [a, b])
+        XCTAssertEqual(rich.count, 2)
+        XCTAssertTrue(rich[0].rich)
+        XCTAssertEqual(rich[1], .init(tag: true))
+        let finder = CardPasteboard.drag(into: DragLanding(cls: .finder), cards: [a, pdf])
+        XCTAssertEqual(finder.map(\.file?.lastPathComponent), ["001.png", "spec v2.pdf"])
+    }
+
+    func testOneFileCardGoesOutAsItsFile() {
+        XCTAssertEqual(CardPasteboard.drag(into: DragLanding(cls: .terminal), card: pdf),
+                       [.init(text: "'/Users/me/Documents/spec v2.pdf' the spec", tag: true), .init(tag: true)])
+        XCTAssertEqual(CardPasteboard.drag(into: DragLanding(cls: .chat, kind: .web), card: pdf).first,
+                       .init(file: URL(fileURLWithPath: "/Users/me/Documents/spec v2.pdf"), tag: true))
+    }
+
+    func testTheItemCountIsTheCardCountForEveryApp() {
+        let landings: [DragLanding] = [.init(cls: .chat, kind: .web), .init(cls: .chat, kind: .qt), .init(cls: .rich), .init(cls: .finder),
+                                       .init(cls: .terminal), .init(cls: .terminal, lines: true)]
+        for l in landings { XCTAssertEqual(CardPasteboard.drag(into: l, cards: [a, words, pdf]).count, 3, "\(l)") }
+    }
+
+    // MARK: v1.0.26 — one list with the agents (agents.json `drop`), the same vectors as tests/test_agent_detect.py
+
+    /// the repo's agents.json (skills/blurt/scripts), as agents.py reads it
+    func registry() throws -> [[String: Any]] {
+        let url = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+            .appendingPathComponent("../../../../scripts/agents.json").standardizedFileURL
+        let o = try JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [String: Any]
+        return try XCTUnwrap(o?["agents"] as? [[String: Any]])
+    }
+
+    func testDropTargetsFromAgentsJSON() throws {
+        let reg = try registry()
+        let t = Dictionary(uniqueKeysWithValues: AgentDropList.targets(registry: reg, record: [:]).map { ($0.agent, $0) })
+        XCTAssertEqual(t["claude"]?.ids, [AgentWindow.claude])
+        XCTAssertEqual(t["claude"]?.drop, "composer")
+        XCTAssertEqual(t["codex"]?.ids, [AgentWindow.codex])
+        XCTAssertEqual(t["workbuddy"]?.drop, "composer")
+        XCTAssertEqual(t["cursor"]?.drop, "terminal")
+        XCTAssertNil(t["gemini"], "no app, no drop")
+        XCTAssertTrue(t.values.allSatisfy(\.on))
+        // every built-in of v1.0.21 is still in the list
+        let all = AgentWindow.list(record: [:], registry: reg)
+        XCTAssertTrue(AgentWindow.builtIn.isSubset(of: all), "\(AgentWindow.builtIn.subtracting(all))")
+        let composers = AgentWindow.composers(record: [:], registry: reg)
+        XCTAssertTrue(composers.contains("com.tencent.workbuddy.mac") && composers.contains(AgentWindow.codex))
+        XCTAssertFalse(composers.contains("com.todesktop.230313mzl4w4u92"), "an AI IDE: its drop may land in its terminal")
+        // switched off (record.agent_drop), a user's own (record.agent_defs)
+        let mine: [String: Any] = ["agent_drop": ["cursor": false],
+                                   "agent_defs": ["zed": AgentDropList.customDef(name: "Zed", bundleID: "dev.zed.Zed")]]
+        let l = AgentWindow.list(record: mine, registry: reg)
+        XCTAssertFalse(l.contains("com.todesktop.230313mzl4w4u92"))
+        XCTAssertTrue(l.contains("dev.zed.Zed"))
+        XCTAssertEqual(AgentDropList.targets(registry: reg, record: mine).first { $0.agent == "zed" }?.custom, true)
+        // no agents.json at hand: the built-in list with v1.0.21's changes
+        XCTAssertEqual(AgentWindow.list(record: ["agent_apps": ["com.trae.app": false]], registry: nil),
+                       AgentWindow.builtIn.subtracting(["com.trae.app"]))
+    }
+
+    func testLegacyAgentAppsStillCountThenMove() throws {
+        let reg = try registry()
+        let legacy: [String: Any] = ["agent_apps": ["com.todesktop.230313mzl4w4u92": false, "dev.zed.Zed": true]]
+        let t = Dictionary(uniqueKeysWithValues: AgentDropList.targets(registry: reg, record: legacy).map { ($0.agent, $0) })
+        XCTAssertEqual(t["cursor"]?.on, false)
+        XCTAssertEqual(t["dev.zed.Zed"]?.on, true)
+        XCTAssertEqual(t["dev.zed.Zed"]?.custom, true)
+        let patch = try XCTUnwrap(AgentDropList.migrate(registry: reg, record: legacy))
+        XCTAssertTrue(patch["agent_apps"] is NSNull)
+        XCTAssertEqual(patch["agent_drop"] as? [String: Bool], ["cursor": false])
+        let defs = try XCTUnwrap(patch["agent_defs"] as? [String: Any])
+        XCTAssertEqual(defs.count, 1)
+        let (zid, zdef) = (defs.first!.key, defs.first!.value as? [String: Any])
+        XCTAssertEqual(zid, "zed")
+        XCTAssertEqual((zdef?["app"] as? [String: Any])?["macos"] as? [String], ["dev.zed.Zed"])
+        XCTAssertEqual(zdef?["drop"] as? String, "terminal")
+        XCTAssertEqual(zdef?["connect"] as? Bool, false)
+        var after: [String: Any] = [:]
+        for (k, v) in patch where !(v is NSNull) { after[k] = v }
+        let t2 = Dictionary(uniqueKeysWithValues: AgentDropList.targets(registry: reg, record: after).map { ($0.agent, $0) })
+        XCTAssertEqual(t2["cursor"]?.on, false)
+        XCTAssertEqual(t2[zid]?.ids, ["dev.zed.Zed"])
+        XCTAssertEqual(t2[zid]?.on, true)
+        XCTAssertNil(AgentDropList.migrate(registry: reg, record: after), "nothing left to move")
+    }
+
+    func testCustomIDs() {
+        XCTAssertEqual(AgentDropList.customID("My Agent", taken: []), "my-agent")
+        XCTAssertEqual(AgentDropList.customID("My Agent", taken: ["my-agent"]), "my-agent-2")
+        XCTAssertEqual(AgentDropList.customID("豆包 工作", taken: []), "豆包-工作")
+        XCTAssertEqual(AgentDropList.customID("  ", taken: []), "agent")
+    }
+}

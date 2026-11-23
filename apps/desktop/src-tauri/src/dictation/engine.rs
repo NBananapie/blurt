@@ -724,6 +724,25 @@ fn say(app: &AppHandle, msg: &str, vars: Value, key: &str, ms: u64, action: Opti
     island::send(app, op);
 }
 
+/// `say` with a second line under the first (`more`, a catalog key: the island puts it after a line break).
+fn say_more(app: &AppHandle, msg: &str, more: Option<&str>, key: &str, ms: u64, action: Option<(String, &str)>) {
+    let mut op = json!({"op": "toast", "kind": "dictation", "msg": msg, "key": key, "ms": ms});
+    if let Some(m) = keys::mark(msg) {
+        op["mark"] = json!(m);
+    }
+    if let Some((a, label)) = action {
+        op["action"] = json!({"a": a, "label": label});
+    }
+    if let Some(m) = more {
+        op["more"] = json!(m);
+    }
+    *LAST_TOAST.lock().unwrap() = Some((Instant::now(), ms));
+    island::send(app, op);
+}
+
+/// The first failed take of this run said where Retry is afterwards.
+static RETRY_LATER_SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// "Sent" (a double tap's Return went in): the ears' moment — keyboard on the left, ✓ and the word on the right for
 /// 1.6 s (the Mac's island.dictationSent → earMoment(lead: .keyboard)), not a line.
 fn say_sent(app: &AppHandle) {
@@ -1350,8 +1369,13 @@ impl Engine {
         let target = cfg().get("translate_target").and_then(Value::as_str).unwrap_or("auto").to_string();
         let into = target.split('|').next().unwrap_or("auto");
         if into == "auto" {
-            // polish.py's Auto: Chinese ↔ English (the other one of the pair)
-            say(&self.app, "dictation.translate.toast.on.auto", json!({"a": language_name("zh"), "b": language_name("en"), "press": press}), keys::STYLE, 3000, None, false);
+            // Auto: the user's own language ↔ the other one (screen_text::direction::Pair, the Mac's TranslateAutoPair);
+            // without a pair, into the user's language
+            let p = crate::screen_text::direction::pair();
+            match &p.other {
+                Some(o) => say(&self.app, "dictation.translate.toast.on.auto", json!({"a": language_name(&p.home), "b": language_name(o), "press": press}), keys::STYLE, 3000, None, false),
+                None => say(&self.app, "dictation.translate.toast.on.into", json!({"lang": language_name(&p.home), "press": press}), keys::STYLE, 3000, None, false),
+            }
         } else {
             say(&self.app, "dictation.translate.toast.on.into", json!({"lang": language_name(into), "press": press}), keys::STYLE, 3000, None, false);
         }
@@ -2130,7 +2154,10 @@ impl Engine {
         } else {
             ("dictation.settings".to_string(), "dictation.toast.asr_cloud_key.action")
         };
-        say(&self.app, l.key(), json!({}), &keys::failed(&t.id), 8000, Some(action), false);
+        // the first failure of a run says where Retry is once this line has gone (the tray's Retry last dictation,
+        // Home's row): a second line under it
+        let later = l.retry_helps() && super::history::CAN_RETRY && !RETRY_LATER_SAID.swap(true, SeqCst);
+        say_more(&self.app, l.key(), later.then_some("dictation.toast.retry_later"), &keys::failed(&t.id), 8000, Some(action));
     }
 
     /// Hear a take's whole recording again (Retry, Undo) and type it like any take — into the app in front then.
@@ -2999,7 +3026,9 @@ fn deliver(app: &AppHandle, d: Done) -> Delivered {
         island::send(app, json!({"op": "live", "text": text, "typed": true}));
         crate::remote::typed(&text); // Blurt on the phone: what the take typed
     }
-    let result: &str = match decision {
+    // a computer's window of ours in front, connected: typed on that computer instead
+    let remote = ours && crate::viewer::type_on_remote(&text);
+    let result: &str = if remote { "pasted" } else { match decision {
         Decision::Paste { confirmed: c } => {
             let mut on_return = || {
                 if !wants_send() {
@@ -3047,7 +3076,7 @@ fn deliver(app: &AppHandle, d: Done) -> Delivered {
             asked.set(wants_send());
             "copied"
         }
-    };
+    } };
     let a2 = app.clone();
     std::thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(1500));
@@ -3753,15 +3782,20 @@ fn polish_full(
     }
     if translate && !skipped() {
         if can_translate {
-            let target = cfg()
-                .get("translate_target")
-                .and_then(Value::as_str)
-                .unwrap_or("auto")
-                .to_string();
+            // the setting ("auto", "en" …; an older build's "zh-Hans" or "X|Y": its first part), and the direction from what
+            // was said (screen_text::direction, the same rules as Alt+Shift+T's and the Mac's): Auto = your language → the
+            // other one, any other language → yours, not sure → the pair's request; a fixed X said in X is typed as said
+            let setting = cfg().get("translate_target").and_then(Value::as_str).unwrap_or("auto").split('|').next().unwrap_or("auto").to_string();
+            let setting = if setting == "zh-Hans" { "zh".to_string() } else { setting };
+            use crate::screen_text::direction;
+            let target = match direction::plan(&setting, &direction::language(&text), &direction::pair()) {
+                direction::Plan::Send(t) => Some(t),
+                direction::Plan::Already(_) => None,
+            };
             let wait = if local { 35 } else { 20 };
             // `check`: polish.py's guard looks at the answer and says why it fell back (the Mac's request)
             let req = json!({"cmd": "translate", "text": text, "target": target, "cloud": tcloud, "spoken": true, "vocab": vocab(), "check": true});
-            match server::call(server::POLISH, &req, Duration::from_secs(wait), give_up) {
+            match target.and_then(|_| server::call(server::POLISH, &req, Duration::from_secs(wait), give_up)) {
                 Some(v) if v["ok"] == json!(true) && v["fell_back"] != json!(true) => {
                     if let Some(t) = v["text"].as_str().filter(|t| !t.trim().is_empty()) {
                         if t != text {
@@ -3774,7 +3808,7 @@ fn polish_full(
                     let why = v["cloud_error"].as_str().or(v["reason"].as_str()).or(v["code"].as_str()).unwrap_or("error");
                     out.translate_error = Some(why.trim_start_matches("cloud_").to_string());
                 }
-                None if skipped() => {}
+                None if skipped() || req["target"].is_null() => {}
                 None => out.translate_error = Some("timeout".into()),
             }
         } else {

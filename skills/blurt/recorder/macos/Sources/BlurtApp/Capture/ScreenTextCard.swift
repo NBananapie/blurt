@@ -1,14 +1,14 @@
-// ⌥T's translation under the island (docs/design/screen-text.md §1b, 2026-10-30). The island's own line says only what
-// became of it ("Translation pasted", "Copied · ⌘V to paste", "Translation copied"); the whole translation is here, to
-// read and to copy again — before, the first 280 characters were pushed into the toast, which wrapped to several lines
-// in uneven sizes, couldn't be clicked or copied and didn't say it was on the clipboard.
+// ⌥C's text or ⌥T's translation under the island (docs/design/screen-text.md §1b). Only when it went nowhere but the
+// clipboard (ScreenTextPaste.showsCard, 2026-11-16: pasted into a field, the text is where the user wanted it and a
+// card would only be in the way) — ⌥C and ⌥T alike. The island's own line says what became of it ("Copied",
+// "Translation copied"); the whole text is here, to read and to copy again.
 //
 //  • It is the island's lower half, as the live-text panel is (docs/design/system.md §3.2 "Live-text panel"; the same
 //    family, not a new pop-up): the island's black, 6 pt under it (under the hanging cards when they are down), the
 //    live panel's width (IslandLayout.livePanelWidth) and corners, the system's soft shadow; no blur, no border.
 //  • One text size: the live panel's 14 pt in 92 % white on 20 pt lines, up to eight lines (IslandLayout.liveTypedLines),
 //    then it scrolls (an overlay scroller). Under it, on the right, Copy: a toast's quiet pill (IslandButton.quiet);
-//    pressed, it says "Copied" with the ok check for a moment.
+//    pressed, it says "Copied" with the ok check for a moment. On the left, ×: the card goes now.
 //  • It goes by itself 10 s after it shows — not while the pointer is over it: then 10 s after the pointer leaves. Esc
 //    closes it only while the pointer is over it: a Carbon hotkey registered on enter and dropped on exit and on close
 //    (as the hanging cards' Esc, CardReveal.holdsEsc). An Esc meant for the app in front — interrupting Claude Code,
@@ -22,8 +22,10 @@ import Carbon.HIToolbox
 
 final class ScreenTextCard {
     static let shared = ScreenTextCard()
-    /// how long it stays once the pointer isn't over it
+    /// how long it stays once the pointer isn't over it: 10 s for a few lines, longer for a long text (6 s + 0.8 s a
+    /// line, at most 30 s) — a 15-line translation that scrolls went after 10 s, unread
     static let seconds: Double = 10
+    static func dwell(lines: Int) -> Double { min(30, max(seconds, 6 + 0.8 * Double(lines))) }
     static let gap = LiveTranscript.gap
 
     private var panel: NSPanel?
@@ -37,7 +39,10 @@ final class ScreenTextCard {
 
     private init() {
         view.onCopy = { [weak self] in self?.copy(via: "button") }
+        view.onClose = { [weak self] in self?.close(why: "close_button") }
         view.onPointer = { [weak self] inside in self?.pointer(inside: inside) }
+        // being scrolled (the wheel or a swipe, the pointer elsewhere a moment later): its time starts again
+        view.onScroll = { [weak self] in if self?.shown == true { self?.later() } }
     }
 
     private var pointerInside: Bool { testPointer ?? view.pointerInside }
@@ -72,7 +77,7 @@ final class ScreenTextCard {
         emit(["event": "text_card_shown", "chars": s.count, "lines": view.lineCount, "scrolls": view.scrolls, "frame": frameDump])
     }
 
-    /// It goes: `why` esc | timeout | new_capture | live_text | test.
+    /// It goes: `why` esc | close_button | timeout | new_capture | live_text | test.
     func close(why: String) {
         guard shown, let p = panel else { return }
         shown = false
@@ -110,12 +115,12 @@ final class ScreenTextCard {
 
     // MARK: going by itself
 
-    /// 10 s from now — unless the pointer is on it (then from when it leaves).
+    /// dwell(lines:) from now (10 s and up) — unless the pointer is on it (then from when it leaves).
     private func later() {
         hideToken += 1
         guard !pointerInside else { return }
         let tok = hideToken
-        DispatchQueue.main.asyncAfter(deadline: .now() + ScreenTextCard.seconds) { [weak self] in
+        DispatchQueue.main.asyncAfter(deadline: .now() + ScreenTextCard.dwell(lines: view.lineCount)) { [weak self] in
             guard let self = self, tok == self.hideToken, !self.pointerInside else { return }
             self.close(why: "timeout")
         }
@@ -205,6 +210,7 @@ final class ScreenTextCard {
         case "copy": copy(via: "test")
         case "esc": if escHeld { close(why: "esc") }        // = the Esc hotkey (registered only with the pointer on it)
         case "close": close(why: "test")
+        case "x": view.onClose?()             // the × button
         case "hover on", "hover off":
             testPointer = arg == "hover on" ? true : nil
             pointer(inside: arg == "hover on")
@@ -216,8 +222,8 @@ final class ScreenTextCard {
     }
 }
 
-/// The card's face: the island's black, the translation in one size (14 pt, 92 % white, 20 pt lines; up to eight,
-/// then it scrolls), Copy under it on the right.
+/// The card's face: the island's black, the text in one size (14 pt, 92 % white, 20 pt lines; up to eight, then it
+/// scrolls), × under it on the left and Copy on the right.
 final class ScreenTextCardView: NSView {
     static let font = LiveTextLines.font
     static let lineH = LiveTextLines.lineH
@@ -230,7 +236,9 @@ final class ScreenTextCardView: NSView {
     static let fadeH: CGFloat = 20
 
     var onCopy: (() -> Void)?
+    var onClose: (() -> Void)?
     var onPointer: ((Bool) -> Void)?
+    var onScroll: (() -> Void)?
     /// the pointer is over the card (set by its tracking area; ScreenTextCard sets it when the card shows)
     var pointerInside = false
     var radius: CGFloat = 14 { didSet { if radius != oldValue { layer?.cornerRadius = radius } } }
@@ -239,6 +247,8 @@ final class ScreenTextCardView: NSView {
     private let textView = NSTextView()
     private let fade = CardFade()
     private var button: IslandButton!
+    /// × on the button row's left: the card goes now (2026-11-16, the founder: "it stays and stays — give it an ×")
+    private var closeButton: IslandButton!
     private var copiedToken = 0
     /// the text's lines at the width it was last laid out at
     private(set) var lineCount = 0
@@ -283,6 +293,12 @@ final class ScreenTextCardView: NSView {
 
         button = IslandButton.quiet(Loc.t("capture.text.card.copy", table: "Capture")) { [weak self] in self?.onCopy?() }
         addSubview(button)
+        closeButton = IslandButton(icon: .x, tip: Loc.t("capture.text.card.close", table: "Capture")) { [weak self] in self?.onClose?() }
+        closeButton.ghost = true
+        closeButton.fg = NSColor(white: 1, alpha: 0.7)
+        closeButton.setAccessibilityLabel(Loc.t("capture.text.card.close", table: "Capture"))
+        closeButton.setFrameSize(NSSize(width: 24, height: 24))
+        addSubview(closeButton)
         addTrackingArea(NSTrackingArea(rect: .zero, options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect], owner: self))
     }
     required init?(coder: NSCoder) { fatalError() }
@@ -294,7 +310,7 @@ final class ScreenTextCardView: NSView {
     /// lines below the ones showing (the last one fades out; tests)
     var more: Bool { !fade.isHidden }
 
-    @objc private func scrolled() { updateFade() }
+    @objc private func scrolled() { updateFade(); onScroll?() }
 
     private func updateFade() {
         let below = textView.frame.height - scroll.contentView.bounds.maxY
@@ -349,6 +365,7 @@ final class ScreenTextCardView: NSView {
         let b = button.frame.size
         button.setFrameOrigin(NSPoint(x: bounds.width - ScreenTextCardView.buttonInset - 2 - b.width,
                                       y: bounds.height - ScreenTextCardView.buttonInset - b.height))
+        closeButton.setFrameOrigin(NSPoint(x: p.width - 6, y: bounds.height - ScreenTextCardView.buttonInset - 24))
         updateFade()
     }
 

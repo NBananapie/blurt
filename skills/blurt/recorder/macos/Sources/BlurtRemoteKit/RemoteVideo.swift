@@ -38,11 +38,26 @@ public struct RemoteScreenRequest: Codable, Hashable, Sendable {
     /// what this phone can do to repair the stream (RemoteVideoFeature: "nack", "ltr", "fec"); nil = none (phones before 1.0.15). The host
     /// says which it uses in ToPhone.screenView (docs/design/remote-realtime.md)
     public var features: [String]?
+    /// a viewer's window, in pixels: the most the picture needs, whatever `width` and `height` say (docs/design/remote-desktop-viewer.md).
+    /// nil from phones
+    public var window: RemotePixelSize?
     public init(target: String, crop: RemoteCrop = .whole, width: Int, height: Int, bitrate: Int, fps: Int = 60, codecs: [String]? = RemoteVideoCodec.decodable,
-                display: String? = nil, features: [String]? = nil) {
+                display: String? = nil, features: [String]? = nil, window: RemotePixelSize? = nil) {
         self.target = target; self.crop = crop; self.width = width; self.height = height; self.bitrate = bitrate; self.fps = fps; self.codecs = codecs
-        self.display = display; self.features = features
+        self.display = display; self.features = features; self.window = window
     }
+
+    /// The box the picture is fitted into: the one asked for, no larger than a viewer's window.
+    public var box: (width: Int, height: Int) {
+        guard let w = window, w.width > 0, w.height > 0 else { return (width, height) }
+        return (min(width, w.width), min(height, w.height))
+    }
+}
+
+public struct RemotePixelSize: Codable, Hashable, Sendable {
+    public var width: Int
+    public var height: Int
+    public init(width: Int, height: Int) { self.width = width; self.height = height }
 }
 
 public enum RemoteVideoCodec {
@@ -81,6 +96,7 @@ public struct RemoteRate: Equatable, Sendable {
     public private(set) var bitrate: Int
     public private(set) var fps: Int
     private var calm = 0
+    private var longRTTs = 0
     private var bestRTT = Double.infinity
     /// reports to let a cut take effect before judging it
     private var wait = 0
@@ -124,7 +140,13 @@ public struct RemoteRate: Equatable, Sendable {
         recent.append((frames, lost))
         if recent.count > Self.window { recent.removeFirst() }
         let seen = recent.reduce(0) { $0 + $1.0 }, missing = recent.reduce(0) { $0 + $1.1 }
-        let queued = rtt.map { $0 > bestRTT * 3 + 0.1 } ?? false
+        // a round trip well over the best counts once it lasts two reports: a phone's hotspot or a relay swings by a few hundred ms on its
+        // own, and taking each swing for a queue brought the picture down to 200 kbps at 10 frames with nothing lost (2026-11-20). With
+        // less arriving than went, it is a queue at once (a rate left past what the network carries otherwise stayed there).
+        let longer = rtt.map { $0 > bestRTT * 3 + 0.1 } ?? false
+        longRTTs = longer ? longRTTs + 1 : 0
+        let shortfall = sent > 0 && delivered > 0 && delivered * 10 < sent * 9
+        let queued = longRTTs >= 2 || (longer && shortfall)
         let lossy = missing >= 2 && missing * 20 >= seen + missing
         sinceTrouble += 1
         if sinceTrouble > Self.patience { troubleAt = Int.max }

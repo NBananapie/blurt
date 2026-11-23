@@ -57,9 +57,12 @@
 // record.agent_drag ("paths", the default; "same": as every other app, the Cards box's other choice). A chat that runs
 // in the cloud (Kimi, Doubao, ChatGPT mode, a Claude chat) can't read a path and keeps the chat layout; in the Codex
 // and Claude apps the window decides (AgentWindow.isAgent: its web page's address, its mode button).
-// Which apps: a built-in list, and the user's own changes to it (record.agent_apps: bundle id → on / off; Settings →
-// General → Agents…: add any app, switch a built-in one off). Not rules on app names: a name doesn't say whether the
-// app reads this Mac's files (Kimi / Kimi Code, 豆包 / 豆包工作 differ by one word), and new built-ins still arrive.
+// Which apps (v1.0.26): one list with the agents — every agents.json entry with a `drop` for macOS and its `app`
+// bundle ids (AgentDropList, the same rule as agents.py drop_targets and the Windows app's card_drop.rs), the user's
+// own agents (record.agent_defs: Settings → Agents → Dragging Cards → Edit… → Add App…), minus the ones switched off
+// (record.agent_drop.<id> = false). v1.0.21's record.agent_apps (bundle id → on / off) still counts until the list
+// is next edited, which moves it to the new keys (AgentDropList.migrate). Not rules on app names: a name doesn't say
+// whether the app reads this Mac's files (Kimi / Kimi Code, 豆包 / 豆包工作 differ by one word).
 
 import CoreGraphics
 import Foundation
@@ -188,6 +191,24 @@ public enum AgentWindow {
         "com.google.antigravity", "dev.kiro.desktop",
     ]
     public static let builtIn = hosts.union(apps)
+    /// agents whose drop lands in their own message box, never a terminal: several cards may go in as several lines
+    /// there. The AI IDEs (Cursor, Windsurf…) aren't: a drop may land in their built-in terminal, where a newline runs
+    /// the line — they get the terminal's one line.
+    public static let composers: Set<String> = hosts.union(["com.tencent.workbuddy.mac", "com.qoder.work", "com.kimi.code.desktop",
+                                                            "com.work.pc.doubao"])
+
+    /// The apps a card goes into as path + note: the list (AgentDropList.targets) when agents.json is at hand, else
+    /// the built-in fallback with v1.0.21's changes (record.agent_apps).
+    public static func list(record: [String: Any], registry: [[String: Any]]?) -> Set<String> {
+        guard let reg = registry else { return list(record["agent_apps"] as? [String: Bool] ?? [:]) }
+        return Set(AgentDropList.targets(registry: reg, record: record).filter(\.on).flatMap(\.ids))
+    }
+
+    /// Of `list(record:registry:)`, the ones with a composer of their own (drop "composer").
+    public static func composers(record: [String: Any], registry: [[String: Any]]?) -> Set<String> {
+        guard let reg = registry else { return composers }
+        return Set(AgentDropList.targets(registry: reg, record: record).filter { $0.on && $0.drop == "composer" }.flatMap(\.ids))
+    }
 
     /// record.agent_drag: "paths" (default, also when unset or unknown) or "same" (as every other app).
     public static func getsPaths(setting: String?) -> Bool { setting != "same" }
@@ -237,6 +258,151 @@ public enum AgentWindow {
     }
 }
 
+/// One app agent a card can be dragged into (agents.json `drop`, or the user's own), as Settings lists it.
+public struct DropAgent: Equatable, Identifiable {
+    /// the agent's id (agents.json / record.agent_defs), or a bundle id from v1.0.21's record.agent_apps
+    public var agent: String
+    public var name: String
+    /// its macOS bundle ids
+    public var ids: [String]
+    /// "composer" (one line per card) | "terminal" (one line)
+    public var drop: String
+    public var on: Bool
+    /// the user's own (Remove, not a switch)
+    public var custom: Bool
+    public var id: String { agent }
+    public init(agent: String, name: String, ids: [String], drop: String, on: Bool, custom: Bool) {
+        self.agent = agent; self.name = name; self.ids = ids; self.drop = drop; self.on = on; self.custom = custom
+    }
+}
+
+/// The card-drag targets from agents.json and the config (agents.py drop_targets / migrate_agent_apps, card_drop.rs:
+/// one rule on three platforms). Pure: the registry's `agents` array and config.json's `record` object come in.
+public enum AgentDropList {
+    /// agents.json's agents with record.agent_defs merged in (a known id: its fields over the registry's; a new id:
+    /// added after the registry's, in id order) — agents.py definitions().
+    public static func definitions(registry: [[String: Any]], record: [String: Any]) -> [[String: Any]] {
+        var out = registry
+        let defs = record["agent_defs"] as? [String: Any] ?? [:]
+        for k in defs.keys.sorted() {
+            guard let v = defs[k] as? [String: Any] else { continue }
+            if let i = out.firstIndex(where: { $0["id"] as? String == k }) {
+                out[i].merge(v) { _, new in new }
+                out[i]["id"] = k
+            } else {
+                var d = v
+                d["id"] = k
+                if d["name"] == nil { d["name"] = k }
+                out.append(d)
+            }
+        }
+        return out
+    }
+
+    static func isPath(_ s: String) -> Bool { s.hasPrefix("~") || s.hasPrefix("$") || s.contains("/") || s.contains("\\") }
+
+    /// A def's macOS app ids (bundle ids; paths left out).
+    public static func appIDs(_ d: [String: Any]) -> [String] {
+        let v = (d["app"] as? [String: Any])?["macos"]
+        let all = (v as? [String]) ?? (v as? String).map { [$0] } ?? []
+        return all.filter { !isPath($0) }
+    }
+
+    /// `drop` for macOS: a string for every OS, or {os: kind}.
+    public static func dropKind(_ d: [String: Any]) -> String? {
+        let v = (d["drop"] as? [String: Any])?["macos"] ?? d["drop"]
+        guard let k = v as? String, k == "composer" || k == "terminal" else { return nil }
+        return k
+    }
+
+    public static func targets(registry: [[String: Any]], record: [String: Any]) -> [DropAgent] {
+        let off = Set((record["agent_drop"] as? [String: Any] ?? [:]).filter { ($0.value as? Bool) == false }.keys)
+        let legacy = (record["agent_apps"] as? [String: Any] ?? [:]).compactMapValues { $0 as? Bool }
+        var out: [DropAgent] = []
+        var seen = Set<String>()
+        for d in definitions(registry: registry, record: record) {
+            guard let id = d["id"] as? String, let kind = dropKind(d) else { continue }
+            let ids = appIDs(d)
+            guard !ids.isEmpty else { continue }
+            let on = !off.contains(id) && !ids.contains { legacy[$0] == false }
+            out.append(DropAgent(agent: id, name: d["name"] as? String ?? id, ids: ids, drop: kind, on: on,
+                                 custom: d["custom"] as? Bool ?? false))
+            seen.formUnion(ids)
+        }
+        for (k, v) in legacy.sorted(by: { $0.key < $1.key }) where v && !seen.contains(k) {
+            out.append(DropAgent(agent: k, name: k, ids: [k], drop: "terminal", on: true, custom: true))
+        }
+        return out
+    }
+
+    /// "My Agent" → "my-agent" (letters and digits of any script kept), unique among `taken` — agents.py custom_id.
+    public static func customID(_ name: String, taken: Set<String>) -> String {
+        let lower = name.trimmingCharacters(in: .whitespaces).lowercased()
+        var base = ""
+        var dash = false
+        for ch in lower {
+            if ch.isLetter || ch.isNumber || ch == "_" { base.append(ch); dash = false }
+            else if !dash { base.append("-"); dash = true }
+        }
+        base = base.trimmingCharacters(in: CharacterSet(charactersIn: "-_"))
+        if base.isEmpty { base = "agent" }
+        var out = base, i = 2
+        while taken.contains(out) { out = "\(base)-\(i)"; i += 1 }
+        return out
+    }
+
+    /// A user's own app (Add App…) as a record.agent_defs entry: a card-drag target only.
+    public static func customDef(name: String, bundleID: String) -> [String: Any] {
+        ["name": name, "bins": [String](), "headless": false, "custom": true, "connect": false,
+         "app": ["macos": [bundleID]], "drop": "terminal"]
+    }
+
+    /// record.agent_apps (v1.0.21) → the new keys, as the `record` values to write (NSNull = remove): an app switched
+    /// off → its agent in agent_drop = false; an app the user added → a custom agent with that bundle id. nil when
+    /// there is nothing to move. agents.py migrate_agent_apps.
+    public static func migrate(registry: [[String: Any]], record: [String: Any]) -> [String: Any]? {
+        guard let legacy = record["agent_apps"] as? [String: Any] else { return nil }
+        let defs = definitions(registry: registry, record: record)
+        var byApp: [String: String] = [:]
+        for d in defs { if let id = d["id"] as? String { for a in appIDs(d) { byApp[a] = id } } }
+        var drop = record["agent_drop"] as? [String: Any] ?? [:]
+        var userDefs = record["agent_defs"] as? [String: Any] ?? [:]
+        var taken = Set(defs.compactMap { $0["id"] as? String })
+        for k in legacy.keys.sorted() {
+            guard let v = legacy[k] as? Bool else { continue }
+            if !v, let a = byApp[k] { drop[a] = false }
+            else if v, byApp[k] == nil {
+                let short = k.split(separator: ".").last.map(String.init) ?? k
+                let id = customID(short, taken: taken)
+                taken.insert(id)
+                userDefs[id] = customDef(name: short, bundleID: k)
+            }
+        }
+        var patch: [String: Any] = ["agent_apps": NSNull()]
+        if !drop.isEmpty { patch["agent_drop"] = drop }
+        if !userDefs.isEmpty { patch["agent_defs"] = userDefs }
+        return patch
+    }
+
+    /// agents.json's `agents`: the skill's (BlurtPaths.scripts), else the copy in the app. Re-read when the file changes.
+    public static func loadRegistry(bundle: Bundle = .main) -> [[String: Any]]? {
+        var urls = [BlurtPaths.scripts.appendingPathComponent("agents.json")]
+        if let u = bundle.url(forResource: "agents", withExtension: "json") { urls.append(u) }
+        lock.lock(); defer { lock.unlock() }
+        for u in urls {
+            guard let m = (try? FileManager.default.attributesOfItem(atPath: u.path))?[.modificationDate] as? Date else { continue }
+            if let c = cached, c.url == u, c.at == m { return c.agents }
+            guard let d = try? Data(contentsOf: u), let o = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
+                  let list = o["agents"] as? [[String: Any]] else { continue }
+            cached = (u, m, list)
+            return list
+        }
+        return nil
+    }
+    private static let lock = NSLock()
+    private static var cached: (url: URL, at: Date, agents: [[String: Any]])?
+}
+
 /// The app under a drag, as far as what the drag carries goes (CardPasteboard.drag(into:)): its class, its kind of
 /// composer, and whether Blurt pastes a voice card's words there itself (then the drag leaves them off).
 ///  • a shot card into WeChat / QQ (chat, Qt): the rich item, as in v0.8.4 — their composer puts the picture in from
@@ -250,9 +416,12 @@ public struct DragLanding: Equatable {
     public var cls: DropClass
     public var kind: ComposerKind?
     public var wordsWithheld: Bool
+    /// an agent's own window (the Claude app's Code tab, the Codex app, Cursor…), not a terminal: several cards may go
+    /// in as several lines (its composer is a text box; at a shell prompt a newline would run the line)
+    public var lines: Bool
 
-    public init(cls: DropClass, kind: ComposerKind? = nil, wordsWithheld: Bool = false) {
-        self.cls = cls; self.kind = kind; self.wordsWithheld = wordsWithheld
+    public init(cls: DropClass, kind: ComposerKind? = nil, wordsWithheld: Bool = false, lines: Bool = false) {
+        self.cls = cls; self.kind = kind; self.wordsWithheld = wordsWithheld; self.lines = lines
     }
 
     /// Where a drag over the app `bundleID` (`kind`: its composer) lands; `voice`: a voice card; `canPaste`: smart paste
@@ -353,5 +522,64 @@ public enum ComposerPick {
             if best == nil || d < best!.d { best = (i, d) }
         }
         return best?.i
+    }
+}
+
+/// The window a drag is over (CardDrag's DropProbe): the frontmost one under the point in CGWindowList's z-order that
+/// can take a drop. v1.0.23 — user report: cards dragged into Claude Code / Codex lost their note (the picture alone).
+/// On macOS 26.5 Notification Center keeps a full-screen, fully transparent window (layer 21, alpha 1) above every
+/// app, and the probe took it for the app under the pointer: every drop was "Notification Center", a chat app with no
+/// composer, so agents never got path + note and chat apps never got the note pasted. Windows at or above the Dock's
+/// level + 1 (Notification Center, the menu bar and its items, the drag image, the cursor) are never drop targets,
+/// and neither are the system's overlay processes at any level.
+public enum DropWindows {
+    public struct Window: Equatable {
+        public var pid: Int
+        public var bundleID: String?
+        public var ownerName: String?
+        public var layer: Int
+        public var alpha: Double
+        /// in CG coordinates (top-left origin)
+        public var bounds: CGRect
+        /// one of ours that takes the pointer (not the cards' panel during a drag)
+        public var oursTakesMouse: Bool
+        public init(pid: Int, bundleID: String? = nil, ownerName: String? = nil, layer: Int = 0, alpha: Double = 1,
+                    bounds: CGRect, oursTakesMouse: Bool = true) {
+            self.pid = pid; self.bundleID = bundleID; self.ownerName = ownerName; self.layer = layer; self.alpha = alpha
+            self.bounds = bounds; self.oursTakesMouse = oursTakesMouse
+        }
+    }
+
+    public enum Pick: Equatable {
+        /// another app's window
+        case app(Int)
+        /// one of Blurt's own windows (the main window, the island, a note): an in-app drop
+        case ours
+        case nothing
+    }
+
+    /// above the Dock (kCGDockWindowLevel = 20): Notification Center (21), the menu bar (24/25), pop-up menus, the drag
+    public static let maxLayer = 20
+    /// processes whose windows float over the apps without ever taking a drop
+    public static let overlays: Set<String> = [
+        "com.apple.notificationcenterui", "com.apple.controlcenter", "com.apple.WindowManager", "com.apple.Spotlight",
+        "com.apple.screencaptureui", "com.apple.TextInputMenuAgent", "com.apple.TextInputUI.xpc.CursorUIViewService",
+    ]
+
+    /// `windows` front to back (CGWindowList order), `q` in CG coordinates, `me` Blurt's pid.
+    public static func pick(_ windows: [Window], at q: CGPoint, me: Int) -> Pick {
+        for w in windows {
+            guard w.alpha > 0.01, w.ownerName != "Window Server", w.bounds.contains(q) else { continue }
+            if w.pid == me {
+                // ours at any level below the drag image (the island sits over the menu bar)
+                guard w.layer < 500 else { continue }
+                if w.oursTakesMouse { return .ours }
+                continue            // the cards' panel during a drag: the drop goes to what is under it
+            }
+            guard w.layer <= maxLayer else { continue }
+            if let id = w.bundleID, overlays.contains(id) { continue }
+            return .app(w.pid)
+        }
+        return .nothing
     }
 }

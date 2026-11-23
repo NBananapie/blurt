@@ -1,5 +1,12 @@
-// Settings → Agents (a page of SettingsKit lines; its sections are in SettingsCatalog). One focus: which agent Blurt
-// uses and whether it works. The page's lead says the rule (the first agent that works, from the top), with Check Again
+// Settings → Agents (a page of SettingsKit lines; its sections are in SettingsCatalog), v1.0.26 — in the order people
+// come for: the lead says who organizes recordings (hidden while Recording is off); "Use Blurt in Your Agent" lists
+// every agent Blurt can be connected to, CLI or app, by what is true of it (connected: its MCP client started the
+// blurt server — agents.py last_seen; set up, not used yet; found, not set up; not found — with "It's Installed,
+// Connect" to write into its own folder anyway), then Other Agent… (ManualAgentSheet: the skill folder, the MCP server
+// as JSON and as a command, a prompt for the agent to set itself up, Test, Add to List); the background organizing
+// list and its model / effort only while a command-line agent is installed; Dragging Cards: the apps a card goes
+// into as path + note, Edit… (AgentAppsSheet). Below, the organizing list as it was:
+// which agent Blurt uses and whether it works. The page's lead says the rule (the first agent that works, from the top), with Check Again
 // at its right end; the list is one compact row per installed agent — its status mark in the page's icon gutter, its
 // name, one neutral line of state ("Not signed in") and a switch (record.agents: on = tried, in the shown order). The
 // one fix an agent needs is a small plain button before its switch (Sign In…, Install…, Connect…); rarer actions are
@@ -16,6 +23,8 @@
 // from Details… or a double-click), whose pop-ups say the inherited value one way: "Default (Haiku)". The sheet also
 // has the agent's sign-in (Sign In… next to "Not signed in"), the blurt skill + MCP (Connect: agents.py install, a
 // --dry-run preview first, applied only after the user confirms), a test run, and in its header the version.
+// Other agent apps (agents.manual: WorkBuddy, Cursor… — no headless mode) organize when asked in their chat: a row
+// with the skill connected says so ("Organizes in its chat"), and the section's footnote has the request to copy.
 // "Ask your agent" (agents.ask) is the page's closing footnote with Examples… (a popover of
 // three requests, copy on hover): sending items anywhere is the agent's job with its own tools; this is where the old
 // Export pane's links land (SettingsCatalog.moved).
@@ -61,6 +70,17 @@ final class AgentsModel: ObservableObject {
     /// Their skill + MCP are in place (agents.py install --dry-run would change nothing): no Connect button. nil = not
     /// checked yet.
     @Published var connected: [String: Bool] = [:]
+
+    /// An installed agent app Blurt doesn't run in the background (WorkBuddy, Cursor…) that this pane found connected:
+    /// it organizes when asked in its chat. nil when none is known (the pane hasn't checked yet this run).
+    var chatAgentName: String? { rows.first { !$0.headless && $0.installed && ($0.linked || connected[$0.id] == true) }?.name }
+
+    /// the by-hand sheet (Other Agent…) is open
+    @Published var manualShown = false
+    /// the Dragging Cards list is open
+    @Published var dropShown = false
+    /// bumped when the Dragging Cards list changes (its one line on the page)
+    @Published var dropRevision = 0
 
     /// The pane opens at once: before the first check, the registry's agents in the saved order, each "Checking…";
     /// then the quick look (no sign-in probe), then the full one. Later opens show what the last check found.
@@ -112,11 +132,11 @@ final class AgentsModel: ObservableObject {
         }
     }
 
-    func load(login: Bool = true) async {
+    func load(login: Bool = true, fresh: Bool = false) async {
         loading = true
         defer { loading = false }
         do {
-            let d = try await Agents.shared.detectAll(login: login)
+            let d = try await Agents.shared.detectAll(login: login, fresh: fresh)
             var fresh = d.agents
             if !login {
                 // a quick re-read (after a reorder or a tick) can't tell who is logged in: keep what the last full
@@ -235,7 +255,7 @@ final class AgentsModel: ObservableObject {
     }
     /// Check Again: every agent's state, sign-in and connection, afresh.
     func recheck() {
-        Task { connected = [:]; await load(); await checkConnected() }
+        Task { connected = [:]; await load(fresh: true); await checkConnected() }
     }
     func toggle(_ id: String, _ on: Bool) {
         if on { enabled.insert(id) } else { enabled.remove(id) }
@@ -316,6 +336,8 @@ struct AgentsPane: View {
     /// The widest fix button on the page (Sign In…, Install…, Connect…): every row keeps a slot this wide before its
     /// switch, so the states end at one x whether a row has a fix or not.
     @State var fixSlot: CGFloat = 0
+    /// the agents not found, folded at the foot of "Use Blurt in Your Agent": open
+    @State var showUseMissing = false
 
     /// Dragged down the list, the agent lands after the row it's over; dragged up, before it.
     func insertsBelow(_ target: String) -> Bool {
@@ -326,45 +348,20 @@ struct AgentsPane: View {
 
     /// Installed (or still being looked at) agents Blurt can run, in the order it tries them.
     var listed: [CoreAgent] { m.headless.filter { $0.installed || $0.state == "checking" } }
-    /// Not installed, Blurt's and the own-app ones alike.
-    var missing: [CoreAgent] { m.rows.filter { !$0.installed && $0.state != "checking" } }
-    /// Own-app agents that are installed.
-    var apps: [CoreAgent] { m.manual.filter(\.installed) }
+    /// Command-line agents that aren't installed (the app agents are under "Use Blurt in Your Agent").
+    var missing: [CoreAgent] { m.headless.filter { !$0.installed && $0.state != "checking" } }
 
     var body: some View {
-        // the list's section is named like the page (Agents): no heading of its own; the lead says how it works, with
-        // Check Again at its end (the list's own action)
-        SettingsPage(.agents, lead: SettingsLead(text: Text(AL("agents.lead")), accessory: AnyView(checkAgain))) {
-            SettingsGroup("agents.list", footer: m.error, content: {
-                // one stack: the untitled group hides only the first row's hairline (not every row's)
-                VStack(alignment: .leading, spacing: 0) {
-                    ForEach(listed) { a in
-                        agentRow(a, ordered: true)
-                            .overlay(alignment: insertsBelow(a.id) ? .bottom : .top) {
-                                if dropTarget == a.id, let d = dragging, d != a.id {
-                                    Capsule().fill(Color.brandInk).frame(height: 2).offset(y: insertsBelow(a.id) ? 1 : -1)
-                                        .allowsHitTesting(false)
-                                }
-                            }
-                            .onDrag { dragging = a.id; return NSItemProvider(object: a.id as NSString) }
-                            .onDrop(of: [.text], delegate: AgentDrop(target: a.id, m: m, dragging: $dragging, over: $dropTarget))
-                    }
-                    if !missing.isEmpty { missingRows }
-                }
-            }, accessory: { EmptyView() })
-
-            organizeSection
-
-            if !apps.isEmpty {
-                SettingsGroup("agents.manual", footer: AL("agents.manual.footer")) {
-                    ForEach(apps) { a in agentRow(a, ordered: false) }
-                }
+        Group {
+            if Capability.recording.isOn {
+                SettingsPage(.agents, lead: SettingsLead(text: Text(statusLine), accessory: AnyView(checkAgain))) { sections }
+            } else {
+                SettingsPage(.agents) { sections }
             }
-
-            askNote
         }
         .onPreferenceChange(AgentFixWidth.self) { fixSlot = $0 }
         .task { await m.open() }
+        .onReceive(NotificationCenter.default.publisher(for: AgentApps.changed)) { _ in m.dropRevision += 1 }
         // Connect's preview; from the details sheet it opens over that sheet instead (AgentDetailSheet)
         .sheet(isPresented: Binding(get: { m.plan != nil && m.details == nil }, set: { if !$0 { m.plan = nil } })) {
             if let p = m.plan { InstallSheet(m: m, agent: p.agent, plan: p.plan, applied: p.applied).buttonStyle(.automatic)
@@ -375,17 +372,244 @@ struct AgentsPane: View {
                 if let id = m.details { AgentDetailSheet(m: m, id: id).buttonStyle(.automatic).closesOnOutsideClick { m.details = nil } }
             }
         }
+        .background {
+            Color.clear.sheet(isPresented: $m.manualShown) {
+                ManualAgentSheet(m: m) { m.manualShown = false }.buttonStyle(.automatic)
+            }
+        }
+        .background {
+            Color.clear.sheet(isPresented: $m.dropShown) {
+                AgentAppsSheet { m.dropShown = false; m.dropRevision += 1 }.buttonStyle(.automatic)
+            }
+        }
+        // screenshots: open the lists with the page
+        .onAppear {
+            let env = ProcessInfo.processInfo.environment
+            if env["BLURT_TEST_AGENT_APPS_SHEET"] == "1" { m.dropShown = true }
+            if env["BLURT_TEST_MANUAL_AGENT_SHEET"] == "1" { m.manualShown = true }
+        }
     }
 
-    /// Check Again, at the right end of the page's lead (a spinner beside it while a check runs).
-    var checkAgain: some View {
-        HStack(spacing: 6) {
-            if m.loading { BrandSpinnerView(size: 10, label: AL("agents.state.checking")) }
-            Button(AL("agents.check_again")) { m.recheck() }
-                .buttonStyle(.plain)
-                .foregroundStyle(m.loading ? Color.secondary : Color.brandInk)
-                .disabled(m.loading)
+    /// The page's sections, in the order people come for.
+    @ViewBuilder var sections: some View {
+        useSection
+
+        // background organizing: the order, the switches and the model only while a command-line agent is here
+        SettingsGroup("agents.list", footer: m.error, content: {
+            VStack(alignment: .leading, spacing: 0) {
+                if listed.isEmpty && checked {
+                    SettingsLine {
+                        Text(AL("agents.organize.none")).font(.system(size: SettingsMetrics.titleSize)).foregroundStyle(.secondary)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                }
+                ForEach(listed) { a in
+                    agentRow(a, ordered: true)
+                        .overlay(alignment: insertsBelow(a.id) ? .bottom : .top) {
+                            if dropTarget == a.id, let d = dragging, d != a.id {
+                                Capsule().fill(Color.brandInk).frame(height: 2).offset(y: insertsBelow(a.id) ? 1 : -1)
+                                    .allowsHitTesting(false)
+                            }
+                        }
+                        .onDrag { dragging = a.id; return NSItemProvider(object: a.id as NSString) }
+                        .onDrop(of: [.text], delegate: AgentDrop(target: a.id, m: m, dragging: $dragging, over: $dropTarget))
+                }
+                if !missing.isEmpty { missingRows }
+            }
+        }, accessory: { EmptyView() })
+
+        if listed.contains(where: \.installed) { organizeSection }
+
+        dropSection
+
+        askNote
+    }
+
+    /// Who organizes recordings, in one line: the agent in use, Save Video Only, or none can.
+    var statusLine: String {
+        if (recordConfig()["process"] as? String ?? "auto") == "off" { return AL("agents.status.off") }
+        guard checked else { return AL("agents.state.checking") }
+        if let p = m.pick, let a = m.rows.first(where: { $0.id == p }) { return AL("agents.status.organizing", a.name) }
+        return AL("agents.status.none")
+    }
+
+    // MARK: use Blurt in your agent
+
+    /// Every agent Blurt can be connected to: connected first, then set up, then found; the ones not found folded.
+    var connectable: [CoreAgent] { m.rows.filter { $0.connect && $0.state != "checking" } }
+    static let connRank = ["connected": 0, "linked": 1, "found": 2, "missing": 3]
+    var useRows: [CoreAgent] {
+        connectable.filter { $0.conn != "missing" }.enumerated()
+            .sorted { (Self.connRank[$0.element.conn] ?? 9, $0.offset) < (Self.connRank[$1.element.conn] ?? 9, $1.offset) }
+            .map(\.element)
+    }
+    var useMissing: [CoreAgent] { connectable.filter { $0.conn == "missing" } }
+
+    @ViewBuilder var useSection: some View {
+        SettingsGroup("agents.use", footer: AL("agents.use.footer")) {
+            VStack(alignment: .leading, spacing: 0) {
+                if m.rows.contains(where: { $0.state == "checking" }) && connectable.isEmpty {
+                    SettingsLine {
+                        HStack(spacing: 6) {
+                            BrandSpinnerView(size: 10, label: AL("agents.state.checking"))
+                            Text(AL("agents.state.checking")).font(.system(size: SettingsMetrics.detailSize)).foregroundStyle(.secondary)
+                            Spacer(minLength: 0)
+                        }
+                    }
+                }
+                ForEach(useRows) { a in useRow(a) }
+                if !useMissing.isEmpty {
+                    foldLine(AL("agents.conn.missing"), names: useMissing.map(\.name), open: $showUseMissing)
+                    if showUseMissing { ForEach(useMissing) { a in useRow(a) } }
+                }
+                otherRow
+            }
         }
+    }
+
+    /// One agent: its mark (the check only when it has used Blurt), name and edition; its state; the one thing to do.
+    func useRow(_ a: CoreAgent) -> some View {
+        SettingsLine(padding: 6) {
+            HStack(alignment: .center, spacing: 14) {
+                HStack(spacing: SettingsMetrics.iconGap) {
+                    StatusDot(tone: a.conn == "connected" ? .good : .off).frame(width: SettingsMetrics.iconSlot)
+                    Text(a.name).font(.system(size: SettingsMetrics.titleSize, weight: .medium))
+                        .foregroundStyle(a.conn == "missing" ? .secondary : .primary).lineLimit(1)
+                        .gridProbe(.iconText, a.name)
+                    if let e = a.edition {
+                        Text(e).font(.system(size: SettingsMetrics.detailSize)).foregroundStyle(.secondary).lineLimit(1)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                HStack(spacing: 10) {
+                    if m.installing == a.id {
+                        BrandSpinnerView(size: 10, label: AL("agents.install"))
+                    }
+                    Text(connText(a)).font(.system(size: SettingsMetrics.detailSize)).foregroundStyle(.secondary).lineLimit(1)
+                    switch a.conn {
+                    case "connected": EmptyView()
+                    case "missing":
+                        Button(AL("agents.conn.anyway")) { Task { await m.preview(a) } }
+                            .buttonStyle(SettingsOutlinedButtonStyle(compact: true)).disabled(m.installing != nil)
+                    default:
+                        Button(AL("agents.install")) { Task { await m.preview(a) } }
+                            .buttonStyle(SettingsOutlinedButtonStyle(compact: true)).disabled(m.installing != nil)
+                            .help(AL("agents.install.help"))
+                    }
+                }
+                .fixedSize()
+            }
+            .frame(minHeight: 28)
+        }
+        .contextMenu {
+            if a.conn != "connected" { Button(AL("agents.connect.menu")) { Task { await m.preview(a) } } }
+            if a.conn == "missing", let u = AgentHub.shared.def(a.id)?.site ?? AgentFix.site(AgentHub.shared.def(a.id)?.installText ?? "") {
+                Button(AL("agents.get_app", a.name)) { NSWorkspace.shared.open(u) }
+            }
+            Divider()
+            Button(AL("agents.check_again")) { m.recheck() }.disabled(m.loading)
+        }
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel(a.name)
+    }
+
+    /// "Connected · used 15:42" (a time today, else the date), "Set up, not used yet", "Found, not set up", "Not found".
+    func connText(_ a: CoreAgent) -> String {
+        switch a.conn {
+        case "connected":
+            let d = Date(timeIntervalSince1970: a.lastSeen ?? 0)
+            let f = DateFormatter()
+            f.locale = Loc.locale
+            if Calendar.current.isDateInToday(d) { f.timeStyle = .short; f.dateStyle = .none }
+            else { f.setLocalizedDateFormatFromTemplate("MMMd") }
+            return AL("agents.conn.connected", f.string(from: d))
+        case "linked": return AL("agents.conn.linked")
+        case "found": return AL("agents.conn.found")
+        default: return AL("agents.conn.missing")
+        }
+    }
+
+    /// Other Agent…: the by-hand setup, the list's last row.
+    var otherRow: some View {
+        SettingsLine(padding: 6) {
+            Button { m.manualShown = true } label: {
+                HStack(spacing: SettingsMetrics.iconGap) {
+                    Image(systemName: "plus").font(.system(size: 11, weight: .semibold)).foregroundStyle(.secondary)
+                        .frame(width: SettingsMetrics.iconSlot)
+                    Text(AL("agents.other")).font(.system(size: SettingsMetrics.titleSize))
+                    Spacer(minLength: 8)
+                    Text(AL("agents.other.detail")).font(.system(size: SettingsMetrics.detailSize)).foregroundStyle(.secondary)
+                }
+                .frame(minHeight: 28)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+        }
+    }
+
+    /// A folded line: its title and, while folded, the names in it.
+    /// A folded line's names, as a plain list ("Claude Code、Codex、Kimi Code" / "Claude Code, Codex, Kimi Code"): no
+    /// "and", no count.
+    static func plainList(_ names: [String]) -> String { CloudServiceUse.list(names, chinese: Loc.language.hasPrefix("zh")) }
+
+    func foldLine(_ title: String, names: [String], open: Binding<Bool>) -> some View {
+        SettingsLine {
+            Button {
+                withAnimation(NSWorkspace.shared.accessibilityDisplayShouldReduceMotion ? nil : .easeOut(duration: 0.15)) { open.wrappedValue.toggle() }
+            } label: {
+                HStack(spacing: SettingsMetrics.iconGap) {
+                    Image(systemName: "chevron.right").font(.system(size: 10, weight: .semibold)).foregroundStyle(.secondary)
+                        .rotationEffect(.degrees(open.wrappedValue ? 90 : 0))
+                        .frame(width: SettingsMetrics.iconSlot)
+                    Text(title).font(.system(size: SettingsMetrics.titleSize)).foregroundStyle(.secondary)
+                    if !open.wrappedValue {
+                        Text(Self.plainList(names)).font(.system(size: SettingsMetrics.detailSize)).foregroundStyle(.secondary)
+                            .lineLimit(1).truncationMode(.tail)
+                    }
+                    Spacer(minLength: 0)
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(title)
+            .accessibilityValue(open.wrappedValue ? "1" : "0")
+        }
+    }
+
+    // MARK: dragging cards
+
+    /// One line: the apps a card goes into as path + note (the ones on, installed first), and Edit….
+    var dropSection: some View {
+        let _ = m.dropRevision
+        let on = AgentApps.targets().filter(\.on)
+        let installed = on.filter { AgentApps.url($0) != nil }
+        let names = (installed.isEmpty ? on : installed).map(\.name)
+        return SettingsGroup("agents.drop") {
+            SettingsLine(padding: 6) {
+                HStack(spacing: 14) {
+                    Text(AL("agents.drop.line", Loc.list(Array(names.prefix(5))) + (names.count > 5 ? "…" : "")))
+                        .font(.system(size: SettingsMetrics.titleSize))
+                        .fixedSize(horizontal: false, vertical: true)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    Button(AL("agents.drop.edit")) { m.dropShown = true }
+                        .buttonStyle(SettingsOutlinedButtonStyle(compact: true)).fixedSize()
+                }
+                .frame(minHeight: 28)
+            }
+        }
+    }
+
+    /// Check Again, at the right end of the page's lead (a spinner beside it while a check runs). The button's text is
+    /// the lead's baseline whether or not the spinner shows: the spinner is drawn beside it, not stacked with it (it has
+    /// no text baseline, and its bottom edge dropped the button ~10 pt while a check ran: dogfood 2026-11-21).
+    var checkAgain: some View {
+        Button(AL("agents.check_again")) { m.recheck() }
+            .buttonStyle(.plain)
+            .foregroundStyle(m.loading ? Color.secondary : Color.brandInk)
+            .disabled(m.loading)
+            .overlay(alignment: .leading) {
+                if m.loading { BrandSpinnerView(size: 10, label: AL("agents.state.checking")).offset(x: -16) }
+            }
     }
 
     /// The agents that aren't installed: one folded line ("Not installed · Gemini CLI, ZCode"); open, a row each.
@@ -402,7 +626,7 @@ struct AgentsPane: View {
                         .gridProbe(.iconText, "not installed")
                     // the names while folded; open, the rows under it name them
                     if !m.showMissing {
-                        Text(Loc.list(missing.map(\.name))).font(.system(size: SettingsMetrics.detailSize)).foregroundStyle(.secondary)
+                        Text(Self.plainList(missing.map(\.name))).font(.system(size: SettingsMetrics.detailSize)).foregroundStyle(.secondary)
                             .lineLimit(1).truncationMode(.tail)
                     }
                     Spacer(minLength: 0)
@@ -497,7 +721,7 @@ struct AgentsPane: View {
     /// version after it, and a ⓘ when the state needs explaining.
     @ViewBuilder
     func stateLabel(_ a: CoreAgent) -> some View {
-        let state = Text(AgentFix.shortState(a)).font(.system(size: SettingsMetrics.detailSize)).foregroundStyle(.secondary)
+        let state = Text(AgentFix.shortState(a, connected: m.connected[a.id] == true)).font(.system(size: SettingsMetrics.detailSize)).foregroundStyle(.secondary)
             .lineLimit(1)
         HStack(spacing: 4) {
             state
@@ -507,7 +731,7 @@ struct AgentsPane: View {
                     .padding(.leading, 2)
                     .help(AL("agents.details.version", v))
             }
-            if let h = AgentFix.stateHelp(a) { InfoButton(title: a.name, text: h) }
+            if let h = AgentFix.stateHelp(a, connected: m.connected[a.id] == true) { InfoButton(title: a.name, text: h) }
         }
         .fixedSize()            // the state never truncates: the name gives way first
     }
@@ -623,7 +847,8 @@ struct AgentsPane: View {
     /// the page's pop-up width (the column names on the heading's line, over them). Its footnote names the agents set
     /// differently in their details.
     @ViewBuilder var organizeSection: some View {
-        SettingsGroup("agents.organize", footer: organizeFooter, content: {
+        // under the list, untitled: its heading line carries only the column names
+        SettingsGroup("agents.organize", title: " ", footer: organizeFooter, content: {
             ForEach(ProcessingKind.allCases, id: \.self) { k in
                 SettingsLine(flashID: k == .recording ? "agents.organize" : nil) {
                     HStack(spacing: AgentsLayout.columnGap) {
@@ -890,7 +1115,9 @@ struct AgentDetailSheet: View {
     func modelChoices(_ k: ProcessingKind, _ ms: AgentModels) -> [(value: String, title: String)] {
         let shared = m.sharedSetting(k).model
         let named: String? = shared == "cheapest" ? ms.name(ms.cheapest) : ms.name(ms.cliDefault)
-        let follow = AL("agents.organize.inherit", named ?? AL(shared == "cheapest" ? "agents.processing.cheapest" : "agents.processing.default"))
+        // no model name known: the page's choice in its short words ("Default (Agent’s default model)" is cut at the
+        // column's width)
+        let follow = AL("agents.organize.inherit", named ?? AL(shared == "cheapest" ? "agents.organize.inherit.cheapest" : "agents.organize.inherit.default"))
         let cli = ms.name(ms.cliDefault).map { AL("agents.processing.default_named", $0) } ?? AL("agents.processing.default")
         let cheap = ms.name(ms.cheapest).map { AL("agents.processing.cheapest_named", $0) } ?? AL("agents.processing.cheapest")
         var out: [(value: String, title: String)] = [(AgentsModel.sharedID, follow), ("default", cli), ("cheapest", cheap)]
@@ -949,8 +1176,9 @@ enum AgentFix {
     }
 
     /// The state in a word or two, for the row's right end (Signed in, Not signed in, Can't check sign-in, Installed).
-    static func shortState(_ a: CoreAgent) -> String {
-        if !a.headless { return AL(a.installed ? "agents.state.installed" : "agents.state.not_installed") }
+    /// An agent app with the skill in place says how it is used: it organizes in its chat.
+    static func shortState(_ a: CoreAgent, connected: Bool = false) -> String {
+        if !a.headless { return AL(!a.installed ? "agents.state.not_installed" : connected ? "agents.state.chat" : "agents.state.installed") }
         switch a.state {
         case "unknown", "configured": return AL("agents.state.unchecked")
         default: return stateText(a)
@@ -958,9 +1186,9 @@ enum AgentFix {
     }
 
     /// What the short state leaves out, for its ⓘ: why a sign-in can't be checked, or how an app of its own gets blurt.
-    static func stateHelp(_ a: CoreAgent) -> String? {
+    static func stateHelp(_ a: CoreAgent, connected: Bool = false) -> String? {
         guard a.installed else { return nil }
-        if !a.headless { return AL("agents.state.manual.help") }
+        if !a.headless { return AL(connected ? "agents.state.chat.help" : "agents.state.manual.help", a.name) }
         switch a.state {
         case "unknown", "configured": return AL("agents.state.unchecked.help")
         default: return nil
@@ -1048,6 +1276,12 @@ struct InstallSheet: View {
             return Row(change: c, group: group, tone: .err, title: AL(skill ? "install.row.failed.skill" : "install.row.failed.mcp"),
                        detail: AL("install.row.failed.detail", name))
         }
+        if c.isApproval {   // Codex: the reporting tools stop asking (an unattended run would refuse them)
+            let done = applied && c.ok == true
+            return Row(change: c, group: group, tone: c.action == "exists" ? .inPlace : done ? .added : .add,
+                       title: AL(c.action == "exists" ? "install.row.in_place.approve" : done ? "install.row.added.approve" : "install.row.add.approve"),
+                       detail: AL("install.row.about.approve", name))
+        }
         switch c.action {
         case "symlink", "run", "json_merge":
             let done = applied && c.ok == true
@@ -1098,6 +1332,7 @@ struct InstallSheet: View {
         VStack(alignment: .leading, spacing: 0) {
             header
             list.padding(.top, 18)
+            if !afterStep.isEmpty { nextStep.padding(.top, 12) }
             if !technical.isEmpty { details.padding(.top, 14) }
             footer.padding(.top, 16)
         }
@@ -1178,15 +1413,45 @@ struct InstallSheet: View {
         }
     }
 
+    /// What the agent still needs after Connect (agents.json `after`: WorkBuddy's Connectors → blurt → Trust), once
+    /// Connect has run.
+    var afterStep: String { applied && !failed ? AgentHub.shared.def(agent.id)?.afterText ?? "" : "" }
+
+    /// The step left, in the sheet's body with the rows ("One more step: …"), not as a footnote by Done.
+    var nextStep: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Image(systemName: "arrow.right.circle.fill").font(.system(size: 13)).foregroundStyle(Color.brandAttn)
+                .frame(width: 18, alignment: .center)
+                .accessibilityHidden(true)
+            Text(AL("install.after", afterStep)).font(.system(size: 13)).fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 0)
+        }
+        .accessibilityElement(children: .combine)
+    }
+
     // MARK: Details: the exact commands and paths, on request
 
+    /// A chevron and "Details", the page's fold (foldLine), not a DisclosureGroup: SwiftUI reports that one's triangle
+    /// ~22 pt left of where it draws it, outside the sheet (layoutcheck).
     var details: some View {
-        DisclosureGroup(isExpanded: $m.installDetails) {
-            InstallDetailsWell(lines: technical).padding(.top, 8)
-        } label: {
-            Text(AL("install.details")).font(.system(size: 12)).foregroundStyle(.secondary)
+        VStack(alignment: .leading, spacing: 0) {
+            Button {
+                withAnimation(NSWorkspace.shared.accessibilityDisplayShouldReduceMotion ? nil : .easeOut(duration: 0.15)) {
+                    m.installDetails.toggle()
+                }
+            } label: {
+                HStack(spacing: 5) {
+                    Image(systemName: "chevron.right").font(.system(size: 9, weight: .semibold)).foregroundStyle(.secondary)
+                        .rotationEffect(.degrees(m.installDetails ? 90 : 0))
+                        .frame(width: 12)
+                    Text(AL("install.details")).font(.system(size: 12)).foregroundStyle(.secondary)
+                }
                 .contentShape(Rectangle())
-                .onTapGesture { withAnimation(.easeOut(duration: 0.15)) { m.installDetails.toggle() } }
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(AL("install.details"))
+            .accessibilityValue(m.installDetails ? "1" : "0")
+            if m.installDetails { InstallDetailsWell(lines: technical).padding(.top, 8) }
         }
     }
 
@@ -1202,8 +1467,11 @@ struct InstallSheet: View {
                     .lineLimit(2).fixedSize(horizontal: false, vertical: true)
             } else if applied && !failed {
                 // agents read their skills and MCP servers when a session starts: a session already open doesn't see them
-                Text(AL("install.next", agent.name)).font(.system(size: 12)).foregroundStyle(.secondary)
-                    .lineLimit(2).fixedSize(horizontal: false, vertical: true)
+                // (an agent with a step of its own after Connect says it in the body: nextStep)
+                if afterStep.isEmpty {
+                    Text(AL("install.next", agent.name)).font(.system(size: 12)).foregroundStyle(.secondary)
+                        .lineLimit(3).fixedSize(horizontal: false, vertical: true)
+                }
             }
             Spacer(minLength: 12)
             if applied || nothingToDo {
@@ -1342,4 +1610,153 @@ struct AgentDrop: DropDelegate {
 func shortVersion(_ v: String) -> String {
     if let r = v.range(of: #"\d+\.\d+(\.\d+)?"#, options: .regularExpression) { return String(v[r]) }
     return String(v.prefix(16))
+}
+
+/// Other Agent… — any agent Blurt has no entry for, set up by hand: the skill folder (Copy, Open Folder, Save as
+/// .zip…), the blurt MCP server as the common `mcpServers` JSON and as a command with its arguments (agents.py manual:
+/// real absolute paths), a prompt the user pastes so their agent sets itself up, Test (waits for an MCP client to
+/// start the server: $BLURT_HOME/run/mcp-clients.json), and a name to keep it in the list (agents.py custom).
+struct ManualAgentSheet: View {
+    @ObservedObject var m: AgentsModel
+    var close: () -> Void
+    @State private var info: AgentManual?
+    @State private var error: String?
+    @State private var copied: String?
+    @State private var testing = false
+    @State private var testOK = false
+    @State private var name = ""
+    @State private var saved = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text(AL("agents.manual.title")).font(.system(size: 17, weight: .semibold)).accessibilityAddTraits(.isHeader)
+                Text(AL("agents.manual.lead")).font(.system(size: 12)).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            if let i = info {
+                // the quick way first: the agent sets itself up from one prompt
+                VStack(alignment: .leading, spacing: 6) {
+                    Text(AL("agents.manual.prompt")).font(.system(size: 12, weight: .medium))
+                    Text(i.prompt).font(.system(size: 12)).foregroundStyle(.secondary).textSelection(.enabled)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Button(copied == "prompt" ? AL("agents.request.copied") : AL("agents.manual.copy_prompt")) { copy(i.prompt, "prompt") }
+                }
+                Divider()
+                block(AL("agents.manual.skill"), mono: i.skill, copyKey: "skill") {
+                    Button(AL("agents.manual.open")) { NSWorkspace.shared.open(URL(fileURLWithPath: i.skill)) }
+                    Button(AL("agents.manual.zip")) { saveZip(i.skill) }
+                }
+                block(AL("agents.manual.mcp"), mono: i.mcpJSON, copyKey: "json") { EmptyView() }
+                HStack(alignment: .top, spacing: 12) {
+                    block(AL("agents.manual.command"), mono: i.command, copyKey: "command") { EmptyView() }
+                    block(AL("agents.manual.args"), mono: i.args.joined(separator: " "), copyKey: "args") { EmptyView() }
+                }
+                Divider()
+                Text(AL("agents.manual.test.help")).font(.system(size: 12)).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                HStack(spacing: 10) {
+                    Button(AL("agents.manual.test")) { Task { await test() } }.disabled(testing)
+                    if testing {
+                        BrandSpinnerView(size: 10, label: AL("agents.manual.waiting"))
+                        Text(AL("agents.manual.waiting")).font(.system(size: 12)).foregroundStyle(.secondary)
+                    } else if testOK {
+                        Label(AL("agents.manual.connected"), systemImage: "checkmark.circle.fill")
+                            .font(.system(size: 12)).foregroundStyle(Color.brandOk)
+                    }
+                    Spacer(minLength: 0)
+                }
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack(spacing: 8) {
+                        TextField(AL("agents.manual.name"), text: $name, prompt: Text(AL("agents.manual.name.placeholder")))
+                            .textFieldStyle(.roundedBorder).frame(width: 200)
+                            .accessibilityLabel(AL("agents.manual.name"))
+                        Button(AL("agents.manual.save")) { Task { await save() } }
+                            .disabled(name.trimmingCharacters(in: .whitespaces).isEmpty || saved)
+                        if saved { Image(systemName: "checkmark").foregroundStyle(Color.brandOk).accessibilityHidden(true) }
+                        Spacer(minLength: 0)
+                    }
+                    Text(AL("agents.manual.name.help")).font(.system(size: 11)).foregroundStyle(.secondary)
+                }
+            } else if let e = error {
+                Text(e).font(.system(size: 12)).foregroundStyle(Color.brandErr).fixedSize(horizontal: false, vertical: true)
+            } else {
+                BrandSpinnerView(size: 14, label: AL("agents.state.checking"))
+            }
+            HStack {
+                Spacer()
+                Button(AL("common.done")) { testing = false; close() }.keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(20)
+        .frame(width: 560)
+        .task {
+            do { info = try await Agents.shared.manual() } catch { self.error = peopleText(error, context: "agents manual") }
+        }
+    }
+
+    /// A titled value in mono, selectable, with Copy (and the block's own buttons).
+    func block<B: View>(_ title: String, mono: String, copyKey: String, @ViewBuilder buttons: () -> B) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(title).font(.system(size: 12, weight: .medium))
+            ScrollView(.horizontal, showsIndicators: false) {
+                Text(mono).font(.system(size: 11, design: .monospaced)).textSelection(.enabled).fixedSize()
+                    .padding(8)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(RoundedRectangle(cornerRadius: 6).fill(Color.primary.opacity(0.05)))
+            HStack(spacing: 8) {
+                Button(copied == copyKey ? AL("agents.request.copied") : AL("agents.copy")) { copy(mono, copyKey) }
+                buttons()
+            }
+            .controlSize(.small)
+        }
+    }
+
+    func copy(_ s: String, _ key: String) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(s, forType: .string)
+        copied = key
+        emit(["event": "agents_manual_copied", "what": key])
+    }
+
+    /// The skill folder as one .zip (for an agent that imports skills from a file: WorkBuddy's 技能 → 导入技能).
+    func saveZip(_ folder: String) {
+        let p = NSSavePanel()
+        p.nameFieldStringValue = "blurt.zip"
+        p.allowedContentTypes = [.zip]
+        guard p.runModal() == .OK, let dest = p.url else { return }
+        let src = URL(fileURLWithPath: folder)
+        // ditto keeps the folder itself at the top (blurt/SKILL.md), as skill imports expect
+        let staging = FileManager.default.temporaryDirectory.appendingPathComponent("blurt-skill-\(UUID().uuidString.prefix(6))/blurt")
+        try? FileManager.default.createDirectory(at: staging.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try? FileManager.default.copyItem(at: src, to: staging)
+        try? FileManager.default.removeItem(at: dest)
+        let r = ShellEnv.runCapture("/usr/bin/ditto", ["-c", "-k", "--sequesterRsrc", "--keepParent", staging.path, dest.path], env: nil, timeout: 60)
+        try? FileManager.default.removeItem(at: staging.deletingLastPathComponent())
+        emit(["event": "agents_manual_zip", "ok": r.status == 0])
+        if r.status == 0 { NSWorkspace.shared.activateFileViewerSelecting([dest]) }
+    }
+
+    /// Test: a client that starts the blurt server from now on (calls hello, or only starts it) — up to 3 minutes.
+    func test() async {
+        testing = true
+        testOK = false
+        let start = Date().timeIntervalSince1970
+        for _ in 0..<180 where testing {
+            if Agents.mcpClients().values.contains(where: { $0 >= start - 1 }) { testOK = true; break }
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+        }
+        testing = false
+        if testOK { Task { await m.load(login: false) } }
+        emit(["event": "agents_manual_test", "ok": testOK])
+    }
+
+    func save() async {
+        do {
+            _ = try await Agents.shared.addCustom(name.trimmingCharacters(in: .whitespaces))
+            saved = true
+            await m.load(login: false)
+        } catch { self.error = peopleText(error, context: "agents custom") }
+    }
 }

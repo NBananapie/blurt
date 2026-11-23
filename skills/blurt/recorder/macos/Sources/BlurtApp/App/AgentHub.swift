@@ -48,7 +48,14 @@ struct AgentDef {
         processingDefault = o["processing"]
         modelsSpec = o["models"] as? [String: Any] ?? [:]
         usageSpec = o["usage"] as? [String: Any] ?? [:]
+        after = o["after"] as? [String: String] ?? [:]
+        site = (o["site"] as? String).flatMap(URL.init(string:))
     }
+    /// agents.json `after`: what to do in the agent after Connect (WorkBuddy: Connectors → blurt → Trust, a new chat)
+    let after: [String: String]
+    /// agents.json `site`: where to get it
+    let site: URL?
+    var afterText: String { Loc.pick(after) ?? "" }
     /// false = an app / interactive-only entry (WP2's zcode): never in the background chain or its menus.
     let headless: Bool
     let modelArgs: [String: [String]]
@@ -515,8 +522,11 @@ extension App {
         App.fallbackNoted[job.id] = key
         job.set("organizer", ["agent": using.id, "instead_of": why] as [String: Any])
         emit(["event": "organize_fallback", "job": job.id, "agent": using.id, "instead_of": why])
+        // with the way to fix the one passed over (its sign-in, its install: Settings → Agents) — the switch is kept
         AppEnvironment.island?.toast(T("app.agent.fallback_notice", why.joined(separator: T("app.agent.list_sep")), using.name),
-                                     actionTitle: nil, action: nil)
+                                     actionTitle: T("app.agent.fallback_settings")) {
+            AppEnvironment.settings?.show(pane: "agents/agents.organize")
+        }
     }
     /// job id → the switch already said for it (running jobs only: pruned on every new switch)
     static var fallbackNoted: [String: String] = [:]
@@ -541,21 +551,24 @@ extension App {
         Refile.runEnded(dir)
     }
 
-    /// The agent's instructions for an unattended run (English: agents read it, the user never does).
-    func processPrompt(_ dir: URL, captures: [Int]?, project: String? = nil, candidates: String? = nil) -> String {
-        OrganizerPrompt.with(basePrompt(dir, captures: captures, project: project), candidates: candidates)
+    /// skills/blurt/scripts/organize_prompt.json, the organising run's text (the Windows/Linux app sends the same): the
+    /// copy bundled into the app (record.py build), else the skill's.
+    static var promptParts: [String: String]? {
+        var urls: [URL] = []
+        if let u = Bundle.main.url(forResource: "organize_prompt", withExtension: "json") { urls.append(u) }
+        urls.append(BlurtPaths.scripts.appendingPathComponent("organize_prompt.json"))
+        return OrganizerPrompt.parts(from: urls)
     }
 
-    private func basePrompt(_ dir: URL, captures: [Int]?, project: String?) -> String {
-        let what = isShotsSession(dir)
-            ? "Use the blurt skill to process this batch of captures: \(dir.path)\nIt is a shots session (no video): each shot "
-              + "anchors one item and is that item's primary frame; voice notes are transcribed first; .marked.png files carry the user's ink."
-            : "Use the blurt skill to process this recording: \(dir.path)"
-        let only = captures.map { "\nOnly these captures (shots.jsonl n): " + $0.map(String.init).joined(separator: ", ") + "." } ?? ""
-        let skill = "\nThe blurt skill: \(BlurtPaths.skillDir.path)/SKILL.md" + UnattendedRun.scriptsHint(BlurtPaths.scripts.path)
-        return what + only + "\nThis is an unattended background run started by the Blurt app: don't ask questions and don't start the "
-            + "review page. Write items.json and run items.py ingest as SKILL.md says, then summarise in 2–3 sentences." + skill
-            + AgentHub.codeHint(project.flatMap { ProjectStore.shared.project(id: $0) } ?? ProjectStore.shared.project(containing: dir))
+    /// The agent's instructions for an unattended run (English: agents read it, the user never does): the SKILL.md it
+    /// follows, the scripts hint, items.py ingest, the project's code to read, the candidates. nil without the parts.
+    func processPrompt(_ dir: URL, captures: [Int]?, project: String? = nil, candidates: String? = nil) -> String? {
+        guard let parts = App.promptParts else { return nil }
+        let p = project.flatMap { ProjectStore.shared.project(id: $0) } ?? ProjectStore.shared.project(containing: dir)
+        let code = p.flatMap { !$0.isInbox && $0.exists ? $0.path.path : nil }
+        return OrganizerPrompt.render(parts, session: dir.path, shots: isShotsSession(dir), captures: captures,
+                                      skillMD: BlurtPaths.skillDir.appendingPathComponent("SKILL.md").path,
+                                      scripts: BlurtPaths.scripts.path, code: code, candidates: candidates)
     }
 
     /// Run queue[0]; on a failure another agent wouldn't share (login, quota, model), move on to the next.
@@ -567,8 +580,16 @@ extension App {
         // effort, a batch of cards with the cheapest one
         let kind = ProcessingSpec.kind(forSession: dir, isShots: isShotsSession(dir))
         let pa = a.def.processingArgs(env: agentEnvironment(), kind: kind)
-        let cmd = a.def.command(bin: bin, prompt: processPrompt(dir, captures: captures, project: project, candidates: candidates), extra: pa.args)
         let log = dir.appendingPathComponent("agent.log")
+        guard let prompt = processPrompt(dir, captures: captures, project: project, candidates: candidates) else {
+            // the skill has no organize_prompt.json (an older copy): nothing to tell the agent — say so on the job
+            processing.removeAll { $0 == dir.path }
+            appendLog(log, "── blurt \(nowStamp()) · organize_prompt.json not found in \(BlurtPaths.scripts.path)\n")
+            job.finish(.failed, error: JobError(code: "skill", message: "organize_prompt.json not found", hintKey: nil))
+            Refile.runEnded(dir)
+            return refreshStatus()
+        }
+        let cmd = a.def.command(bin: bin, prompt: prompt, extra: pa.args)
         let withCandidates: String = candidates == nil ? "" : " · with the candidate projects"
         let model: String = " · model \(pa.model ?? "CLI default")" + (pa.effort.map { ", effort \($0)" } ?? "")
         let skips: String = skipped.isEmpty ? "" : " · skipped: " + skipped.map(\.1).joined(separator: "; ")
@@ -619,16 +640,47 @@ extension App {
             // items.py ingest turns items.json into Markdown (renaming it) and writes batch.json
             let fm = FileManager.default
             let hasItems = ["batch.json", "items.json", "items.ingested.json"].contains { fm.fileExists(atPath: dir.appendingPathComponent($0).path) }
+            // a sandboxed run can't append to its job (ingest's event names the items): the batch does
+            let uids = (try? Data(contentsOf: dir.appendingPathComponent("batch.json")))
+                .flatMap({ try? JSONSerialization.jsonObject(with: $0) as? [String: Any] })?["items"] as? [String] ?? []
+            let meta = (try? Data(contentsOf: dir.appendingPathComponent("meta.json")))
+                .flatMap({ try? JSONSerialization.jsonObject(with: $0) as? [String: Any] })
+            // nothing was filed and the run's own output says why: a script stopped on a tool this Mac hasn't got (a Mac
+            // without ffmpeg, #107), or a batch written with no item while the recording's words never arrived. Not
+            // "done, 0 items", and no reason to try the next agent
+            if uids.isEmpty, let why = OrganizeSteps.emptyRun(hasBatch: hasItems, output: tail, captures: captures != nil, shots: isShotsSession(dir),
+                                                               videoOnly: meta?["video_only"] as? Bool ?? false,
+                                                               transcribed: fm.fileExists(atPath: dir.appendingPathComponent("transcript.json").path)) {
+                let reason: String, cls: String, said: String
+                switch why {
+                case .missingTool(let tool, let install):
+                    reason = T("app.agent.missing_tool", tool, install)
+                    cls = "missing_tool"
+                    said = "\(tool) not installed, no items"
+                case .noTranscript:
+                    reason = T("app.agent.no_transcript")
+                    cls = "no_transcript"
+                    said = "no transcript, no items"
+                }
+                appendLog(log, "── blurt \(nowStamp()) · failed: \(said)\n")
+                self.processing.removeAll { $0 == dir.path }
+                updateMeta(dir) { m in
+                    m["agent"] = (m["agent"] as? [String: Any] ?? [:]).merging(
+                        ["result": "failed", "class": cls, "short": T("job.state.failed"), "reason": reason,
+                         "exit": Int(status), "done_at": nowStamp()]) { _, n in n }
+                }
+                for (s, st) in OrganizeSteps.onFailure(failureClass: nil, transcribed: false) { job.step(s, st) }
+                job.finish(.failed, error: JobError(code: "unknown", message: said, hintKey: nil, reason: reason))
+                Refile.runEnded(dir)
+                self.refreshStatus()
+                return
+            }
             if hasItems {
                 self.processing.removeAll { $0 == dir.path }
                 updateMeta(dir) { m in m["agent"] = (m["agent"] as? [String: Any] ?? [:]).merging(["result": "ok", "done_at": nowStamp()]) { _, n in n } }
                 appendLog(log, "── blurt \(nowStamp()) · \(a.def.name) done" + (status == 0 ? "" : " (exit \(status))") + "\n")
                 for s in ["transcribe", "write", "frames"] { job.step(s, .done) }
-                // a sandboxed run can't append to its job (ingest's event names the items): the batch does
-                if let uids = (try? Data(contentsOf: dir.appendingPathComponent("batch.json")))
-                    .flatMap({ try? JSONSerialization.jsonObject(with: $0) as? [String: Any] })?["items"] as? [String], !uids.isEmpty {
-                    job.setItems(uids)
-                }
+                if !uids.isEmpty { job.setItems(uids) }
                 job.finish(.done)
                 Scripts.indexUpdate([dir])
                 // a recording re-filed while it ran ("Filed to X · Change"): its items go where the user said

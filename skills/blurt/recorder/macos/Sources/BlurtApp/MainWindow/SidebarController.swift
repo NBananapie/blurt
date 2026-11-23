@@ -43,6 +43,8 @@ protocol SidebarActions: AnyObject {
     func renameProject(_ id: String, to name: String)
     /// the projects dragged into a new order
     func reorderProjects(_ ids: [String])
+    /// v1.0.23: another app's pictures / files / text dropped on a project: a New Item sheet into it
+    func newItem(from drop: DropIn, in project: String)
 }
 
 extension NSPasteboard.PasteboardType {
@@ -74,6 +76,22 @@ final class SidebarController: NSViewController, NSOutlineViewDataSource, NSOutl
     }
     required init?(coder: NSCoder) { fatalError() }
 
+    /// What a row takes besides its name, at the sidebar's width: the source list's insets round the row, the icon
+    /// (2 + 18 + 6), the gaps a hidden key, mark and empty count still keep (5 + 5 + 6 + 6), and a few points so the
+    /// name never meets "…" (measured: a 190 pt sidebar leaves a name 107.5 pt).
+    static let rowChrome: CGFloat = 88
+
+    /// The narrowest the sidebar may be: every built-in place's name whole, in this language, at the rows' font
+    /// (dogfood 1.1.0: "Text &…slation" at the window's minimum width, light and dark). Never under 190 pt; project
+    /// names, which can be any length, keep their middle truncation and tooltip.
+    static var minimumWidth: CGFloat {
+        let font = NSFont.systemFont(ofSize: NSFont.systemFontSize)
+        let names = [T("home.title"), T("dictation.history.sidebar"), T("cards.title"), T("feature.screen_text"), T("feature.phone"),
+                     T("main.place.inbox"), T("main.place.progress"), T("project.inbox"), T("main.place.all")]
+        let widest = names.map { ($0 as NSString).size(withAttributes: [.font: font]).width }.max() ?? 0
+        return max(190, ceil(widest) + rowChrome)
+    }
+
     override func loadView() {
         let scroll = NSScrollView()
         scroll.drawsBackground = false
@@ -94,7 +112,7 @@ final class SidebarController: NSViewController, NSOutlineViewDataSource, NSOutl
         outline.setAccessibilityLabel(T("main.sidebar.label"))
         outline.menu = NSMenu()
         outline.menu?.delegate = self
-        outline.registerForDraggedTypes([.fileURL, .blurtItems, .blurtProject, capturePasteboardType])
+        outline.registerForDraggedTypes([.blurtItems, .blurtProject, capturePasteboardType] + DropIn.types)
         outline.setDraggingSourceOperationMask(.every, forLocal: false)
         outline.setDraggingSourceOperationMask(.move, forLocal: true)
         outline.target = self
@@ -113,19 +131,50 @@ final class SidebarController: NSViewController, NSOutlineViewDataSource, NSOutl
         open.font = .systemFont(ofSize: 13)
         open.toolTip = T("main.sidebar.open_folder.tip")
         open.setAccessibilityLabel(T("project.open_folder"))   // not the symbol's own name ("New Folder")
+        openButton = open
         let root = NSView()
-        for v in [scroll, open] as [NSView] { v.translatesAutoresizingMaskIntoConstraints = false; root.addSubview(v) }
+        // a hairline over the footer while rows go on under it: the last row cut by the list's edge read as drawn under
+        // "+ Open Folder…" at the window's smallest height
+        let rule = NSBox()
+        rule.boxType = .separator
+        rule.isHidden = true
+        footerRule = rule
+        for v in [scroll, rule, open] as [NSView] { v.translatesAutoresizingMaskIntoConstraints = false; root.addSubview(v) }
         NSLayoutConstraint.activate([
             scroll.topAnchor.constraint(equalTo: root.topAnchor), scroll.leadingAnchor.constraint(equalTo: root.leadingAnchor),
-            scroll.trailingAnchor.constraint(equalTo: root.trailingAnchor), scroll.bottomAnchor.constraint(equalTo: open.topAnchor, constant: -6),
+            scroll.trailingAnchor.constraint(equalTo: root.trailingAnchor), scroll.bottomAnchor.constraint(equalTo: open.topAnchor, constant: -8),
+            rule.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 12),
+            rule.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -12),
+            rule.bottomAnchor.constraint(equalTo: scroll.bottomAnchor),
             open.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 16),
             open.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -10),
         ])
+        scroll.contentView.postsBoundsChangedNotifications = true
+        NotificationCenter.default.addObserver(self, selector: #selector(updateFooterRule), name: NSView.boundsDidChangeNotification,
+                                               object: scroll.contentView)
+        NotificationCenter.default.addObserver(self, selector: #selector(updateFooterRule), name: NSView.frameDidChangeNotification,
+                                               object: outline)
+        listScroll = scroll
         view = root
         view.frame = NSRect(x: 0, y: 0, width: 220, height: 600)
     }
 
     @objc func openTapped() { actions?.openFolder() }
+
+    private var footerRule: NSBox?
+    private weak var listScroll: NSScrollView?
+
+    /// The footer's hairline shows while some row is below the list's visible bottom.
+    @objc private func updateFooterRule() {
+        guard let s = listScroll, let r = footerRule else { return }
+        let more = outline.bounds.height - s.contentView.documentVisibleRect.maxY > 1
+        if r.isHidden == more { r.isHidden = !more }
+    }
+
+    override func viewDidLayout() {
+        super.viewDidLayout()
+        updateFooterRule()
+    }
 
     // MARK: rename in place
 
@@ -159,11 +208,24 @@ final class SidebarController: NSViewController, NSOutlineViewDataSource, NSOutl
             node.accessibility = ax
             return node
         }
-        // not items: what was dictated into other apps — a page of its own (DictationPage.swift); text typed at a cursor, as
-        // Settings → Dictation, the menu bar and ⌘K mark it (the mic is a voice note's)
-        let dictation = place(T("dictation.history.sidebar"), .dictation, "character.cursor.ibeam", nil, ax: T("main.sidebar.dictation.ax"))
-        // (cards used in other apps are not a place here: they are the Cards panel's History, ⌥H — v1.0.7)
-        let top = [
+        // The sidebar follows the capabilities (BlurtCore Capabilities.swift), one place each, and a capability that is
+        // off has no place: Home (always), Dictation, Cards, Phone — pages of their own — then Recording's two groups,
+        // the items' places and the projects they are filed in. Screen Text has no place: it leaves nothing behind
+        // but the clipboard (Home has its tile).
+        var pages = [place(T("home.title"), .home, "house", nil)]
+        // what was dictated into other apps (DictationPage.swift); text typed at a cursor, as Settings → Dictation,
+        // the menu bar and ⌘K mark it (the mic is a voice note's)
+        if Capability.dictation.isOn {
+            pages.append(place(T("dictation.history.sidebar"), .dictation, "character.cursor.ibeam", nil, ax: T("main.sidebar.dictation.ax")))
+        }
+        if Capability.cards.isOn {
+            let n = AppEnvironment.island?.hangingCount ?? 0
+            pages.append(place(T("cards.title"), .cards, "rectangle.stack", n > 0 ? n : nil))
+        }
+        if Capability.screenText.isOn { pages.append(place(T("feature.screen_text"), .screenText, "text.viewfinder", nil)) }
+        if Capability.phone.isOn { pages.append(place(T("feature.phone"), .phone, "laptopcomputer.and.iphone", nil)) }
+        let recording = Capability.recording.isOn
+        let itemPlaces = !recording ? [] : [
             place(T("main.place.inbox"), .inbox, "tray", c.inbox, alert: true, ax: T("main.sidebar.inbox.ax")),
             place(T("main.place.progress"), .inProgress, "circle.righthalf.filled", c.active, ax: T("main.sidebar.progress.ax")),
             { () -> SidebarNode in
@@ -172,8 +234,8 @@ final class SidebarController: NSViewController, NSOutlineViewDataSource, NSOutl
                 return n
             }(),
             place(T("main.place.all"), .all, "list.bullet.rectangle", c.all),
-            dictation,
         ]
+        let items = SidebarNode(T("main.sidebar.items"), scope: nil, children: itemPlaces)
         let projectNodes = model.projects.map { p -> SidebarNode in
             // a project's count is plain secondary digits: the one mint pill is the Inbox's (what's new for you, §3.3),
             // so the brand marks on screen stay few. The key ("AW", its ids' prefix) is the row's tooltip, not text.
@@ -191,8 +253,11 @@ final class SidebarController: NSViewController, NSOutlineViewDataSource, NSOutl
             return n
         }
         let projects = SidebarNode(T("main.sidebar.projects"), scope: nil, children: projectNodes)
+        projectsGroup = recording && !projectNodes.isEmpty ? projects : nil
         let selected = selectedScope
-        roots = top + (projectNodes.isEmpty ? [] : [projects])     // no bare "Projects" header before the first one
+        // no bare "Projects" header before the first one; neither group with Recording off
+        roots = pages + (recording ? [items] : []) + (projectsGroup.map { [$0] } ?? [])
+        openButton?.isHidden = !recording
         reloading = true
         outline.reloadData()
         for r in roots where r.isGroup { outline.expandItem(r) }
@@ -274,18 +339,19 @@ final class SidebarController: NSViewController, NSOutlineViewDataSource, NSOutl
     // MARK: drags: projects reorder (Finder's Favorites); folders open as projects; items move
 
     func outlineView(_ o: NSOutlineView, pasteboardWriterForItem item: Any) -> NSPasteboardWriting? {
-        // the projects keep the one order every list uses (pinned, then the most recently used: Pin to Top in their
-        // menu), so a project isn't dragged into an order of its own
+        // the user's own order: dragged like Finder's Favorites (pinned ones stay above the rest)
         guard Self.reorderByDrag, let n = item as? SidebarNode, case .project(let id)? = n.scope, model.project(id: id)?.registered == true else { return nil }
         let pb = NSPasteboardItem()
         pb.setString(id, forType: .blurtProject)
         return pb
     }
 
-    static let reorderByDrag = false
+    static let reorderByDrag = true
 
-    /// The projects group node (where a dragged project lands).
-    private var projectsGroup: SidebarNode? { roots.first(where: \.isGroup) }
+    /// The projects group node (where a dragged project lands); nil while there is none.
+    private var projectsGroup: SidebarNode?
+    /// "Open Folder…" at the foot: the projects' (hidden with Recording off)
+    private weak var openButton: NSButton?
 
     func outlineView(_ o: NSOutlineView, validateDrop info: NSDraggingInfo, proposedItem item: Any?, proposedChildIndex index: Int) -> NSDragOperation {
         let pb = info.draggingPasteboard
@@ -313,7 +379,14 @@ final class SidebarController: NSViewController, NSOutlineViewDataSource, NSOutl
             o.setDropItem(nil, dropChildIndex: NSOutlineViewDropOnItemIndex)     // the whole list highlights
             return .link
         }
-        return []
+        // v1.0.23: pictures, files, text from another app onto a project (or Unassigned): a new item there
+        let d = DropIn.read(pb, decode: false)
+        guard !d.isEmpty, let n = item as? SidebarNode, index == NSOutlineViewDropOnItemIndex, let s = n.scope else { return [] }
+        switch s {
+        case .project(let p) where model.project(id: p)?.registered == true: return .copy
+        case .unassigned: return .copy
+        default: return []
+        }
     }
 
     func outlineView(_ o: NSOutlineView, acceptDrop info: NSDraggingInfo, item: Any?, childIndex index: Int) -> Bool {
@@ -334,18 +407,33 @@ final class SidebarController: NSViewController, NSOutlineViewDataSource, NSOutl
             }
             return true
         }
-        if let raw = pb.pasteboardItems?.first?.string(forType: capturePasteboardType), let shot = Island.shot(fromPasteboard: raw) {
+        let shots = Island.shots(from: pb)
+        if !shots.isEmpty {
             guard let s = (item as? SidebarNode)?.scope else { return false }
+            HangingCards.takenInApp = CACurrentMediaTime()
             switch s {
-            case .project(let p): snapper.assign(hanging.withSelection(shot), to: p)
-            case .unassigned: snapper.assign(hanging.withSelection(shot), to: "inbox")
+            case .project(let p): snapper.assign(shots, to: p)
+            case .unassigned: snapper.assign(shots, to: "inbox")
             default: return false
             }
             return true
         }
         let dirs = folders(pb)
-        guard !dirs.isEmpty else { return false }
-        actions?.openFolders(dirs)
+        if !dirs.isEmpty {
+            actions?.openFolders(dirs)
+            return true
+        }
+        guard let s = (item as? SidebarNode)?.scope else { return false }
+        let project: String
+        switch s {
+        case .project(let p): project = p
+        case .unassigned: project = "inbox"
+        default: return false
+        }
+        DropIn.read(pb, decode: true).resolved { [weak self] got in
+            guard !got.isEmpty else { return NSSound.beep() }
+            self?.actions?.newItem(from: got, in: project)
+        }
         return true
     }
 
@@ -405,6 +493,10 @@ final class SourceCell: NSTableCellView, InlineEditable {
     let badge = CountPill()
     /// the current project's mark (SidebarNode.current)
     let mark = NSImageView()
+    /// the current-project mark takes no room while hidden (a hidden view keeps its width in the layout): a long
+    /// place name ("Phones and Computers") gets that room instead of being cut
+    private lazy var markOff = mark.widthAnchor.constraint(equalToConstant: 0)
+    private lazy var markGap = mark.leadingAnchor.constraint(equalTo: key.trailingAnchor, constant: 5)
 
     init(id: NSUserInterfaceItemIdentifier) {
         super.init(frame: .zero)
@@ -434,7 +526,7 @@ final class SourceCell: NSTableCellView, InlineEditable {
             title.centerYAnchor.constraint(equalTo: centerYAnchor),
             key.leadingAnchor.constraint(equalTo: title.trailingAnchor, constant: 5),
             key.firstBaselineAnchor.constraint(equalTo: title.firstBaselineAnchor),
-            mark.leadingAnchor.constraint(equalTo: key.trailingAnchor, constant: 5),
+            markGap,
             mark.centerYAnchor.constraint(equalTo: centerYAnchor),
             badge.leadingAnchor.constraint(greaterThanOrEqualTo: mark.trailingAnchor, constant: 6),
             badge.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -6),
@@ -465,6 +557,8 @@ final class SourceCell: NSTableCellView, InlineEditable {
         icon.alphaValue = 1
         toolTip = n.current ? [n.tip, T("main.project.current_mark")].compactMap { $0 }.joined(separator: "\n") : n.tip
         mark.isHidden = !n.current
+        markOff.isActive = !n.current
+        markGap.constant = n.current ? 5 : 0
         applyInk()
         badge.text = n.count.map { $0 > 0 ? Loc.number($0) : "" } ?? ""
         badge.mint = n.alert

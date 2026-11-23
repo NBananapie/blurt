@@ -1,10 +1,16 @@
 // The Settings window (⌘, from the menu; blurt://settings/<pane>[/<row>]): one resizable window, a sidebar and a page.
 //   Sidebar  the search field on top (⌘F focuses it, Esc clears it, ↓ / ↑ walk the results, ↩ opens one), then the
-//            panes in three small groups — Preferences: General, Dictation, Copy Text from Screen, Speech, Shortcuts ·
-//            Work: Projects, Agents ·
-//            This Mac: Privacy, Storage (SettingsCatalog.panes) — in an NSOutlineView like the main window's sidebar:
-//            the brand-tint selection (BrandRowView), ↑ / ↓ move between panes. While searching, the panes with
-//            matches show how many; the others are dimmed (with no match anywhere, none are).
+//            panes in three small groups, by capability (v1.0.23; BlurtCore Capabilities.swift) — Features: Dictation,
+//            Cards, Screen Text, Recording & Items, Projects, Phone, named and drawn as in the main window's sidebar ·
+//            App: General, Models, Shortcuts, Agents · This Mac: Privacy, Storage (SettingsCatalog.panes) — in an
+//            NSOutlineView like the main window's sidebar: the brand-tint selection (BrandRowView), ↑ / ↓ move between
+//            panes. While searching, the panes with matches show how many; the others are dimmed (with no match
+//            anywhere, none are).
+//   Off      a capability that is turned off (General's Features switches, Home's, config.json) has no pane here: the
+//            sidebar, the search and the Shortcuts pane's rows follow SettingsCatalog.paneShown / rowShown, and are
+//            rebuilt when a switch flips while the window is open (SettingsFeatures). The pane on show going away
+//            (Dictation's own switch, Home's) moves the window to General, at that capability's switch; a link to an
+//            off capability's pane or row lands there too (SettingsCatalog.landing).
 //   Page     the pane (SwiftUI, SettingsKit's SettingsPage), or the search results (SettingsSearch.swift). Each pane's
 //            page is kept once made, so switching back doesn't reload it.
 // State (pane, query) lives in SettingsNavigator, the row to scroll to in SettingsFlash. The last pane is remembered
@@ -19,10 +25,14 @@ import SwiftUI
 import BlurtCore
 
 enum SettingsPane: String, CaseIterable {
-    // the sidebar's order (SettingsCatalog.panes)
-    case general, dictation, screenText = "screentext", speech, shortcuts, remote, projects, agents, privacy, storage
+    // the sidebar's order (SettingsCatalog.panes): the capabilities' panes, the app's, this Mac's
+    case dictation, cards, screenText = "screentext", recording, projects, remote
+    case general, speech, shortcuts, agents
+    case privacy, storage
 
     var info: SettingsPaneInfo? { SettingsCatalog.pane(rawValue) }
+    /// false while the capability it is the settings of is turned off: not in the sidebar, not opened
+    var shown: Bool { SettingsCatalog.paneShown(rawValue) }
     var title: String { info.flatMap { SettingsCatalog.text($0.title) } ?? rawValue }
     /// Agents: a terminal, what they run in here — not a "send" paper plane
     var symbol: String { self == .agents ? "terminal" : info?.symbol ?? "gearshape" }
@@ -32,6 +42,8 @@ enum SettingsPane: String, CaseIterable {
         let view: AnyView
         switch self {
         case .general: view = AnyView(GeneralPane())
+        case .cards: view = AnyView(CardsPane())
+        case .recording: view = AnyView(RecordingPane())
         case .shortcuts: view = AnyView(ShortcutsPane())
         case .remote: view = AnyView(RemotePane())
         case .speech: view = AnyView(SpeechPane())
@@ -46,6 +58,44 @@ enum SettingsPane: String, CaseIterable {
         vc.sizingOptions = []           // the window sizes the page, not the other way round
         vc.title = title
         return vc
+    }
+}
+
+/// The capabilities that are off, as Settings shows them now: the sidebar, the search, General's switches, the Shortcuts
+/// pane's rows and Projects' "new snaps go to" follow it. Whoever flipped a switch — General here, Home, Dictation's own
+/// switch, config.json by hand (CapabilityWatch says so) — it is read again from the config.
+@MainActor
+final class SettingsFeatures: ObservableObject {
+    static let shared = SettingsFeatures()
+    @Published private(set) var off: Set<Capability> = Capability.off
+    private var observers: [NSObjectProtocol] = []
+
+    private init() {
+        // Dictation's switch is the Dictation capability, and says so by its own notification
+        for name in [Capability.didChange, Dictation.settingsChanged] {
+            observers.append(NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated { self?.look() }
+            })
+        }
+    }
+
+    func look() {
+        let now = Capability.off
+        if now != off { off = now }
+    }
+
+    /// Turns a capability on or off, as its switch in General does. Dictation goes the way its own switch in
+    /// Settings → Dictation goes (record.dictation.enabled, then Dictation.apply: the key is let go or listened to at
+    /// once), so the two switches are one; the others are Capability.set. Whatever the config answered is what shows.
+    func set(_ c: Capability, on: Bool) {
+        if c == .dictation {
+            Dictation.set("enabled", on ? nil : false)
+            Dictation.shared.apply()
+        } else {
+            Capability.set(c, on: on)
+        }
+        emit(["event": "settings_feature", "feature": c.rawValue, "on": c.isOn])
+        look()
     }
 }
 
@@ -97,7 +147,8 @@ final class SettingsController: NSObject, SettingsHosting, NSWindowDelegate {
         let page = SettingsDetailController()
         let split = NSSplitViewController()
         let sideItem = NSSplitViewItem(sidebarWithViewController: side)
-        sideItem.minimumThickness = 190
+        // 210: the longest pane name ("Phones and Computers") whole, not cut
+        sideItem.minimumThickness = 210
         sideItem.maximumThickness = 260
         sideItem.canCollapse = false
         sideItem.allowsFullHeightLayout = true          // the source list runs to the top, under the window's buttons
@@ -117,7 +168,7 @@ final class SettingsController: NSObject, SettingsHosting, NSWindowDelegate {
         w.toolbarStyle = .unified
         w.titleVisibility = .visible
         w.titlebarAppearsTransparent = true
-        w.minSize = NSSize(width: 760, height: 520)
+        w.minSize = NSSize(width: Self.minWidth, height: Self.minHeight)
         w.setContentSize(NSSize(width: 860, height: 620))
         w.isReleasedWhenClosed = false
         w.delegate = self
@@ -127,6 +178,7 @@ final class SettingsController: NSObject, SettingsHosting, NSWindowDelegate {
         window = w
         sidebar = side
         detail = page
+        fitMinimum()
         // the last pane, for next time (a pane chosen while the window is open counts, not only the one at closing)
         nav.$pane.removeDuplicates().sink { p in Config.shared.set("app.settings_pane", p.rawValue) }.store(in: &subs)
         // while searching, the query is the page's title ("“short”"): the results page doesn't say it twice
@@ -134,6 +186,46 @@ final class SettingsController: NSObject, SettingsHosting, NSWindowDelegate {
             .receive(on: RunLoop.main)
             .sink { [weak w] p, q in w?.title = q.isEmpty ? p.title : T("settings.search.title_query", q) }
             .store(in: &subs)
+        // a capability was turned on or off: its pane comes or goes (the config is written by then)
+        SettingsFeatures.shared.$off.dropFirst().removeDuplicates().receive(on: RunLoop.main)
+            .sink { [weak self] _ in MainActor.assumeIsolated { self?.capabilitiesChanged() } }
+            .store(in: &subs)
+    }
+
+    static let minWidth: CGFloat = 760
+    /// The least height of any sidebar; the real minimum is what the sidebar needs (fitMinimum).
+    static let minHeight: CGFloat = 520
+
+    /// The window's minimum height is the sidebar's: the search field and every pane listed, the last one whole — at
+    /// the smallest size no pane is cut by the window's bottom edge (Storage was, at the old fixed 760 × 520). It
+    /// follows the panes shown (a capability turned off lowers it); a window smaller than that
+    /// (an autosaved frame from before) grows to it, its top edge kept.
+    @MainActor
+    private func fitMinimum() {
+        guard let w = window, let side = sidebar else { return }
+        w.layoutIfNeeded()
+        let need = max(Self.minHeight, side.neededHeight.rounded(.up))
+        w.minSize = NSSize(width: Self.minWidth, height: need)
+        // with the toolbar showing, AppKit adds its height to the minimum it is given (520 came back as 554): take
+        // that off, so the window stops where the last pane ends
+        let over = w.minSize.height - need
+        if over > 0 { w.minSize = NSSize(width: Self.minWidth, height: need - over) }
+        if w.frame.height < need {
+            let f = w.frame
+            w.setFrame(NSRect(x: f.minX, y: f.maxY - need, width: f.width, height: need), display: true)
+        }
+        emit(["event": "settings_min_size", "size": [Double(w.minSize.width), Double(w.minSize.height)]])
+    }
+
+    /// The sidebar and the search follow the switches; a pane that just went away leaves for General, at its
+    /// capability's switch (while the window is closed: General, quietly), and its page is let go.
+    @MainActor
+    private func capabilitiesChanged() {
+        SettingsNavigator.shared.capabilitiesChanged(visible: window?.isVisible == true)
+        sidebar?.rebuild()
+        fitMinimum()
+        detail?.prune()
+        emit(["event": "settings_features", "off": Capability.off.map(\.rawValue).sorted(), "pane": SettingsNavigator.shared.pane.rawValue])
     }
 
     func show(pane: String?) {
@@ -141,16 +233,20 @@ final class SettingsController: NSObject, SettingsHosting, NSWindowDelegate {
             MainActor.assumeIsolated {
                 let nav = SettingsNavigator.shared
                 // "speech" or "speech/dictation": the pane, then a row or section of it; a pane that moved: where it went
-                let link = SettingsCatalog.redirect(pane ?? "")
-                if link != (pane ?? "") { emit(["event": "settings_moved_pane", "from": pane ?? "", "to": link]) }
+                let moved = SettingsCatalog.redirect(pane ?? "")
+                if moved != (pane ?? "") { emit(["event": "settings_moved_pane", "from": pane ?? "", "to": moved]) }
+                // a pane or a row of a capability that is off: General, at that capability's switch
+                SettingsFeatures.shared.look()
+                let link = SettingsCatalog.landing(moved)
+                if link != moved { emit(["event": "settings_off_pane", "from": moved, "to": link]) }
                 let parts = link.split(separator: "/", maxSplits: 1).map(String.init)
                 let asked = parts.first.flatMap(SettingsPane.init(rawValue:))
-                // no pane named: the last one picked; a name that isn't a pane (a stale link): General, never an
-                // unrelated pane from last time
+                // no pane named: the last one picked (General when its capability has been turned off since); a name
+                // that isn't a pane (a stale link): General, never an unrelated pane from last time
                 if asked == nil, let p = parts.first, !p.isEmpty { emit(["event": "settings_unknown_pane", "pane": p]) }
                 let last = SettingsCatalog.redirect(Config.shared["app.settings_pane"] as? String ?? "").split(separator: "/").first
-                let want = asked ?? (parts.first?.isEmpty == false ? .general
-                    : last.flatMap { SettingsPane(rawValue: String($0)) } ?? .general)
+                    .flatMap { SettingsPane(rawValue: String($0)) }.flatMap { $0.shown ? $0 : nil }
+                let want = asked ?? (parts.first?.isEmpty == false ? .general : last ?? .general)
                 nav.go(want)                    // before the window is made: only the pane asked for is built
                 if window == nil { build() }
                 if parts.count > 1 { nav.reveal(parts[1].contains(".") ? parts[1] : "\(want.rawValue).\(parts[1])") }
@@ -239,6 +335,11 @@ final class SettingsDetailController: NSViewController {
     private var current: NSViewController?
     private var subs: Set<AnyCancellable> = []
 
+    /// The pages of panes that are gone (their capability was turned off) are let go: back on, the pane is made again
+    /// and reads its settings afresh. The one on show stays until the navigator has moved on.
+    @MainActor
+    func prune() { pages = pages.filter { $0.key.shown || $0.value === current } }
+
     override func loadView() { view = NSView(frame: NSRect(x: 0, y: 0, width: 660, height: 620)) }
 
     override func viewDidLoad() {
@@ -264,6 +365,7 @@ final class SettingsDetailController: NSViewController {
         vc.view.autoresizingMask = [.width, .height]
         view.addSubview(vc.view)
         current = vc
+        prune()
     }
 }
 
@@ -331,17 +433,12 @@ final class SettingsSidebarController: NSViewController, NSOutlineViewDataSource
             scroll.bottomAnchor.constraint(equalTo: root.bottomAnchor),
         ])
         view = root
-        view.frame = NSRect(x: 0, y: 0, width: 210, height: 620)
+        view.frame = NSRect(x: 0, y: 0, width: 226, height: 620)
     }
 
     override func viewDidLoad() {
         super.viewDidLoad()
-        roots = SettingsCatalog.groups.map { g in
-            SettingsNode(SettingsCatalog.text(g.title) ?? g.id, pane: nil,
-                         children: SettingsPane.allCases.filter { $0.info?.group == g.id }.map { SettingsNode($0.title, pane: $0) })
-        }
-        outline.reloadData()
-        for r in roots { outline.expandItem(r) }
+        MainActor.assumeIsolated { rebuild() }
         let nav = SettingsNavigator.shared
         nav.$pane.receive(on: RunLoop.main).sink { [weak self] p in MainActor.assumeIsolated { self?.reflect(pane: p) } }.store(in: &subs)
         nav.$hits.receive(on: RunLoop.main).sink { [weak self] _ in MainActor.assumeIsolated { self?.reflectSearch() } }.store(in: &subs)
@@ -349,6 +446,32 @@ final class SettingsSidebarController: NSViewController, NSOutlineViewDataSource
             guard let self = self, self.search.stringValue != q else { return }
             self.search.stringValue = q
         }.store(in: &subs)
+    }
+
+    /// The groups and their panes, as the capabilities are now: a pane whose capability is off is not listed, a group
+    /// left with none isn't either (Features, with all five off). The selection goes back on the pane showing.
+    @MainActor func rebuild() {
+        guard isViewLoaded else { return }
+        roots = SettingsCatalog.groups.compactMap { g in
+            let panes = SettingsCatalog.panes.filter { $0.group == g.id }.compactMap { SettingsPane(rawValue: $0.id) }.filter(\.shown)
+            return panes.isEmpty ? nil : SettingsNode(SettingsCatalog.text(g.title) ?? g.id, pane: nil, children: panes.map { SettingsNode($0.title, pane: $0) })
+        }
+        syncing = true
+        outline.reloadData()
+        for r in roots { outline.expandItem(r) }
+        syncing = false
+        reflect(pane: SettingsNavigator.shared.pane)
+    }
+
+    /// The height the sidebar needs to list every pane whole: from the window's top (it runs full height, under the
+    /// toolbar) to the list's top, then its rows, with the list's own top margin repeated under the last one.
+    @MainActor var neededHeight: CGFloat {
+        view.layoutSubtreeIfNeeded()
+        let rows = outline.numberOfRows
+        guard rows > 0, let scroll = outline.enclosingScrollView else { return 0 }
+        let first = outline.rect(ofRow: 0), last = outline.rect(ofRow: rows - 1)
+        let top = view.isFlipped ? scroll.frame.minY : view.bounds.height - scroll.frame.maxY
+        return top + scroll.contentInsets.top + last.maxY + max(8, first.minY)
     }
 
     @MainActor func focusSearch() {
@@ -508,7 +631,9 @@ final class SettingsPaneCell: NSTableCellView {
     /// count: nil = not searching; 0 = no match here (dimmed)
     func set(title t: String, symbol: String, count: Int?) {
         title.stringValue = t
-        icon.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)?.withSymbolConfiguration(.init(pointSize: 13, weight: .regular))
+        // monochrome: one line weight in the column (the iPhone's screen was a filled slab among outlines)
+        icon.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)?
+            .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 13, weight: .regular).applying(.preferringMonochrome()))
         icon.setAccessibilityElement(false)
         title.setAccessibilityElement(false)
         let dim = count == 0

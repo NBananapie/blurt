@@ -290,11 +290,12 @@ final class CommandPalette: NSObject, NSTableViewDataSource, NSTableViewDelegate
         var out: [Entry] = []
         if has {
             out += [
-                // the Handed off ring, as the state actions below show the state each leads to
-                Entry(T("main.menu.start_session"), image: Look.target("handed_off", size: 14), keys: "⌘↩", hint: T("main.toolbar.handoff.tip"),
+                // the Handed off ring, as the state actions below show the state each leads to — as a template, in the
+                // same quiet ink as its neighbours (the selection highlight marks the active row). One row for the
+                // one command: Copy Instruction for Agent is ⌘↩, with no second name under ⇧⌘C.
+                Entry(T("main.menu.start_session"), image: Self.template(Look.target("handed_off", size: 14)), keys: "⌘↩", hint: T("main.toolbar.handoff.tip"),
                       kind: .command, mutates: false, enabled: true, section: .selected, pinned: true) { c.handOffSelection() },
-                e(T("main.cmd.copy_instruction"), "doc.on.doc", "⇧⌘C", hint: T("main.palette.hint.copy_instruction"), section: .selected, pinned: true) { c.mCopyInstruction() },
-                e(T("main.cmd.copy_full"), "text.alignleft", hint: T("main.palette.hint.copy_full"), section: .selected) { c.mCopyFull() },
+                e(T("main.cmd.copy_full"), "doc.on.doc", "⇧⌘C", hint: T("main.palette.hint.copy_full"), section: .selected) { c.mCopyFull() },
             ]
             // K3: what the selection can do from its state (hand off is above); the hint goes to the footer
             // the same marks as the ring's menu (the shape of the state each leads to), so ⌘K and the menu read alike
@@ -303,7 +304,7 @@ final class CommandPalette: NSObject, NSTableViewDataSource, NSTableViewDelegate
                       hint: StateMenu.hint(a, items), mutates: true, enabled: Scripts.canWrite, section: .selected, pinned: true) { c.apply(a, to: items) }
             }
             out += [
-                e(T("main.palette.move_pick"), "arrow.turn.up.right", "M", section: .selected, pinned: true, enabled: Scripts.canWrite) {
+                e(T("main.palette.move_pick"), "folder", "M", section: .selected, pinned: true, enabled: Scripts.canWrite) {
                     DispatchQueue.main.async { c.pickProject() }
                 },
                 e(T("main.menu.export_bundle"), "archivebox", section: .selected) { c.mExportBundle() },
@@ -313,25 +314,47 @@ final class CommandPalette: NSObject, NSTableViewDataSource, NSTableViewDelegate
                 e(T("main.menu.rename"), "pencil", "E", section: .selected) { c.renameSelection() },
             ]
         }
-        out += [
-            e(T("main.action.record"), "record.circle", hk(.toggleRecord), hint: tip("main.toolbar.record.tip"), section: .capture, pinned: true) { c.record() },
-            e(T("main.action.snap"), "camera.viewfinder", hk(.snap), hint: tip("main.toolbar.snap.tip"), section: .capture, pinned: true) { c.snap() },
-            e(T("main.place.inbox"), "tray", "⌘1", kind: .place, section: .go, pinned: true) { c.go(.inbox) },
-            e(T("main.place.progress"), "circle.righthalf.filled", "⌘2", kind: .place, section: .go, pinned: true) { c.go(.inProgress) },
-            e(T("project.inbox"), "tray.2", "⌘3", kind: .place, section: .go) { c.go(.unassigned) },
-            e(T("main.place.all"), "list.bullet.rectangle", "⌘4", kind: .place, section: .go, pinned: true) { c.go(.all) },
-            e(T("dictation.history.menu"), "character.cursor.ibeam", "⌥⌘D", kind: .place, section: .go, pinned: true) { c.showDictation() },
-            e(T("project.open_folder"), "folder.badge.plus", "⌘O") { c.openFolder() },
-            e(T("main.palette.switch_project"), "arrow.left.arrow.right", hk(.project)) { AppEnvironment.island?.showSwitcher() },
-            e(T("main.empty.clear_filters"), "line.3.horizontal.decrease.circle", enabled: c.model.filtered) { c.clearFilters() },
-            e(T("menu.rescan"), "arrow.clockwise") { c.model.scan() },
-            e(T("menu.shortcuts"), "keyboard", "?") { c.showShortcuts() },
-        ]
-        if DictationLabModel.enabled { out.append(e(T("dictation.lab.menu"), "waveform", "⌥⌘L", kind: .place) { c.showDictationLab() }) }
-        for k in KindStyle.builtIn {
-            out.append(Entry(T("main.palette.only_kind", Look.kindName(k)), image: Look.kindImage(k, size: KindStyle.smallSize)) {
-                c.model.kinds = [k]; c.model.reload()
-            })
+        // every capability's commands and places while it is on (BlurtCore Capabilities.swift), in the sidebar's order;
+        // Settings' panes by name, so "phone" or "shortcuts" typed here goes straight there
+        let recording = Capability.recording.isOn, cards = Capability.cards.isOn, dictation = Capability.dictation.isOn
+        if recording {
+            out.append(e(T("main.action.record"), "record.circle", hk(.toggleRecord), hint: tip("main.toolbar.record.tip"), section: .capture, pinned: true) { c.record() })
+        }
+        if cards {
+            out.append(e(T("main.action.snap"), "camera.viewfinder", hk(.snap), hint: tip("main.toolbar.snap.tip"), section: .capture, pinned: true) { c.snap() })
+        }
+        out.append(e(T("home.title"), "house", "⌘0", kind: .place, section: .go, pinned: true) { c.go(.home) })
+        if dictation {
+            out.append(e(T("dictation.history.menu"), "character.cursor.ibeam", "⌥⌘D", kind: .place, section: .go, pinned: true) { c.showDictation() })
+        }
+        if cards { out.append(e(T("cards.title"), "rectangle.stack", kind: .place, section: .go, pinned: true) { c.go(.cards) }) }
+        if Capability.screenText.isOn { out.append(e(T("feature.screen_text"), "text.viewfinder", kind: .place, section: .go, pinned: true) { c.go(.screenText) }) }
+        if Capability.phone.isOn { out.append(e(T("feature.phone"), "laptopcomputer.and.iphone", kind: .place, section: .go, pinned: true) { c.go(.phone) }) }
+        if recording {
+            out += [
+                e(T("main.place.inbox"), "tray", "⌘1", kind: .place, section: .go, pinned: true) { c.go(.inbox) },
+                e(T("main.place.progress"), "circle.righthalf.filled", "⌘2", kind: .place, section: .go, pinned: true) { c.go(.inProgress) },
+                e(T("project.inbox"), "tray.2", "⌘3", kind: .place, section: .go) { c.go(.unassigned) },
+                e(T("main.place.all"), "list.bullet.rectangle", "⌘4", kind: .place, section: .go, pinned: true) { c.go(.all) },
+                e(T("project.open_folder"), "folder.badge.plus", "⌘O") { c.openFolder() },
+                e(T("main.palette.switch_project"), "arrow.left.arrow.right", hk(.project)) { AppEnvironment.island?.showSwitcher() },
+                e(T("main.empty.clear_filters"), "line.3.horizontal.decrease.circle", enabled: c.model.filtered) { c.clearFilters() },
+                e(T("menu.rescan"), "arrow.clockwise") { c.model.scan() },
+            ]
+        }
+        out.append(e(T("menu.shortcuts"), "keyboard", "?") { c.showShortcuts() })
+        if dictation, DictationLabModel.enabled { out.append(e(T("dictation.lab.menu"), "waveform", "⌥⌘L", kind: .place) { c.showDictationLab() }) }
+        if recording, !c.model.scope.isPage {
+            for k in KindStyle.builtIn {
+                out.append(Entry(T("main.palette.only_kind", Look.kindName(k)), image: Look.kindImage(k, size: KindStyle.smallSize)) {
+                    c.model.kinds = [k]; c.model.reload()
+                })
+            }
+        }
+        if AppEnvironment.settings != nil {
+            for p in SettingsCatalog.panes where SettingsCatalog.paneShown(p.id) {
+                out.append(e(T("main.palette.settings_pane", Loc.string(p.title.key, table: p.title.table)), p.symbol) { AppEnvironment.settings?.show(pane: p.id) })
+            }
         }
         // what's running (organising): its progress
         for j in JobStore.shared.active {
@@ -339,12 +362,12 @@ final class CommandPalette: NSObject, NSTableViewDataSource, NSTableViewDelegate
         }
         if AppEnvironment.settings != nil { out.append(e(T("menu.settings"), "gearshape", "⌘,") { AppEnvironment.settings?.show(pane: nil) }) }
         let current = ProjectStore.shared.currentID
-        for p in c.model.projects where p.registered {
+        for p in c.model.projects where p.registered && recording {
             let path = (p.path.path as NSString).abbreviatingWithTildeInPath
             out.append(e(p.name, "folder", hint: p.id == current ? T("main.project.current_count", path) : T("main.palette.project", path),
                          kind: .place) { c.reveal(project: p.id) })
             if has {
-                out.append(e(T("main.palette.move_to", p.name), "arrow.turn.up.right", section: .selected, mutates: true) {
+                out.append(e(T("main.palette.move_to", p.name), "folder", section: .selected, mutates: true) {
                     c.move(uids: items.map(\.uid), to: p.id)
                 })
             }
@@ -353,10 +376,17 @@ final class CommandPalette: NSObject, NSTableViewDataSource, NSTableViewDelegate
                 out.append(e(T("main.palette.use_project", p.name), "scope", hint: T("main.project.use.tip"), mutates: true) { c.useProject(p.id) })
             }
         }
-        if current != nil {
+        if current != nil, recording {
             out.append(e(T("main.palette.use_none"), "tray.2", hint: T("app.menu.project.none_tip"), mutates: true) { c.useProject(nil) })
         }
         return out.filter(\.enabled)
+    }
+
+    /// A drawn mark (the hand-off ring) as a template, so the cell tints it like the SF glyphs around it.
+    static func template(_ image: NSImage?) -> NSImage? {
+        let i = image?.copy() as? NSImage
+        i?.isTemplate = true
+        return i
     }
 
     /// Commands' glyphs: SF Symbols, one size and weight, template (the cell tints them secondary ink).

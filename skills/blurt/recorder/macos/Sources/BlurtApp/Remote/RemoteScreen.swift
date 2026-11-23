@@ -23,6 +23,19 @@ import VideoToolbox
 
 final class RemoteScreen: NSObject, SCStreamOutput, SCStreamDelegate {
     private let q = DispatchQueue(label: "blurt.remote.screen", qos: .userInteractive)
+    /// ScreenCaptureKit hands frames over here, not on `q`. Its receiving source drains every frame waiting before it returns, so on `q`
+    /// a still screen arriving at full rate, each frame compared with the last, kept `q` busy for minutes: no frame encoded, and `stop()`
+    /// waiting on it held the server's queue too, so no phone could get in (docs/design/remote-realtime.md §A picture that stopped).
+    /// Only the newest frame waits for `q`, one hand-over at a time.
+    private let frames = DispatchQueue(label: "blurt.remote.screen.frames", qos: .userInteractive)
+    /// guards what both queues and `stop()` touch: the frame waiting for `q`, and the stream to stop without waiting for `q`
+    private let gate = NSLock()
+    private var waiting: CMSampleBuffer?
+    private var handOverQueued = false
+    private var gateStopped = false
+    private var liveStream: SCStream?
+    /// frames with nothing new, and frames a newer one replaced before `q` took it: counted as skipped
+    private var gateSkips = 0
     private let channel: RemoteChannel
     private var stream: SCStream?
     private var session: VTCompressionSession?
@@ -37,7 +50,11 @@ final class RemoteScreen: NSObject, SCStreamOutput, SCStreamDelegate {
 
     init(channel: RemoteChannel) { self.channel = channel }
 
-    private var source = CGRect.zero        // on the desktop, in points
+    private var source = CGRect.zero {      // on the desktop, in points
+        didSet { let s = source; gate.withLock { gateSource = s } }
+    }
+    /// `source`, for `pointerTo` on the phone's queue: placing the pointer mustn't wait for `q`
+    private var gateSource = CGRect.zero
     private var crop = RemoteCrop.whole
     /// what frames show. ScreenCaptureKit doesn't say which frame a change landed on: while one is under way frames can't be labelled, so
     /// they wait, and the latest goes when it's done, with the new label. On a still screen that's the only frame there is.
@@ -124,7 +141,9 @@ final class RemoteScreen: NSObject, SCStreamOutput, SCStreamDelegate {
     /// The stream for a display: its shape, as large as the phone asked for and no larger than the display has pixels.
     private static func configure(_ src: CGRect, scale: CGFloat, _ r: RemoteScreenRequest) -> SCStreamConfiguration {
         let c = SCStreamConfiguration()
-        let k = min(CGFloat(r.width) / src.width, CGFloat(r.height) / src.height, scale)
+        // a viewer's window is a ceiling too: a picture larger than the window it's shown in is sent for nothing
+        let box = r.box
+        let k = min(CGFloat(box.width) / src.width, CGFloat(box.height) / src.height, scale)
         c.width = Int(src.width * k) / 2 * 2
         c.height = Int(src.height * k) / 2 * 2
         c.scalesToFit = true
@@ -144,6 +163,7 @@ final class RemoteScreen: NSObject, SCStreamOutput, SCStreamDelegate {
         r.fps = min(max(r.fps, 1), 120)
         r.width = min(max(r.width, 64), 8192)
         r.height = min(max(r.height, 64), 8192)
+        if let w = r.window { r.window = RemotePixelSize(width: min(max(w.width, 64), 8192), height: min(max(w.height, 64), 8192)) }
         r.bitrate = min(max(r.bitrate, 100_000), 50_000_000)
         q.sync {
             self.asked = r
@@ -165,7 +185,7 @@ final class RemoteScreen: NSObject, SCStreamOutput, SCStreamDelegate {
                     // the one the phone chose, or the one the pointer is on
                     let want = q.sync { self.pinned } ?? RemoteDisplayList.at(Self.pointerNow())
                     guard let d = content.displays.first(where: { $0.displayID == want }) ?? content.displays.first else { return failed("no_display") }
-                    filter = SCContentFilter(display: d, excludingWindows: [])
+                    filter = SCContentFilter(display: d, excludingWindows: Self.excluded(content))
                     src = CGDisplayBounds(d.displayID)
                     scale = RemoteDisplayList.scale(d.displayID)
                     shown = d.displayID
@@ -194,14 +214,19 @@ final class RemoteScreen: NSObject, SCStreamOutput, SCStreamDelegate {
                     }
                 }
                 let s = SCStream(filter: filter, configuration: c, delegate: self)
-                try s.addStreamOutput(self, type: .screen, sampleHandlerQueue: q)
-                q.sync {
+                try s.addStreamOutput(self, type: .screen, sampleHandlerQueue: frames)
+                let go = q.sync {
+                    // stopped meanwhile: no encoder made that nothing would end
+                    guard !self.stopped else { return false }
                     self.rate = RemoteRate(bitrate: r.bitrate, fps: r.fps, away: self.relayed)
                     self.makeEncoder(w, h, self.rate.bitrate, fps: self.rate.fps)
                     self.stream = s
                     self.running = true
                     self.statsSince = CACurrentMediaTime()
+                    self.gate.withLock { if !self.gateStopped { self.liveStream = s } }
+                    return true
                 }
+                guard go else { return }
                 try await s.startCapture()
                 if q.sync(execute: { stopped }) {
                     try? await s.stopCapture()
@@ -210,6 +235,8 @@ final class RemoteScreen: NSObject, SCStreamOutput, SCStreamDelegate {
                 q.async {
                     self.tellView()
                     self.startTicker(fps: self.channel.isRelay ? 15 : 60)
+                    // started (again) while locked: a resize or a quality change restarts the stream, and the lock screen still needs its own
+                    if RemoteServer.screenLocked, self.lockStream == nil { self.startLockStream() }
                     // chosen while this was starting
                     if shown != 0, let p = self.pinned, p != self.shownDisplay { self.retarget(p, why: "pinned") }
                 }
@@ -258,6 +285,32 @@ final class RemoteScreen: NSObject, SCStreamOutput, SCStreamDelegate {
         }
     }
 
+    // MARK: the privacy screen
+
+    /// Blurt's privacy covers (RemotePrivacy) are never in the picture: the person controlling sees the real desktop.
+    static func excluded(_ content: SCShareableContent) -> [SCWindow] {
+        let ids = RemotePrivacy.ids
+        return ids.isEmpty ? [] : content.windows.filter { ids.contains($0.windowID) }
+    }
+
+    static func excludedNow() async -> [SCWindow] {
+        guard !RemotePrivacy.ids.isEmpty, let c = try? await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false) else { return [] }
+        return excluded(c)
+    }
+
+    /// The covers came or went: the running stream's filter follows.
+    func privacyChanged() {
+        q.async {
+            guard self.running, let s = self.stream, self.shownDisplay != 0 else { return }
+            let id = self.shownDisplay
+            Task {
+                guard let c = try? await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false),
+                      let d = c.displays.first(where: { $0.displayID == id }) else { return }
+                try? await s.updateContentFilter(SCContentFilter(display: d, excludingWindows: Self.excluded(c)))
+            }
+        }
+    }
+
     /// Each tick while following: the pointer has really crossed onto another display.
     private func followPointer() {
         guard pinned == nil, !switching, shownDisplay != 0 else { return }
@@ -288,7 +341,7 @@ final class RemoteScreen: NSObject, SCStreamOutput, SCStreamDelegate {
             var ok = true
             if #available(macOS 14.0, *) {
                 do {
-                    try await s.updateContentFilter(SCContentFilter(display: d, excludingWindows: []))
+                    try await s.updateContentFilter(SCContentFilter(display: d, excludingWindows: await Self.excludedNow()))
                     try await s.updateConfiguration(c)
                 } catch {
                     ok = false
@@ -355,6 +408,7 @@ final class RemoteScreen: NSObject, SCStreamOutput, SCStreamDelegate {
         guard var r = asked, let f = failedHandler else { return }
         let keep = pinned, s = stream
         stream = nil
+        gate.withLock { liveStream = nil }
         running = false
         ticker?.cancel()
         ticker = nil
@@ -440,10 +494,9 @@ final class RemoteScreen: NSObject, SCStreamOutput, SCStreamDelegate {
 
     /// The pointer, on the part of the screen the phone is looking at.
     func pointerTo(x: Float, y: Float) -> CGPoint? {
-        q.sync {
-            guard source.width > 0, x.isFinite, y.isFinite else { return nil }
-            return CGPoint(x: source.minX + CGFloat(min(1, max(0, x))) * source.width, y: source.minY + CGFloat(min(1, max(0, y))) * source.height)
-        }
+        let source = gate.withLock { gateSource }
+        guard source.width > 0, x.isFinite, y.isFinite else { return nil }
+        return CGPoint(x: source.minX + CGFloat(min(1, max(0, x))) * source.width, y: source.minY + CGFloat(min(1, max(0, y))) * source.height)
     }
 
     private func tellView() {
@@ -599,15 +652,44 @@ final class RemoteScreen: NSObject, SCStreamOutput, SCStreamDelegate {
         emit(["event": "remote_screen", "state": "encoder", "low_latency": lowLatency])
     }
 
+    /// On `frames`. Kept short: a frame with nothing new is dropped here, and the newest of the others waits for `q`, replacing one that
+    /// hasn't been taken yet. Whatever `q` is doing, ScreenCaptureKit's frames can't pile up in front of it.
     func stream(_ stream: SCStream, didOutputSampleBuffer b: CMSampleBuffer, of type: SCStreamOutputType) {
-        guard type == .screen, running, session != nil, b.isValid, let image = CMSampleBufferGetImageBuffer(b) else { return }
+        guard type == .screen, b.isValid else { return }
+        // a frame with nothing new: skipped by SCK, which is why a still screen costs nothing
+        if let a = CMSampleBufferGetSampleAttachmentsArray(b, createIfNecessary: false) as? [[SCStreamFrameInfo: Any]],
+           let raw = a.first?[.status] as? Int, let status = SCFrameStatus(rawValue: raw), status != .complete {
+            gate.withLock { gateSkips += 1 }
+            return
+        }
+        let handOver: Bool = gate.withLock {
+            guard !gateStopped else { return false }
+            if waiting != nil { gateSkips += 1 }
+            waiting = b
+            guard !handOverQueued else { return false }
+            handOverQueued = true
+            return true
+        }
+        if handOver { q.async { self.takeWaiting() } }
+    }
+
+    /// On `q`: the newest frame handed over.
+    private func takeWaiting() {
+        let (b, n): (CMSampleBuffer?, Int) = gate.withLock {
+            defer { waiting = nil; handOverQueued = false; gateSkips = 0 }
+            return (waiting, gateSkips)
+        }
+        skipped += n
+        if let b { frame(b) }
+    }
+
+    /// On `q`: a frame with something new on it.
+    private func frame(_ b: CMSampleBuffer) {
+        guard running, session != nil, let image = CMSampleBufferGetImageBuffer(b) else { return }
         let size = (w: CVPixelBufferGetWidth(image), h: CVPixelBufferGetHeight(image))
         let whole = size == encoderSize, full = size == nativeSize
         // the display before a switch, at its own size: nothing the encoder can take
         guard cropsUnderWay > 0 || whole || full else { skipped += 1; return }
-        // a frame with nothing new: skipped by SCK, which is why a still screen costs nothing
-        if let a = CMSampleBufferGetSampleAttachmentsArray(b, createIfNecessary: false) as? [[SCStreamFrameInfo: Any]],
-           let raw = a.first?[.status] as? Int, let status = SCFrameStatus(rawValue: raw), status != .complete { skipped += 1; return }
         let pts = CMSampleBufferGetPresentationTimeStamp(b)
         // ScreenCaptureKit doesn't always say so: a window that isn't changing still comes as complete frames, at full rate
         if let l = lastRaw, Self.same(l, image), lastRawCrop == (full ? crop : .whole) { skipped += 1; return }
@@ -870,26 +952,112 @@ final class RemoteScreen: NSObject, SCStreamOutput, SCStreamDelegate {
         }
     }
 
+    /// Returns at once. Called on the server's queue, which takes the phones' connections: it never waits for `q`, and capture stops
+    /// even if `q` is held up somewhere, so a picture in trouble can't keep a phone out.
     func stop() {
-        q.sync {
-            running = false
-            stopped = true
-            lastImage = nil
-            heldImage = nil
-            lastRaw = nil
-            early = nil
-            cropper.reset()
-            ticker?.cancel()
-            ticker = nil
-            if let s = session { VTCompressionSessionInvalidate(s) }
-            session = nil
+        let live: SCStream? = gate.withLock {
+            gateStopped = true
+            waiting = nil
+            defer { liveStream = nil }
+            return liveStream
         }
-        let s = stream
-        stream = nil
-        Task {
-            do { try await s?.stopCapture() } catch { emit(["event": "remote_screen", "state": "stop_failed", "error": "\(error)"]) }
+        if let live { Self.stopCapture(live) }
+        q.async {
+            self.running = false
+            self.stopped = true
+            self.lastImage = nil
+            self.heldImage = nil
+            self.lastRaw = nil
+            self.early = nil
+            self.cropper.reset()
+            self.ticker?.cancel()
+            self.ticker = nil
+            if let s = self.session { VTCompressionSessionInvalidate(s) }
+            self.session = nil
+            self.stopLockStream()
+            // a stream not yet handed to the gate when stop() came (start() between the two)
+            if let s = self.stream, s !== live { Self.stopCapture(s) }
+            self.stream = nil
         }
         emit(["event": "remote_screen", "state": "off"])
+    }
+
+    // MARK: the lock screen (docs/design/remote-1.1.md §1)
+
+    /// While the session is locked ScreenCaptureKit sends nothing more (macOS 15.7, measured 2026-11-20); UU Remote's capture library
+    /// carries the older display stream next to it. That one is tried meanwhile, at the size the encoder takes, its frames sent the same
+    /// way. Only when it brings nothing either is the viewer told the picture stopped (`noFrames`).
+    private var lockStream: CGDisplayStream?
+    private var lockFrames = 0
+
+    func locked(_ on: Bool, noFrames: @escaping () -> Void) {
+        q.async {
+            guard self.running || self.lockStream != nil else { return }
+            if on {
+                self.startLockStream()
+                self.q.asyncAfter(deadline: .now() + 1.5) {
+                    guard self.running, self.lockFrames == 0 else { return }
+                    emit(["event": "remote_screen", "state": "locked_no_frames", "stream": self.lockStream != nil])
+                    noFrames()
+                }
+            } else {
+                let had = self.lockFrames
+                self.stopLockStream()
+                // ScreenCaptureKit's stream doesn't always come back by itself after the lock: started again on the same display
+                emit(["event": "remote_screen", "state": "unlocked", "lock_frames": had])
+                if self.running, self.shownDisplay != 0 { self.restart(on: self.shownDisplay) }
+            }
+        }
+    }
+
+    private func startLockStream() {
+        guard lockStream == nil, running, shownDisplay != 0, encoderSize.w > 0, encoderSize.h > 0 else { return }
+        lockFrames = 0
+        let props: [CFString: Any] = [CGDisplayStream.showCursor: false, CGDisplayStream.minimumFrameTime: 1.0 / Double(max(asked?.fps ?? 60, 30))]
+        guard let s = CGDisplayStream(dispatchQueueDisplay: shownDisplay, outputWidth: encoderSize.w, outputHeight: encoderSize.h,
+                                      pixelFormat: Int32(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange),
+                                      properties: props as CFDictionary, queue: frames,
+                                      handler: { [weak self] status, _, surface, _ in
+            guard let self, status == .frameComplete, let surface else { return }
+            var pb: Unmanaged<CVPixelBuffer>?
+            guard CVPixelBufferCreateWithIOSurface(nil, surface, nil, &pb) == kCVReturnSuccess, let image = pb?.takeRetainedValue() else { return }
+            self.q.async { self.lockFrame(image) }
+        }) else {
+            emit(["event": "remote_screen", "state": "lock_stream_failed", "why": "create"])
+            return
+        }
+        let err = s.start()
+        guard err == .success else {
+            emit(["event": "remote_screen", "state": "lock_stream_failed", "why": "start \(err.rawValue)"])
+            return
+        }
+        lockStream = s
+        emit(["event": "remote_screen", "state": "lock_stream", "width": encoderSize.w, "height": encoderSize.h])
+    }
+
+    private func stopLockStream() {
+        lockStream?.stop()
+        lockStream = nil
+        lockFrames = 0
+    }
+
+    /// On `q`: a frame of the lock screen, the whole display at the encoder's size.
+    private func lockFrame(_ image: CVImageBuffer) {
+        guard running, lockStream != nil, session != nil else { return }
+        lockFrames += 1
+        if lockFrames == 1 { emit(["event": "remote_screen", "state": "lock_first_frame"]) }
+        if let l = lastRaw, Self.same(l, image) { skipped += 1; return }
+        let pts = CMTime(seconds: CACurrentMediaTime(), preferredTimescale: 1_000_000_000)
+        lastRaw = image
+        lastRawCrop = .whole
+        lastPTS = pts
+        take(image, pts: pts, captured: CMTimeGetSeconds(pts), crop: .whole, cut: false)
+    }
+
+    private static func stopCapture(_ s: SCStream) {
+        Task {
+            do { try await s.stopCapture() } catch { emit(["event": "remote_screen", "state": "stop_failed", "error": "\(error)"]) }
+        }
     }
 
     func stream(_ stream: SCStream, didStopWithError error: Error) {

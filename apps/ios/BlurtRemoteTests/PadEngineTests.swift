@@ -102,8 +102,16 @@ final class PadEngineTests: XCTestCase {
         let e = PadEngine()
         e.scrollEdge = 374...400
         _ = e.began([t(1, 390, 100)], at: 0)
-        XCTAssertEqual(e.moved([t(1, 390, 120)], at: 0.05), [.scroll(0, 0, .began)])
+        XCTAssertEqual(e.moved([t(1, 390, 120)], at: 0.05), [.scroll(0, 0, .began), .edgeScroll(true)])
         guard case .scroll(_, _, .changed)? = e.moved([t(1, 390, 130)], at: 0.07).first else { return XCTFail() }
+        // its mark goes out with it; a two-finger scroll never lights it
+        XCTAssertEqual(e.ended([1], at: 0.5).prefix(2), [.scroll(0, 0, .ended), .edgeScroll(false)])
+    }
+
+    func testTwoFingerScrollIsNoEdgeScroll() {
+        let o = zooms(from: (CGPoint(x: 150, y: 200), CGPoint(x: 200, y: 200)), to: (CGPoint(x: 150, y: 400), CGPoint(x: 200, y: 400)))
+        XCTAssertTrue(o.contains(.scroll(0, 0, .began)))
+        XCTAssertFalse(o.contains { if case .edgeScroll = $0 { true } else { false } }, "\(o)")
     }
 
     func testAcrossTheEdgeIsThePointer() {
@@ -170,6 +178,66 @@ final class PadEngineTests: XCTestCase {
         XCTAssertEqual(e.moved([t(1, 40, 300), t(2, 260, 300)], at: 0.1), [.system(.zoomIn), .haptic(.step)])
     }
 
+    /// every zoom step a two-finger gesture sends, fed as a straight path in small moves like a real finger's
+    private func zooms(_ e: PadEngine = PadEngine(), from a: (CGPoint, CGPoint), to b: (CGPoint, CGPoint), steps n: Int = 30) -> [PadOutput] {
+        var out = e.began([t(1, a.0.x, a.0.y), t(2, a.1.x, a.1.y)], at: 0)
+        for i in 1...n {
+            let f = CGFloat(i) / CGFloat(n)
+            out += e.moved([t(1, a.0.x + (b.0.x - a.0.x) * f, a.0.y + (b.0.y - a.0.y) * f),
+                            t(2, a.1.x + (b.1.x - a.1.x) * f, a.1.y + (b.1.y - a.1.y) * f)], at: Double(i) * 0.012)
+        }
+        return out + e.ended([1, 2], at: Double(n) * 0.012 + 0.05)
+    }
+
+    private func count(_ m: RemoteSystemMove, in o: [PadOutput]) -> Int { o.filter { $0 == .system(m) }.count }
+
+    func testASpreadWithTheThumbHeldStillZoomsIn() {
+        // thumb and finger start close, the thumb stays put and the finger goes out: the middle moves half as far as they come apart
+        let o = zooms(from: (CGPoint(x: 150, y: 400), CGPoint(x: 190, y: 360)), to: (CGPoint(x: 150, y: 400), CGPoint(x: 250, y: 300)))
+        XCTAssertGreaterThanOrEqual(count(.zoomIn, in: o), 2, "\(o)")
+        XCTAssertFalse(o.contains { if case .scroll = $0 { true } else { false } }, "never a scroll: \(o)")
+        XCTAssertEqual(count(.zoomOut, in: o), 0)
+    }
+
+    func testASpreadFromCloseZoomsAsReadilyAsAPinchFromWide() {
+        // the same ratio either way, 60 ↔ 150 apart: as many steps out as in
+        let a = (CGPoint(x: 170, y: 300), CGPoint(x: 230, y: 300)), b = (CGPoint(x: 125, y: 300), CGPoint(x: 275, y: 300))
+        let out = count(.zoomIn, in: zooms(from: a, to: b)), back = count(.zoomOut, in: zooms(from: b, to: a))
+        XCTAssertGreaterThanOrEqual(out, 2)
+        XCTAssertEqual(out, back)
+    }
+
+    func testASmallSpreadFromCloseIsAZoomStep() {
+        // 60 → 85 apart was nothing before: it took 61 pt, twice the starting span, for the first step
+        let o = zooms(from: (CGPoint(x: 170, y: 300), CGPoint(x: 230, y: 300)), to: (CGPoint(x: 158, y: 300), CGPoint(x: 243, y: 300)))
+        XCTAssertEqual(count(.zoomIn, in: o), 1, "\(o)")
+    }
+
+    func testASpreadAfterTheHandDriftedStillZooms() {
+        // the hand was still settling when the fingers landed (8 pt of drift: a scroll), then they spread
+        let e = PadEngine()
+        _ = e.began([t(1, 150, 400), t(2, 190, 360)], at: 0)
+        var o = e.moved([t(1, 156, 405), t(2, 196, 365)], at: 0.02)
+        XCTAssertEqual(o, [.scroll(0, 0, .began)])
+        for i in 1...20 { o += e.moved([t(1, 156, 405), t(2, 196 + CGFloat(i) * 3, 365 - CGFloat(i) * 3)], at: 0.02 + Double(i) * 0.012) }
+        XCTAssertGreaterThanOrEqual(count(.zoomIn, in: o), 1, "\(o)")
+        XCTAssertEqual(e.ended([1, 2], at: 0.4), [], "and no fling of the scroll it started as")
+    }
+
+    func testAScrollWhoseFingersDriftNeverZooms() {
+        // a long scroll with the fingers coming 30 pt apart on the way
+        let o = zooms(from: (CGPoint(x: 150, y: 200), CGPoint(x: 200, y: 200)), to: (CGPoint(x: 140, y: 500), CGPoint(x: 220, y: 500)))
+        XCTAssertEqual(count(.zoomIn, in: o) + count(.zoomOut, in: o), 0, "\(o)")
+        XCTAssertTrue(o.contains(.scroll(0, 0, .began)))
+    }
+
+    func testATwoFingerTapWithAWobbleIsStillARightClick() {
+        let e = PadEngine()
+        _ = e.began([t(1, 150, 300), t(2, 200, 300)], at: 0)
+        _ = e.moved([t(1, 148, 301), t(2, 203, 299)], at: 0.05)
+        XCTAssertEqual(e.ended([1, 2], at: 0.12), [.click(.right), .haptic(.tap)])
+    }
+
     func testWithTheScreenShowingAPinchZoomsTheView() {
         let e = PadEngine()
         e.pinchZoomsView = true
@@ -180,6 +248,37 @@ final class PadEngineTests: XCTestCase {
         XCTAssertEqual(dx, 0); XCTAssertEqual(dy, 0)
         XCTAssertEqual(at, CGPoint(x: 150, y: 300))
         XCTAssertEqual(e.ended([1, 2], at: 0.2), [.viewEnd])
+    }
+
+    func testWithTheZoomKeyHeldAPinchOverThePictureZoomsTheComputer() {
+        // ⌘ (or Ctrl) held: the computer's zoom, in the same steps as with no picture, and the view stays as it is
+        let e = PadEngine()
+        e.pinchZoomsView = true
+        e.computerZoomHeld = { true }
+        let o = zooms(e, from: (CGPoint(x: 170, y: 300), CGPoint(x: 230, y: 300)), to: (CGPoint(x: 125, y: 300), CGPoint(x: 275, y: 300)))
+        XCTAssertGreaterThanOrEqual(count(.zoomIn, in: o), 2, "\(o)")
+        XCTAssertFalse(o.contains { if case .view = $0 { true } else { false } }, "the picture doesn't zoom: \(o)")
+    }
+
+    func testWithTheZoomKeyLetGoAPinchOverThePictureZoomsItAgain() {
+        var held = true
+        let e = PadEngine()
+        e.pinchZoomsView = true
+        e.computerZoomHeld = { held }
+        _ = zooms(e, from: (CGPoint(x: 170, y: 300), CGPoint(x: 230, y: 300)), to: (CGPoint(x: 125, y: 300), CGPoint(x: 275, y: 300)))
+        held = false
+        let o = zooms(e, from: (CGPoint(x: 170, y: 300), CGPoint(x: 230, y: 300)), to: (CGPoint(x: 125, y: 300), CGPoint(x: 275, y: 300)))
+        XCTAssertEqual(count(.zoomIn, in: o), 0, "\(o)")
+        XCTAssertTrue(o.contains { if case .view = $0 { true } else { false } })
+    }
+
+    func testWithTheZoomKeyHeldTwoFingersStillScroll() {
+        let e = PadEngine()
+        e.pinchZoomsView = true
+        e.computerZoomHeld = { true }
+        let o = zooms(e, from: (CGPoint(x: 150, y: 200), CGPoint(x: 200, y: 200)), to: (CGPoint(x: 150, y: 400), CGPoint(x: 200, y: 400)))
+        XCTAssertTrue(o.contains(.scroll(0, 0, .began)))
+        XCTAssertEqual(count(.zoomIn, in: o) + count(.zoomOut, in: o), 0, "\(o)")
     }
 
     func testWithThePictureTwoFingersScrollTheMacUnderThem() {
@@ -529,19 +628,19 @@ final class DeckMigrationTests: XCTestCase {
 
     func testKeysSetUpBeforeTheSpaceBarAreKept() throws {
         var old = Deck.standard
-        old.dock.removeLast()                       // as it was: eight
+        old.dock.remove(at: 5)                      // as it was: eight, no space bar
         old.sections[0].slots.swapAt(0, 1)           // and changed by its owner
         ["deck.v8", "deck.v9"].forEach { UserDefaults.standard.removeObject(forKey: $0) }
         UserDefaults.standard.set(try JSONEncoder().encode(old), forKey: "deck.v7")
         let d = Deck.load()
         XCTAssertEqual(d.dock.count, Deck.dockCount)
-        XCTAssertEqual(d.dock.last?.action, Deck.spaceBar.action)
+        XCTAssertEqual(d.dock.map(\.action), Deck.standard.dock.map(\.action), "an untouched dock: the space bar, then as it ships now")
         XCTAssertEqual(d.sections[0].slots.map(\.id), old.sections[0].slots.map(\.id), "the owner's keys, where they were")
     }
 
     func testACustomDockStillGetsTheSpaceBar() throws {
         var old = Deck.standard
-        old.dock.removeLast()
+        old.dock.remove(at: 5)
         old.dock[1] = old.sections[0].slots[0]       // ⌥ swapped for ⌘C
         ["deck.v8", "deck.v9"].forEach { UserDefaults.standard.removeObject(forKey: $0) }
         UserDefaults.standard.set(try JSONEncoder().encode(old), forKey: "deck.v7")
@@ -550,7 +649,7 @@ final class DeckMigrationTests: XCTestCase {
 
     func testASpaceAlreadyInTheDockIsntDoubled() throws {
         var old = Deck.standard
-        old.dock.removeLast()
+        old.dock.remove(at: 5)
         old.dock[4] = Deck.spaceBar                  // in place of ⇥
         ["deck.v8", "deck.v9"].forEach { UserDefaults.standard.removeObject(forKey: $0) }
         UserDefaults.standard.set(try JSONEncoder().encode(old), forKey: "deck.v7")
@@ -581,7 +680,7 @@ final class LayoutTests: XCTestCase {
         XCTAssertLessThan(l.pad.maxY, l.drawer.minY + 1)
         XCTAssertEqual(l.talk.maxX, l.drawer.maxX, accuracy: 1, "the talk key by the thumb")
         XCTAssertEqual(l.talk.width, l.dock[0].width, accuracy: 0.5, "no bigger than the keys beside it")
-        XCTAssertEqual(l.dock[PadLayout.thumbSlots.space].maxX + PadLayout.gap, l.talk.minX, accuracy: 0.5, "space right by it")
+        XCTAssertEqual(l.dock[PadLayout.thumbSlots.enter].maxX + PadLayout.gap, l.talk.minX, accuracy: 0.5, "return right by it")
         XCTAssertEqual(l.settingsButton.minX, l.drawer.minX, accuracy: 1, "settings first")
         noOverlaps(l.dock + [l.talk, l.arrowKey, l.keyboardButton, l.screenButton, l.findButton, l.settingsButton, l.strip, l.list])
         XCTAssertGreaterThanOrEqual(l.strip.width / 4, 38, "room for four tabs")
@@ -627,7 +726,7 @@ final class LayoutTests: XCTestCase {
                     XCTAssertEqual(b.midX, islandLeft ? 31 : size.width - 31, accuracy: 1, "in the black edge")
                 }
                 let t = PadLayout.thumbSlots
-                let stay = [l.drawerButton, l.appsKey, l.dock[t.esc], l.arrowKey, l.dock[t.enter], l.dock[t.space], l.talk]
+                let stay = [l.drawerButton, l.appsKey, l.dock[t.esc], l.arrowKey, l.dock[t.delete], l.dock[t.enter], l.talk]
                 noOverlaps(stay)
                 for r in stay {
                     XCTAssertEqual(r.midX, islandLeft ? size.width - 40 : 40, accuracy: 1, "one column, at the far end")
@@ -635,9 +734,11 @@ final class LayoutTests: XCTestCase {
                     XCTAssertLessThanOrEqual(r.maxY, size.height - 18, "clear of the round corners")
                     XCTAssertGreaterThanOrEqual(islandLeft ? size.width - r.maxX : r.minX, 12)
                 }
-                XCTAssertGreaterThanOrEqual(l.dock[t.space].height, 44, "keys a thumb can hit")
-                XCTAssertGreaterThan(l.talk.height, l.dock[t.space].height, "the talk key a little taller")
-                XCTAssertLessThanOrEqual(l.talk.height, l.dock[t.space].height + 12, "but not a tower")
+                XCTAssertGreaterThanOrEqual(l.dock[t.delete].height, 44, "keys a thumb can hit")
+                XCTAssertGreaterThan(l.talk.height, l.dock[t.enter].height, "the talk key a little taller")
+                XCTAssertLessThanOrEqual(l.talk.height, l.dock[t.enter].height + 12, "but not a tower")
+                // esc and ↩ never side by side: one stops an agent, the other sends a half-written prompt
+                XCTAssertGreaterThan(l.dock[t.enter].minY - l.dock[t.esc].maxY, l.dock[t.esc].height, "something between esc and return")
                 XCTAssertGreaterThan(l.drawer.height, size.height - 90, "the keys use the height")
                 XCTAssertLessThanOrEqual(l.keySize.height, l.keySize.width * 1.25 + 1, "but stay key-shaped")
             }
@@ -667,7 +768,7 @@ final class LayoutTests: XCTestCase {
     func testAPhoneWithNoIslandStillFits() {
         let s = CGSize(width: 667, height: 375)
         let l = PadLayout(size: s, safe: .zero, lefty: false, drawerOpen: true)
-        XCTAssertGreaterThanOrEqual(l.dock[PadLayout.thumbSlots.space].height, 43, "the thumb's column too")
+        XCTAssertGreaterThanOrEqual(l.dock[PadLayout.thumbSlots.delete].height, 43, "the thumb's column too")
         XCTAssertGreaterThan(l.pad.width, 150)
         XCTAssertGreaterThanOrEqual(l.keySize.width, 30)
         XCTAssertGreaterThanOrEqual(l.keySize.height, 44)

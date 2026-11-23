@@ -7,6 +7,7 @@ struct SettingsSheet: View {
     @ObservedObject private var p = Prefs.shared
     @ObservedObject private var l = Link.shared
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.locale) private var locale
     @State private var pairing = false
     @State private var details: PairedMac?
     @ObservedObject private var use = ScreenStream.shared.use
@@ -19,6 +20,10 @@ struct SettingsSheet: View {
                     Button("Add Computer") { pairing = true }
                 } header: { Text("Computers") } footer: {
                     if l.macs.count > 1 { Text("Tap a computer to switch to it. On the main screen, hold the settings button to switch without coming here.") }
+                }
+                Section {
+                    SwiftUI.Link("Support", destination: supportURL("support"))
+                    SwiftUI.Link("Privacy Policy", destination: supportURL("privacy"))
                 }
                 Section {
                     Picker("Quality", selection: $p.quality) {
@@ -69,7 +74,7 @@ struct SettingsSheet: View {
                     Toggle("Haptics", isOn: $p.haptics)
                 }
                 Section {
-                    Toggle("Use iPhone Microphone", isOn: $p.micOnPhone)
+                    Toggle("Use This Device’s Microphone", isOn: $p.micOnPhone)
                         .onChange(of: p.micOnPhone) { _, _ in Link.shared.send(.setMicOnPhone(MicStream.shared.usable)) }
                 } header: { Text("Dictation") } footer: {
                     Text(l.host == .mac ? "Off: Blurt listens through your Mac’s microphone." : "Off: Blurt listens through your computer’s microphone.")
@@ -83,11 +88,12 @@ struct SettingsSheet: View {
                     row("Touch and hold, then lift", "Right click")
                     row("Touch and hold, then drag", "Drag, select an area")
                     row("Tap, in Touch Mode", "Click right there")
-                    row("One finger along the edge", "Scroll")
                     row("Two fingers", "Scroll at the pointer, tap to right click")
                     row("Two fingers, in Touch Mode", "Scroll under your fingers")
+                    row("One finger up or down the thumb-side edge", "Scroll at the pointer")
                     row("Pinch", "Zoom")
                     row("Pinch, with the screen showing", "Zoom the picture")
+                    row(l.host == .mac ? "Pinch with ⌘ held" : "Pinch with Ctrl held", l.host == .mac ? "Zoom on the Mac" : "Zoom on the computer")
                     row("One finger, zoomed in, in Touch Mode", "Move the picture")
                     row("Pointer, zoomed in", "The picture follows it")
                     row("\(Words.cycleKeys(l.host)): hold and slide", "Step through, both ways")
@@ -112,6 +118,12 @@ struct SettingsSheet: View {
         }
     }
 
+    private func supportURL(_ page: String) -> URL {
+        let language = locale.language.languageCode?.identifier
+        let section = language == "zh" ? "#zh-Hans" : ""
+        return URL(string: "https://blurt.work/\(page)/\(section)")!
+    }
+
     private func macRow(_ m: PairedMac) -> some View {
         HStack(spacing: 12) {
             Button {
@@ -124,7 +136,19 @@ struct SettingsSheet: View {
                     VStack(alignment: .leading, spacing: 1) {
                         Text(m.title).foregroundStyle(.primary)
                         // with computers of more than one kind, each says which it is
-                        Text(kinds ? "\(m.host.kindName) · \(String(localized: state(of: m)))" : String(localized: state(of: m))).font(.footnote).foregroundStyle(.secondary)
+                        let words = kinds ? "\(m.host.kindName) · \(String(localized: state(of: m)))" : String(localized: state(of: m))
+                        // the one in hand, not connected: said at reading size with a mark, not as a caption (as the pad's card does)
+                        if m.id == l.current?.id, l.state != .connected {
+                            HStack(spacing: 6) {
+                                if l.state == .connecting { ProgressView().controlSize(.small) }
+                                else { Image(systemName: l.state == .replaced ? "iphone" : "exclamationmark.triangle.fill").foregroundStyle(l.state == .replaced ? Color.primary : Color(Theme.attn)) }
+                                Text(words)
+                            }
+                            .font(.subheadline.weight(.medium)).foregroundStyle(.primary)
+                            .accessibilityElement(children: .combine)
+                        } else {
+                            Text(words).font(.footnote).foregroundStyle(.secondary)
+                        }
                     }
                     Spacer(minLength: 0)
                 }
@@ -142,15 +166,26 @@ struct SettingsSheet: View {
     private func state(of m: PairedMac) -> String.LocalizationValue {
         if m.id == l.current?.id {
             switch l.state {
-            case .connected: return l.route == .local ? "Connected" : l.route == .direct ? "Connected, direct" : "Connected through your relay"
+            case .connected:
+                switch l.route {
+                case .local: return "Connected"
+                case .direct: return "Connected, direct"
+                case .overlay: return l.overlayIsTailscale ? "Connected · Tailscale" : "Connected · Virtual network"
+                case .relay: return l.viaGoBetween ? "Connected · Public connection service" : "Connected through your relay"
+                }
             case .connecting: return "Connecting…"
             case .unreachable: return "Can’t reach it"
-            case .forgotten: return "Needs pairing again"
+            // removed there in a session (the key is gone), or a key refused this run (kept): either way, a new code adds it again
+            case .forgotten: return "Removed this iPhone"
             case .replaced: return "Another phone is using it"
+            case .ended: return "Ended at the computer"
             case .unpaired: return "Not connected"
             }
         }
-        return l.nearby.contains(m.id) ? "On this network" : m.relayAddress != nil ? "Uses your relay" : "Not on this network"
+        if m.removed == true { return "Removed this iPhone" }
+        if l.nearby.contains(m.id) { return "On this network" }
+        if RemoteRelay.isGoBetween(m.relayAddress) { return "Uses the public connection service" }
+        return m.relayAddress != nil ? "Uses your relay" : "Not on this network"
     }
 
     private func rate(_ kbps: Int) -> String {
@@ -190,9 +225,11 @@ private struct MacDetail: View {
                     .onSubmit { l.rename(mac, to: name == mac.name ? "" : name) }
             }
             Section {
-                LabeledContent("Relay", value: mac.relayAddress ?? String(localized: "None"))
+                LabeledContent("Relay", value: RemoteRelay.isGoBetween(mac.relayAddress) ? String(localized: "Public connection service") : mac.relayAddress ?? String(localized: "None"))
             } footer: {
-                if mac.host == .mac {
+                if RemoteRelay.isGoBetween(mac.relayAddress) {
+                    Text("Free, with no guarantee. If a network can’t connect directly, set up your own relay.")
+                } else if mac.host == .mac {
                     Text(mac.relayAddress == nil ? "Without a relay this Mac is reachable on its own network. Set one in Blurt’s Settings on the Mac." : "Set in Blurt’s Settings on the Mac. All your Macs can share one.")
                 } else {
                     Text(mac.relayAddress == nil ? "Without a relay this computer is reachable on its own network. Set one in Blurt’s Settings on the computer." : "Set in Blurt’s Settings on the computer. All your computers can share one.")

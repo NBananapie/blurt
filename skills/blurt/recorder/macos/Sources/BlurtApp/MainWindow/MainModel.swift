@@ -22,6 +22,14 @@ enum Scope: Hashable {
     case inbox, inProgress, unassigned, all
     /// the Dictation page (DictationPage.swift): no item rows
     case dictation
+    /// Home (HomePage.swift): what Blurt does, each with its switch and key, and what you made lately
+    case home
+    /// the cards under the notch and the used ones (CardsPage.swift)
+    case cards
+    /// the phones paired with this Mac (PhonePage.swift)
+    case phone
+    /// what ⌥C and ⌥T read and translated (ScreenTextPage.swift)
+    case screenText
     case project(String)
     case session(String)
 
@@ -32,6 +40,10 @@ enum Scope: Hashable {
         case .unassigned: return "unassigned"
         case .all: return "all"
         case .dictation: return "dictation"
+        case .home: return "home"
+        case .cards: return "cards"
+        case .phone: return "phone"
+        case .screenText: return "screen_text"
         case .project(let p): return "project:" + p
         case .session(let s): return "session:" + s
         }
@@ -44,6 +56,10 @@ enum Scope: Hashable {
         case "unassigned": self = .unassigned
         case "all": self = .all
         case "dictation": self = .dictation
+        case "home": self = .home
+        case "cards": self = .cards
+        case "phone": self = .phone
+        case "screen_text": self = .screenText
         default:
             if key.hasPrefix("project:") { self = .project(String(key.dropFirst(8))) }
             else if key.hasPrefix("session:") { self = .session(String(key.dropFirst(8))) }
@@ -51,6 +67,23 @@ enum Scope: Hashable {
         }
     }
 
+    /// A page of its own in place of the items' list and detail: nothing of the items (rows, filters, the Item menu)
+    /// applies there.
+    var isPage: Bool {
+        switch self { case .dictation, .home, .cards, .phone, .screenText: return true; default: return false }
+    }
+    /// The capability a place belongs to (nil: Home, always there): with it off the place is not in the sidebar, and
+    /// a window that remembers being there opens on Home.
+    var capability: Capability? {
+        switch self {
+        case .home: return nil
+        case .dictation: return .dictation
+        case .cards: return .cards
+        case .phone: return .phone
+        case .screenText: return .screenText
+        default: return .recording
+        }
+    }
     /// Every place is the one dense list (one row grammar: kind, id, title, state, date) — no column table anywhere.
     var isTable: Bool { false }
     /// How the place groups its rows (ListSections): the Inbox by project (the one project order, Unassigned last), so a
@@ -112,6 +145,11 @@ final class MainModel {
     private(set) var counts = IndexCounts()
     private(set) var projects: [ProjectEntry] = []
     private(set) var jobs: [Job] = []            // active ones for this place (and failures waiting), newest first
+    /// the recordings this place lists at the top (BlurtCore Recordings.listed): their organising jobs are their rows,
+    /// not in `jobs`
+    private(set) var recordings: [Recordings.Row] = []
+    /// the newest recordings' facts, read again with the index (reload); their state follows the jobs (reloadJobs)
+    private(set) var recordingFacts: [Recordings.Facts] = []
     /// Unassigned only: its items by the project an organizing run suggested (the sidebar's order)
     private(set) var suggestionGroups: [SuggestionGroup] = []
     private(set) var lastReloadMS = 0.0
@@ -302,7 +340,7 @@ final class MainModel {
         case .unassigned: q.project = "inbox"; q.bySuggestion = true     // each suggested project's items together
         case .project(let p): q.project = p
         case .session(let s): q.session = s; if sort == "updated" && !ascending { q.sort = "t_start" }
-        case .all, .dictation: break
+        case .all, .dictation, .home, .cards, .phone, .screenText: break
         }
         return q
     }
@@ -315,9 +353,9 @@ final class MainModel {
     func reloadSidebar() {
         let byID = Dictionary(((try? reader?.projects()) ?? []).map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
         counts = (try? reader?.counts()) ?? IndexCounts()
-        // the one project order everywhere (the pickers, the switcher, ⌘K, the Inbox's groups): pinned, then the most
-        // recently used
-        var list = ProjectStore.shared.projects.map { p -> ProjectEntry in
+        // the user's own order (ProjectStore.ordered): pinned, then as they dragged them, a folder opened last; using a
+        // project never moves it, so ⌘5–⌘9 keep going to the same five (the capture switcher keeps recency)
+        var list = ProjectStore.shared.ordered.map { p -> ProjectEntry in
             var e = ProjectEntry(id: p.id, name: p.name, key: p.key, path: p.path, registered: true, exists: p.exists && testMissing != p.id,
                                  pinned: p.pinned)
             e.open = byID[p.id]?.openItems ?? 0
@@ -355,14 +393,28 @@ final class MainModel {
 
     /// The running jobs, and organising that failed and still waits for a Retry or Dismiss (JobFailures): a recording
     /// whose organising failed has no items to be found by, so its job stays in its place until then.
+    /// A recording's organising job is drawn as the recording's row (RecordingsSection), never as a job row beside it.
     func reloadJobs() {
-        let all = JobStore.shared.active + JobFailures.waiting(JobStore.shared.jobs)
+        let recs = Capability.recording.isOn ? Recordings.rows(recordingFacts, jobs: JobStore.shared.jobs) : []
+        let all = Recordings.jobsBeside(JobStore.shared.active + JobFailures.waiting(JobStore.shared.jobs), recs)
         switch scope {
         case .project(let p): jobs = all.filter { $0.project == p }
         case .unassigned: jobs = all.filter { $0.project == "inbox" || $0.project == nil }
         default: jobs = scope.showsJobs ? all : []
         }
+        // while searching or filtering, only items
+        recordings = filtered || testEmpty != nil ? [] : Recordings.listed(recs, in: recordingPlace)
         onJobs?()
+    }
+
+    private var recordingPlace: Recordings.Place {
+        switch scope {
+        case .inbox: return .needsYou
+        case .inProgress: return .inProgress
+        case .unassigned: return .unassigned
+        case .project(let p): return .project(p)
+        default: return .other
+        }
     }
 
     func reload() {
@@ -370,7 +422,7 @@ final class MainModel {
         pages.removeAll()
         overrides.removeAll()
         let emptied = testEmpty.map { !["no_results", "no_match"].contains($0) } ?? false
-        if scope == .dictation || emptied {
+        if scope.isPage || emptied {
             uids = []
             rowKeys = []
         } else if grouping != .none {
@@ -386,7 +438,7 @@ final class MainModel {
         }
         recut()
         // "12 of 52": the place's own count, while a search or a filter narrows it
-        if filtered, scope != .dictation, let r = reader {
+        if filtered, !scope.isPage, let r = reader {
             let (k, s, t) = (kinds, state, text)
             kinds = []; state = nil; text = ""
             let q = query
@@ -401,6 +453,8 @@ final class MainModel {
         let byName = projects.filter(\.registered).sorted { $0.name.lowercased() < $1.name.lowercased() }.map(\.id)
         suggestionGroups = scope == .unassigned ? Suggestions.groups((try? reader?.suggestions()) ?? [], known: byName) : []
         lastReloadMS = Double(DispatchTime.now().uptimeNanoseconds - t0) / 1e6
+        // (not while searching or filtering: the list is only items then)
+        recordingFacts = scope.showsJobs && !filtered && Capability.recording.isOn ? (reader.map { Recordings.load($0, live: RecordingLook.live) } ?? []) : []
         reloadJobs()
         onReload?()
         if ProcessInfo.processInfo.environment["BLURT_PERF"] != nil {    // query, then query + table reload + detail
@@ -466,7 +520,7 @@ final class MainModel {
     /// How many of each built-in kind this place lists with its other filters (state, search) as they are — the
     /// Filter menu's counts.
     func kindCounts() -> [String: Int] {
-        guard let r = reader, scope != .dictation else { return [:] }
+        guard let r = reader, !scope.isPage else { return [:] }
         var out: [String: Int] = [:]
         for k in ["issue", "idea", "note", "task"] {
             var q = query
@@ -496,6 +550,10 @@ final class MainModel {
         case .unassigned: return T("project.inbox")
         case .all: return T("main.place.all")
         case .dictation: return T("dictation.history.sidebar")
+        case .home: return T("home.title")
+        case .cards: return T("cards.title")
+        case .phone: return T("feature.phone")
+        case .screenText: return T("feature.screen_text")
         case .project(let p): return project(id: p)?.name ?? ProjectStore.shared.project(id: p)?.name ?? T("main.place.project")
         case .session(let s): return sessionRow(id: s).map(MainModel.title(of:)) ?? T("main.place.session")
         }

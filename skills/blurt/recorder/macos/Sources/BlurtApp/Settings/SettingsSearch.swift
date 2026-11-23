@@ -1,6 +1,7 @@
 // Where the Settings window is and the search across all of it.
 //   SettingsNavigator   the pane showing, the query and its results (SettingsCatalog.results: titles, descriptions and
-//                       keywords, English and Chinese, grouped by pane), the stop chosen with ↑ / ↓ or the pointer.
+//                       keywords, English and Chinese, grouped by pane — without the panes and rows of capabilities
+//                       that are off), the stop chosen with ↑ / ↓ or the pointer.
 //   SettingsFlash       the row to scroll to — a hit opened, a link (show(pane: "speech/dictation")), a test hook — and
 //                       the row flashing there in the brand tint; a row folded away (Dictation's By kind of app) is
 //                       unfolded by its pane first. Apart from the navigator so that the rows of every kept page, which
@@ -69,9 +70,12 @@ final class SettingsNavigator: ObservableObject {
     @Published private(set) var groups: [SettingsResultGroup] = []
     /// Every setting found, in the page's order (the sidebar's counts; tests).
     @Published private(set) var hits: [SettingsHit] = []
-    /// The keyboard's stops, in the page's order, and the page's lines.
-    @Published private(set) var items: [Item] = []
-    @Published private(set) var lines: [Line] = []
+    /// The keyboard's stops, in the page's order, and the page's lines: one value, published in one write, so the
+    /// results page never draws lines against the stops of another query (a line's row reads `items[i]`).
+    struct Page { var items: [Item] = []; var lines: [Line] = [] }
+    @Published private(set) var page = Page()
+    var items: [Item] { page.items }
+    var lines: [Line] { page.lines }
     /// panes found as a whole whose rows are all shown
     @Published private(set) var expanded: Set<String> = []
     @Published var selected = 0
@@ -86,7 +90,7 @@ final class SettingsNavigator: ObservableObject {
             MainActor.assumeIsolated {
                 let hw = SpeechModel.shared.state?.hardware
                 switch key {
-                case "dictation.settings.double_tap": return [Dictation.keyShort(Dictation.key)]
+                case "dictation.settings.double_tap", "feature.dictation.what": return [Dictation.keyShort(Dictation.key)]
                 case "speech.limits.threads.detail": return hw.map { [Loc.number($0.perfCores + $0.effCores)] }
                 case "speech.limits.memory.detail":
                     guard let h = hw, let f = SpeechModel.shared.state?.limits.maxMemoryFraction else { return nil }
@@ -134,8 +138,7 @@ final class SettingsNavigator: ObservableObject {
             }
             if folds { add(.more(g.pane)) }
         }
-        self.items = items
-        self.lines = lines
+        page = Page(items: items, lines: lines)
     }
 
     func count(_ p: SettingsPane) -> Int { hits.filter { $0.entry.pane == p.rawValue }.count }
@@ -152,6 +155,20 @@ final class SettingsNavigator: ObservableObject {
         emit(["event": "settings_search_clear"])
     }
 
+    /// A capability was turned on or off (SettingsFeatures): the results are searched again — what is off is not
+    /// found —, and when the pane showing is one that just went away the window goes to General: at that capability's
+    /// switch, flashed, so the click that made the pane go is seen to have landed (`visible` false, the window closed:
+    /// General, without a row waiting to flash at the next open). A search in progress stays.
+    func capabilitiesChanged(visible: Bool) {
+        if !pane.shown {
+            let gone = SettingsCatalog.capability(ofPane: pane.rawValue)
+            if searching || !visible { pane = .general }
+            else if let c = gone { reveal(SettingsCatalog.featureRow(c)) }
+            else { go(.general) }
+        }
+        if searching { refresh() }
+    }
+
     /// Show a pane (the sidebar, a link): the search ends.
     func go(_ p: SettingsPane) {
         if !query.isEmpty { query = "" }
@@ -163,7 +180,7 @@ final class SettingsNavigator: ObservableObject {
         let req = SettingsFlash.Request(id: id)
         guard let p = SettingsPane(rawValue: req.pane) else { return }
         go(p)
-        SettingsFlash.shared.request = req
+        SettingsFlash.shared.ask(req)
         emit(["event": "settings_reveal", "id": id])
     }
 
@@ -236,6 +253,16 @@ final class SettingsFlash: ObservableObject {
     @Published var request: Request?
     @Published private(set) var row: String?
 
+    /// Ask for a row. A page that comes on screen for it reads `request` as it appears; a page already showing is
+    /// told by `$request`, which speaks before the value is in (@Published) — so the page read the request before
+    /// this one, found none, and a link to a row of the pane on show ("general/general.language" with General open,
+    /// a link to an off capability's pane while General shows) neither scrolled nor flashed. Said once more on the
+    /// next turn of the run loop, when it is in; a page that has already taken it only scrolls where it is.
+    func ask(_ r: Request) {
+        request = r
+        DispatchQueue.main.async { [self] in if request == r { request = r } }
+    }
+
     /// The landing row's wash, briefly.
     func flash(_ id: String) {
         row = id
@@ -254,13 +281,15 @@ struct SettingsSearchResults: View {
     /// the pen's hold key, shown on its row
     @ObservedObject private var keys = HotkeySettings.shared
 
-    /// The page's lines as boxes: each pane's heading, then its rows (indices into nav.lines).
-    var blocks: [(group: SettingsResultGroup, lines: [Int])] {
-        var out: [(group: SettingsResultGroup, lines: [Int])] = []
-        for (k, l) in nav.lines.enumerated() {
+    /// The page's lines as boxes: each pane's heading, then its rows — the lines themselves, keyed by their item, never
+    /// indices into nav.lines: SwiftUI can run a row of the last query against a shorter list of the next one (typing
+    /// "relay" → "中继" crashed on nav.lines[k] out of range).
+    var blocks: [(group: SettingsResultGroup, lines: [SettingsNavigator.Line])] {
+        var out: [(group: SettingsResultGroup, lines: [SettingsNavigator.Line])] = []
+        for l in nav.lines {
             switch l {
             case .group(let g): out.append((g, []))
-            case .item: if !out.isEmpty { out[out.count - 1].lines.append(k) }
+            case .item: if !out.isEmpty { out[out.count - 1].lines.append(l) }
             case .section: break
             }
         }
@@ -277,11 +306,11 @@ struct SettingsSearchResults: View {
                             .padding(.horizontal, SettingsMetrics.boxInset).padding(.top, SettingsMetrics.groupGap)
                     } else {
                         header
-                        ForEach(Array(blocks.enumerated()), id: \.element.group.pane) { _, b in
+                        ForEach(blocks, id: \.group.pane) { b in
                             groupHeading(b.group)
                             VStack(alignment: .leading, spacing: 0) {
-                                ForEach(Array(b.lines.enumerated()), id: \.element) { j, k in
-                                    lineView(nav.lines[k], hairline: j > 0)
+                                ForEach(b.lines) { l in
+                                    lineView(l, hairline: l.id != b.lines.first?.id)
                                 }
                             }
                             .clipShape(RoundedRectangle(cornerRadius: SettingsMetrics.boxRadius, style: .continuous))
@@ -430,7 +459,7 @@ struct SettingsSearchResults: View {
             switch HotkeySettings.shared.drawKey {
             case "control": return ["⌃"]
             case "option": return ["⌥"]
-            case "fn": return ["fn"]
+            case "fn": return [Dictation.keyName(.fn)]          // "Fn", as every other keycap
             default: return []
             }
         default:

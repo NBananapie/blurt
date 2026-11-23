@@ -49,14 +49,24 @@ final class PadViewController: UIViewController {
     /// the pad has the Mac's shape and shows its screen
     private var showing = false
     private let edgeMark = UIView()
+    /// one finger is scrolling along the edge now
+    private var edgeLit = false
+    /// the first time the picture comes on: two fingers scroll, and the zoom key with a pinch zooms the computer
+    private let tip = UILabel()
+    private let tipBack = UIView()
+    /// full screen: the one way back, in words
+    private let exitFull = UIButton(type: .system)
+    /// not with the keyboard up, nor half folded: nothing goes across a fold in use
+    private var fullNow: Bool { showing && Prefs.shared.fullScreen && keyboardHeight == 0 && !surround.foldActive }
     private let liveText = UILabel()
     /// over the picture, the words need something behind them
     private let liveBack = UIView()
-    private let message = UILabel()
+    /// what the pad says when the connection isn't simply there (StatusCard.swift)
+    private let card = StatusCard()
+    private var follower = StatusFollower()
     /// the empty pad, the first times: what it is and where the picture is. Gone once the pad is touched, for good once the picture's been on
     private let emptyHint = UILabel()
     private var padTouched = false
-    private let action = UIButton(type: .system)
     private let dim = UIView()
     private let field = TypeField(frame: .zero, textContainer: nil)
     private let modRow = ModifierRow()
@@ -152,7 +162,17 @@ final class PadViewController: UIViewController {
         standIn.isHidden = true
         pad.layer.insertSublayer(standIn, at: 1)
         #endif
-        for v in [header, liveBack, liveText, message, emptyHint, action, edgeMark] as [UIView] { pad.addSubview(v) }
+        for v in [header, liveBack, liveText, emptyHint, edgeMark, tipBack, card] as [UIView] { pad.addSubview(v) }
+        tipBack.addSubview(tip)
+        tipBack.backgroundColor = UIColor(white: 0, alpha: 0.72)
+        tipBack.layer.cornerRadius = 12
+        tipBack.layer.cornerCurve = .continuous
+        tipBack.isUserInteractionEnabled = false
+        tipBack.alpha = 0
+        tip.font = .systemFont(ofSize: 14, weight: .medium)
+        tip.textColor = .white
+        tip.textAlignment = .center
+        tip.numberOfLines = 0
         liveBack.backgroundColor = UIColor(white: 0, alpha: 0.72)
         liveBack.layer.cornerRadius = 12
         liveBack.layer.cornerCurve = .continuous
@@ -164,6 +184,24 @@ final class PadViewController: UIViewController {
         screenButton.onToggle = { [weak self] in self?.toggleScreen() }
         screenButton.onPick = { [weak self] c in self?.pickDisplay(c) }
         screenButton.mapPlace = { [weak self] size in self?.placeMap(size) }
+        screenButton.fullScreen = Prefs.shared.fullScreen
+        var exit = UIButton.Configuration.filled()
+        exit.title = String(localized: "Exit Full Screen")
+        exit.image = UIImage(systemName: "arrow.down.right.and.arrow.up.left", withConfiguration: UIImage.SymbolConfiguration(pointSize: 12, weight: .semibold))
+        exit.imagePadding = 6
+        exit.cornerStyle = .capsule
+        exit.baseBackgroundColor = UIColor(white: 0, alpha: 0.62)
+        exit.baseForegroundColor = .white
+        exit.contentInsets = NSDirectionalEdgeInsets(top: 8, leading: 14, bottom: 8, trailing: 14)
+        exit.titleTextAttributesTransformer = UIConfigurationTextAttributesTransformer { a in
+            var a = a
+            a.font = .systemFont(ofSize: 14, weight: .medium)
+            return a
+        }
+        exitFull.configuration = exit
+        exitFull.isHidden = true
+        exitFull.addAction(UIAction { [weak self] _ in self?.setFullScreen(false) }, for: .touchUpInside)
+        view.addSubview(exitFull)
         drawerButton.setImage(UIImage(systemName: "square.grid.3x3", withConfiguration: UIImage.SymbolConfiguration(pointSize: 18, weight: .regular)), for: .normal)
         drawerButton.tintColor = Theme.mark
         drawerButton.backgroundColor = Theme.slab
@@ -178,19 +216,13 @@ final class PadViewController: UIViewController {
         liveText.numberOfLines = 3
         liveText.lineBreakMode = .byWordWrapping
         liveText.isUserInteractionEnabled = false
-        message.textAlignment = .center
-        message.numberOfLines = 0
-        message.font = .systemFont(ofSize: 15)
-        message.textColor = Theme.caption
-        message.isUserInteractionEnabled = false
+        card.onAction = { [weak self] in self?.cardAction(second: false) }
+        card.onSecond = { [weak self] in self?.cardAction(second: true) }
         emptyHint.textAlignment = .center
         emptyHint.numberOfLines = 0
         emptyHint.isUserInteractionEnabled = false
         emptyHint.attributedText = Self.emptyHintText()
         emptyHint.isHidden = true
-        action.tintColor = Theme.mark
-        action.titleLabel?.font = .systemFont(ofSize: 15, weight: .semibold)
-        action.addAction(UIAction { [weak self] _ in self?.primaryAction() }, for: .touchUpInside)
 
         view.addSubview(list)
         list.onCycle = { [weak self] on, c in self?.cycling(on, by: c) }
@@ -253,6 +285,15 @@ final class PadViewController: UIViewController {
                 }
             }
             p.onClick = { Sticky.shared.used() }
+            // ⌘ on a Mac, Ctrl elsewhere, from the keys here or a keyboard on the iPad
+            p.engine.computerZoomHeld = {
+                let k: RemoteModifiers = Link.shared.host == .mac ? .command : .control
+                return Sticky.shared.held.union(HardwareKeys.shared.sent).isSuperset(of: k)
+            }
+        }
+        pad.onEdgeScroll = { [weak self] on in
+            self?.edgeLit = on
+            self?.markEdge()
         }
         pad.onTouch = { [weak self] in
             guard let self, !self.padTouched else { return }
@@ -287,6 +328,14 @@ final class PadViewController: UIViewController {
             self?.thumbPad.letGo()
             HardwareKeys.shared.letGo()
             Sticky.shared.clear()
+        }
+        // left and come back to, the connection starts again: that's not a drop to tell the thumb about
+        NotificationCenter.default.addObserver(forName: UIApplication.didEnterBackgroundNotification, object: nil, queue: .main) { [weak self] _ in
+            self?.follower = StatusFollower()
+        }
+        // the card's words follow the system's text size
+        NotificationCenter.default.addObserver(forName: UIContentSizeCategory.didChangeNotification, object: nil, queue: .main) { [weak self] _ in
+            self?.view.setNeedsLayout()
         }
         touched()
         #if DEBUG
@@ -355,11 +404,17 @@ final class PadViewController: UIViewController {
         }.store(in: &bag)
         // the picture was of the Mac just left
         l.$current.map { $0?.deviceID }.removeDuplicates().dropFirst().receive(on: RunLoop.main).sink { [weak self] _ in self?.setShowing(false) }.store(in: &bag)
-        Publishers.CombineLatest(l.$waitingForMac, l.$pairFailed).receive(on: RunLoop.main).sink { [weak self] _, _ in
+        Publishers.CombineLatest3(l.$waitingForMac, l.$pairFailed, l.$away).receive(on: RunLoop.main).sink { [weak self] _, _, _ in
             DispatchQueue.main.async { self?.status() }
         }.store(in: &bag)
         Publishers.CombineLatest(l.$route, l.$displayAspect).receive(on: RunLoop.main).sink { [weak self] _, _ in
             DispatchQueue.main.async { self?.status() }
+        }.store(in: &bag)
+        l.$notice.compactMap { $0 }.receive(on: RunLoop.main).sink { [weak self] t in
+            Link.shared.notice = nil
+            let a = UIAlertController(title: Link.shared.current?.name, message: t, preferredStyle: .alert)
+            a.addAction(UIAlertAction(title: String(localized: "OK"), style: .default))
+            self?.present(a, animated: true)
         }.store(in: &bag)
         l.$screenError.receive(on: RunLoop.main).sink { [weak self] e in
             guard let e else { return }
@@ -398,57 +453,66 @@ final class PadViewController: UIViewController {
         }.store(in: &bag)
     }
 
-    /// What the pad says, in the few states where it should say anything.
+    /// What the pad says, in the few states where it should say anything: which words for which state is LinkStatus.swift's, the same
+    /// on Android. Connected and working it's the computer's name, small, in the corner; anything else is the card in the middle.
     private func status() {
         let l = Link.shared
-        var text: String?, button: String?
-        switch l.state {
-        case .unpaired:
-            text = Words.whereTheCodeIs
-            button = String(localized: "Scan Code")
-        case .forgotten:
-            text = String(localized: "\(l.current?.title ?? String(localized: "This computer")) no longer knows this iPhone.")
-            button = String(localized: "Scan Code")
-        case .unreachable:
-            let n = l.current?.title ?? String(localized: "the computer")
-            text = l.current?.relayAddress == nil ? String(localized: "Can’t reach \(n). Check that Blurt is running and both are on the same network.")
-                : String(localized: "Can’t reach \(n). Check that it’s awake and Blurt is running.")
-            if l.macs.count > 1 { button = String(localized: "Try Another Computer") }
-        case .connecting: break
-        case .replaced:
-            text = String(localized: "Another phone is connected. Touch to take over.")
-        case .connected:
-            let n = l.current?.title ?? ""
-            if !l.canControl { text = Words.cantControl(l.host, n) }
-            if l.screenError == "permission" { text = Words.noScreenPermission(l.host, n) }
-            if l.screenError == "off" { text = Words.screenOff(l.host, n) }
+        let phase: LinkStatus.Phase = switch l.state {
+        case .unpaired: .unpaired
+        case .connecting: .connecting
+        case .unreachable: .unreachable
+        case .connected: .connected
+        case .forgotten: .forgotten
+        case .replaced: .replaced
+        case .ended: .ended
         }
-        if l.waitingForMac {
-            text = String(format: String(localized: "Allow this iPhone in Blurt’s Settings on your computer. Check that it shows %@."), l.pairCheck ?? "")
-            button = nil
-        }
-        if let f = l.pairFailed { text = f }
+        let cue = follower.see(phase, computer: l.current?.id, inUse: UIApplication.shared.applicationState != .background)
+        var banner = StatusBanner.of(LinkStatus(phase: phase, dropped: follower.dropped, hasRelay: l.current?.relayAddress != nil,
+                                                otherComputers: l.macs.count > 1, canControl: l.canControl, screenError: l.screenError,
+                                                waiting: l.waitingForMac, pairFailed: l.pairFailed != nil,
+                                                pairRetry: l.pairFailed?.canRetry == true, away: l.away))
         var ready = l.state == .connected
         #if DEBUG
-        if Pretend.connected { text = nil; button = nil; ready = true }
+        if Pretend.connected { banner = nil; ready = true }
         #endif
-        message.text = text
-        message.isHidden = text == nil
-        emptyHint.isHidden = !(ready && text == nil && !showing && !padTouched && !Prefs.shared.screenFound)
-        action.setTitle(button, for: .normal)
-        action.isHidden = button == nil
-        let name = l.current?.title ?? ""
-        let via = l.route == .relay ? String(localized: "\(name) · Internet") : l.route == .direct ? String(localized: "\(name) · Direct") : name
-        header.text = showing && l.state == .connected ? nil : l.state == .connected ? via : l.state == .connecting ? String(localized: "Connecting to \(name)…") : nil
+        let name = l.current?.title
+        func say(_ line: StatusBanner.Line) -> String { Words.status(line, host: l.host, name: name, check: l.pairCheck, failed: l.pairFailed) }
+        shownBanner = banner
+        let words = banner.map { StatusCard.Words(title: say($0.title), detail: $0.detail.map(say), action: $0.action.map { Words.status($0) }, second: $0.second.map { Words.status($0) }) }
+        let changed = card.show(banner?.mark, words)
+        // the pad is one thing to VoiceOver ("Trackpad"), which hides what's in it: while the card is up, its words and buttons are the things
+        pad.isAccessibilityElement = banner == nil
+        // the thumb and VoiceOver hear of it too: the connection went, it's back, or the card says something new
+        switch cue {
+        case .dropped: Haptics.release()
+        case .back:
+            Haptics.grab()
+            UIAccessibility.post(notification: .announcement, argument: String(localized: "Connected to \(name ?? String(localized: "the computer"))"))
+        case nil: break
+        }
+        if changed, let words { UIAccessibility.post(notification: .announcement, argument: words.spoken) }
+        emptyHint.isHidden = !(ready && banner == nil && !showing && !padTouched && !Prefs.shared.screenFound)
+        let via: String? = switch l.route {
+        case .relay: l.viaGoBetween ? String(localized: "\(name ?? "") · Public connection service") : String(localized: "\(name ?? "") · Own relay")
+        case .direct: String(localized: "\(name ?? "") · Direct")
+        case .overlay: l.overlayIsTailscale ? String(localized: "\(name ?? "") · Tailscale") : String(localized: "\(name ?? "") · Virtual network")
+        case .local: name
+        }
+        header.text = l.state == .connected && !showing ? via : nil
         talk.alpha = ready ? 1 : 0.35
         if cycleKey == nil { allCells.forEach { $0.alpha = ready ? 1 : 0.35 } }
         view.setNeedsLayout()
     }
 
-    private func primaryAction() {
-        switch Link.shared.state {
-        case .unreachable: showSettings()
-        default: showPairing()
+    private var shownBanner: StatusBanner?
+
+    private func cardAction(second: Bool) {
+        guard let a = second ? shownBanner?.second : shownBanner?.action else { return }
+        Haptics.tick()
+        switch a {
+        case .retry: Link.shared.tryAgain()
+        case .scan: showPairing()
+        case .another: showSettings()
         }
     }
 
@@ -478,6 +542,20 @@ final class PadViewController: UIViewController {
         remember()
     }
 
+    /// Full screen on: the picture comes on too, as choosing a display does. Off: the keys come back around it.
+    private func setFullScreen(_ on: Bool) {
+        Haptics.tick()
+        Prefs.shared.fullScreen = on
+        screenButton.fullScreen = on
+        if on, !showing {
+            Link.shared.screenError = nil
+            setShowing(true)
+            remember()
+        }
+        view.setNeedsLayout()
+        UIView.animate(withDuration: 0.25) { self.view.layoutIfNeeded() }
+    }
+
     /// What the user chose, kept for next time.
     private func remember() {
         Prefs.shared.screenWanted = showing
@@ -487,6 +565,7 @@ final class PadViewController: UIViewController {
     /// From the screen button: another display, or following the pointer again. The picture comes on if it was off: choosing what to see is
     /// asking to see it.
     private func pickDisplay(_ c: DisplayChoice) {
+        if c == .fullScreen { return setFullScreen(!Prefs.shared.fullScreen) }
         Link.shared.screenError = nil
         Link.shared.showDisplay(c.id)
         if !showing { setShowing(true) }
@@ -498,7 +577,8 @@ final class PadViewController: UIViewController {
     private func placeMap(_ size: CGSize) -> (UIView, CGRect)? {
         let b = screenButton.frame, v = view.bounds, m: CGFloat = 8
         guard let l = layout else { return nil }
-        if l.mode != .landscape, !list.isHidden, l.list.height >= 150 {
+        // the keys' place for the arrangement; Full Screen alone is one row, beside the button
+        if l.mode != .landscape, !list.isHidden, l.list.height >= 150, size.height > DisplayMap.followHeight + DisplayMap.pad * 2 {
             var r = l.list
             if l.mode == .big, let half = l.halves.first(where: { $0.minX <= b.midX && b.midX <= $0.maxX }) {
                 r = CGRect(x: half.minX, y: l.list.minY, width: half.width, height: l.list.height)
@@ -516,6 +596,32 @@ final class PadViewController: UIViewController {
         return (view, r)
     }
 
+    /// The edge where one finger scrolls. On the plain pad its mark stays; over the picture it would hide a strip of it, so it shows as the
+    /// picture comes on and while one finger scrolls there, then fades.
+    private func markEdge(flash: Bool = false) {
+        edgeMark.layer.removeAllAnimations()
+        edgeMark.backgroundColor = showing ? UIColor(white: 1, alpha: 0.8) : Theme.hairline
+        // over a white page as well as a dark one
+        edgeMark.layer.borderWidth = showing ? 0.5 : 0
+        edgeMark.layer.borderColor = UIColor(white: 0, alpha: 0.4).cgColor
+        guard showing else { edgeMark.alpha = 1; return }
+        if flash || edgeLit { edgeMark.alpha = 1 }
+        guard !edgeLit else { return }
+        UIView.animate(withDuration: 0.3, delay: flash ? 1.5 : 0.3, options: [.allowUserInteraction, .beginFromCurrentState]) { self.edgeMark.alpha = 0 }
+    }
+
+    /// Once, the first time the picture is on: the two things a hand tries on a picture and doesn't find.
+    private func tipOnce() {
+        guard !Prefs.shared.pictureTipShown else { return }
+        Prefs.shared.pictureTipShown = true
+        tip.text = Link.shared.host == .mac ? String(localized: "Two fingers scroll · Pinch with ⌘ held zooms the Mac")
+            : String(localized: "Two fingers scroll · Pinch with Ctrl held zooms the computer")
+        view.setNeedsLayout()
+        UIView.animate(withDuration: 0.25) { self.tipBack.alpha = 1 } completion: { _ in
+            UIView.animate(withDuration: 0.4, delay: 4.5, options: [.allowUserInteraction]) { self.tipBack.alpha = 0 }
+        }
+    }
+
     private func setShowing(_ on: Bool) {
         guard on != showing else { return }
         if !on { screenButton.closeMap() }
@@ -531,6 +637,8 @@ final class PadViewController: UIViewController {
         ScreenStream.shared.resetView()
         applyPrefs()
         if on { ScreenStream.shared.start() } else { ScreenStream.shared.stop() }
+        markEdge(flash: on)
+        if on { tipOnce() } else { tipBack.alpha = 0 }
         status()
         view.setNeedsLayout()
         UIView.animate(withDuration: 0.22) { self.view.layoutIfNeeded() }
@@ -606,6 +714,8 @@ final class PadViewController: UIViewController {
         layout = l
         let typing = keyboardHeight > 0
         var padFrame = l.pad
+        let full = fullNow
+        if full { padFrame = view.bounds }
         if typing {
             let top = l.landscape ? max(view.safeAreaInsets.top, 8) : l.pad.minY
             padFrame = CGRect(x: l.landscape ? max(view.safeAreaInsets.left, 12) : l.pad.minX, y: top,
@@ -674,8 +784,30 @@ final class PadViewController: UIViewController {
         settingsButton.isHidden = typing
         findButton.isHidden = typing
         dim.frame = view.bounds
+        // full screen: everything but the picture goes, and the talk key stays over it, small and see-through, by the thumb
+        exitFull.isHidden = !full
+        talk.alpha = full ? 0.8 : 1
+        if full {
+            for v in [thumbPad, list, arrowCell, appsCell, drawerButton, screenButton, strip, keyboardButton, settingsButton, findButton] as [UIView] {
+                v.isHidden = true
+            }
+            dockCells.forEach { $0.isHidden = true }
+            glassOutline.isHidden = true
+            screenButton.closeMap()
+            // the keys that showed a ⌘ held are gone: nothing stays held unseen
+            if !Sticky.shared.held.isEmpty { Sticky.shared.release(Sticky.shared.held) }
+            let s = view.safeAreaInsets, m: CGFloat = 12, k: CGFloat = 60, b = view.bounds, lefty = Prefs.shared.lefty
+            talk.isHidden = false
+            talk.frame = CGRect(x: lefty ? max(s.left, m) : b.width - max(s.right, m) - k, y: b.height - max(s.bottom, m) - k, width: k, height: k)
+            let e = exitFull.sizeThatFits(CGSize(width: b.width, height: 44))
+            exitFull.frame = CGRect(x: lefty ? b.width - max(s.right, m) - e.width : max(s.left, m), y: max(s.top, m), width: e.width, height: e.height)
+            view.insertSubview(talk, belowSubview: dim)
+            view.insertSubview(exitFull, belowSubview: dim)
+            pad.engine.scrollEdge = PadLayout.scrollEdge(width: padFrame.width, lefty: lefty)
+            pad.engine.scrollEdgeY = nil
+        }
 
-        ScreenStream.shared.layout(pad.bounds, alignY: l.stageAlignY)
+        ScreenStream.shared.layout(pad.bounds, alignY: full ? 0.5 : l.stageAlignY)
         #if DEBUG
         if Pretend.screen {
             ScreenStream.shared.standsIn = true
@@ -687,7 +819,7 @@ final class PadViewController: UIViewController {
         // with several displays, enough for any of them: a switch then needs no new stream, only another display in the same one
         let aspects = Link.shared.displays.map { $0.width / max($0.height, 1) }.filter { $0 > 0 }
         let want = (aspects.isEmpty ? [Link.shared.displayAspect] : aspects)
-            .map { PadLayout.outputPixels(stage: l.pad.size, aspect: $0, scale: traitCollection.displayScale) }
+            .map { PadLayout.outputPixels(stage: full ? padFrame.size : l.pad.size, aspect: $0, scale: traitCollection.displayScale) }
             .reduce(CGSize.zero) { CGSize(width: max($0.width, $1.width), height: max($0.height, $1.height)) }
         if want.width > 0, askedPixels.map({ abs($0.width - want.width) > $0.width * 0.08 || abs($0.height - want.height) > $0.height * 0.08 }) ?? true {
             askedPixels = want
@@ -695,12 +827,15 @@ final class PadViewController: UIViewController {
         }
 
         // what's said on the stage stays clear of the fold, on the thumb's side
-        let hint = typing ? pad.bounds : l.hintArea
+        let hint = typing || full ? pad.bounds : l.hintArea
         let chipsW = min(hint.width - 16, 300)
         chips.frame = CGRect(x: padFrame.minX + hint.midX - chipsW / 2, y: padFrame.minY + hint.maxY - 8 - 32, width: chipsW, height: 32)
-        edgeMark.isHidden = showing
         let edge = pad.engine.scrollEdge ?? (0...0), ys = pad.engine.scrollEdgeY ?? (0...pad.bounds.height)
         edgeMark.frame = CGRect(x: edge.lowerBound < 1 ? 7 : pad.bounds.maxX - 10, y: (ys.lowerBound + ys.upperBound) / 2 - 34, width: 3, height: 68)
+        let tipW = min(hint.width - 32, 420)
+        let tipFit = ceil(tip.sizeThatFits(CGSize(width: tipW - 24, height: .greatestFiniteMagnitude)).height)
+        tipBack.frame = CGRect(x: hint.midX - tipW / 2, y: hint.minY + 16, width: tipW, height: tipFit + 16)
+        tip.frame = tipBack.bounds.insetBy(dx: 12, dy: 8)
         let inset = hint.insetBy(dx: 16, dy: 12)
         header.frame = CGRect(x: 16, y: 12, width: pad.bounds.width - 32, height: 16)
         // above the chips, nearest the thumb; the newest words stay in view
@@ -711,13 +846,13 @@ final class PadViewController: UIViewController {
         liveText.frame = CGRect(x: hint.midX - wordsW / 2, y: chipsTop - 6 - fit, width: wordsW, height: fit)
         liveBack.frame = liveText.frame.insetBy(dx: -10, dy: -6)
         liveBack.isHidden = !hasWords
-        let tall = sizeForMessage(inset.width)
-        message.frame = CGRect(x: inset.minX + 8, y: hint.midY - tall / 2 - 20, width: inset.width - 16, height: tall)
+        // in the middle of what's clear, a little above it as the eye expects; a pad too short for it keeps its top
+        let cardW = min(inset.width, StatusCard.maxWidth)
+        let cardH = min(card.height(width: cardW), inset.height)
+        card.frame = CGRect(x: hint.midX - cardW / 2, y: max(inset.minY, hint.midY - cardH / 2 - min(20, (inset.height - cardH) / 2)), width: cardW, height: cardH)
         let hintSize = emptyHint.sizeThatFits(CGSize(width: inset.width - 16, height: .greatestFiniteMagnitude))
         emptyHint.frame = CGRect(x: hint.midX - hintSize.width / 2, y: hint.midY - hintSize.height / 2, width: hintSize.width, height: hintSize.height)
         emptyHint.isHidden = emptyHint.isHidden || typing
-        let actionW = min(inset.width, 280)
-        action.frame = CGRect(x: hint.midX - actionW / 2, y: message.frame.maxY + 8, width: actionW, height: 44)
     }
 
     /// The safe area, and on iPadOS 26 a window's controls too: the stage's top corner stays clear of them.
@@ -753,11 +888,6 @@ final class PadViewController: UIViewController {
         return t
     }
 
-    private func sizeForMessage(_ w: CGFloat) -> CGFloat {
-        ceil((message.text as NSString? ?? "").boundingRect(with: CGSize(width: w - 16, height: 400), options: .usesLineFragmentOrigin,
-                                                           attributes: [.font: message.font as Any], context: nil).height)
-    }
-
     /// A turn, a window resized, the Duo opened or closed: the same session goes on. Touches in flight end cleanly (a drag lets go,
     /// a scroll ends); latched modifiers stay held; the zoomed view keeps its middle (ViewPort.reshape). The keys go back to how they
     /// start only when the layout changes kind, not at every step of a window being dragged bigger.
@@ -774,6 +904,9 @@ final class PadViewController: UIViewController {
         list.show(deck.sections)
         strip.show(names: deck.sections.map(\.name), page: list.section)
         for (i, c) in dockCells.enumerated() { c.slot = deck.dock[i] }
+        // esc, ⌫ and ↩ go by the thumb in landscape wherever this dock has them
+        PadLayout.thumbSlots = Deck.thumbSlots(deck.dock)
+        view.setNeedsLayout()
         status()
     }
 

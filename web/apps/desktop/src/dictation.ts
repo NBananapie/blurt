@@ -12,6 +12,28 @@ export const differs = (e: DictationEntry) => e.polished != null && e.text !== e
 /** A take the speech model couldn't recognise. */
 export const isFailed = (e: DictationEntry) => !e.text && (e.reason ?? '').startsWith('asr_failed');
 
+/** The reason a take the user cancelled (Esc) is kept under: meant, so only the Dictation page offers it. */
+export const CANCELLED_REASON = 'asr_failed:cancelled';
+
+/** Recognition failed and the user didn't cancel it: the speech model failed, was too slow, the app quit before the
+ *  text came (the Mac's DictationRetry.failed; Rust history.rs `failed`). */
+export const failedNotCancelled = (e: DictationEntry) => isFailed(e) && e.reason !== CANCELLED_REASON;
+
+/** Home's timeline lists it: a dictation with text, or a failed one whose recording is kept and can be retried here
+ *  (`retryable`: `can_retry` and the recording on disk) — never a cancelled one (DictationRetry.onHome). */
+export const onHome = (e: DictationEntry, retryable: boolean) =>
+  !!finalText(e).trim() || (failedNotCancelled(e) && retryable);
+
+/** How many entries a retention of `days` deletes now (the Mac's DictationHistory.wouldPrune): older than the period;
+ *  under Don't keep (0) a take waiting for Retry still gets a day. A shorter period that deletes any asks first. */
+export const wouldPrune = (entries: DictationEntry[], days: number, now = Date.now()): number => {
+  const day = 86_400_000;
+  return entries.filter((e) => {
+    const cut = now - (days > 0 ? days : isFailed(e) && e.audio_path ? 1 : 0) * day;
+    return Date.parse(e.t) < cut;
+  }).length;
+};
+
 /** One paragraph: line breaks and runs of spaces become one space, so every row clamps the same way. */
 export const preview = (s: string) => s.split(/\s+/).filter(Boolean).join(' ');
 

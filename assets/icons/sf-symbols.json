@@ -181,6 +181,9 @@
     "phone": [
       "iphone"
     ],
+    "devices": [
+      "laptopcomputer.and.iphone"
+    ],
     "cloud": [
       "cloud"
     ],
@@ -198,7 +201,8 @@
       "hand.raised"
     ],
     "drive": [
-      "internaldrive"
+      "internaldrive",
+      "externaldrive"
     ],
     "sliders": [
       "slider.horizontal.3"
@@ -278,6 +282,9 @@
     ],
     "window": [
       "macwindow"
+    ],
+    "cube": [
+      "cube"
     ]
   },
   "nearest": {

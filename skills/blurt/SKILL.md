@@ -26,7 +26,11 @@ language; write items in the language the user spoke.
 ## 0. Setup (first run, or when something fails)
 
 - `doctor.py` → OS, RAM/GPU, ffmpeg, configured ASR, recommendations, `todo` list.
-- Missing ffmpeg/uv: offer the install command; run it only after the user agrees.
+- Missing ffmpeg/uv: offer the install command; run it only after the user agrees. On Windows and Linux the Blurt
+  app keeps its own copies in `$BLURT_HOME/bin` (default `~/.blurt/bin`, `%USERPROFILE%\.blurt\bin`; a moved data
+  folder: the `home` in `%APPDATA%\Blurt\location.json` / `~/.config/Blurt/location.json`): not on your PATH, so
+  call `~/.blurt/bin/uv` (`uv.exe`) when `uv` isn't found. The scripts find ffmpeg / ffprobe there themselves and
+  use the app's download mirrors (`$BLURT_HOME/run/env.json`). The app's copy of this skill is `$BLURT_HOME/skill`.
 - ASR: if none configured, pick from `asr_recommendations` + the language the user speaks, tell the user in one
   line what and why (size, local vs cloud, cost), run its `setup`. Details: `reference/asr.md`. Cloud keys are set
   by the user in their env — never ask them to paste keys in chat.
@@ -54,8 +58,10 @@ recording in the app, so it records with the app's own Screen Recording permissi
 recorder under the app hosting you (Terminal, iTerm, Codex…), which then needs that permission too and a restart.
 Run `record.py app` **in the background** (see *Waiting* below): it starts Blurt if needed and opens
 `blurt://record`. The notch asks once (one click), the user picks the area and talks, ⌥R or *Finish* stops, and the
-app organizes the recording into items in its project (Settings → Agents picks the agent). Tell the user that in two
-lines. The command prints one JSON line per change and ends with the outcome:
+app organizes the recording into items in its project, in the background with the first agent CLI in Settings →
+Agents (Claude Code, Codex, Kimi Code, OpenCode, Gemini CLI, Grok). Tell the user that in two lines. With none of
+them installed and signed in (common for WorkBuddy, Cursor or CodeBuddy users) the outcome is `organize_failed`: you
+organize it here. The command prints one JSON line per change and ends with the outcome:
 - `organized` (`session`, `items`: how many) → `items.py list <session>`, tell the user what came out in a few lines,
   then offer §6 / §7. The items are in Blurt's main window; to go through them here, start `review.py <session>` (§3).
 - `saved` (Save Video Only, or the app doesn't organize recordings) or `organize_failed` (`error`: say it in one line)
@@ -110,7 +116,7 @@ from the app in front, and never `items.py move` an item yourself unless the use
 
 **Blurt app recordings:** the menu-bar app records into the current project's store, or the inbox when there is none.
 `record.py inbox` lists them all with `processed` / `reviewed` flags (v0.6 recordings in `~/Blurt/recordings/` too).
-"Process my recordings" → do §2–§4 for each unprocessed one (fan out to subagents if available), then one review per
+"Process my recordings" / 「处理我录的视频」 (the app tells people without a background agent to say this to you) → do §2–§4 for each unprocessed one (fan out to subagents if available), then one review per
 session (or merge into one session dir if the user wants a single list). `meta.json` has `author` — keep it on items
 when several people's recordings are combined.
 

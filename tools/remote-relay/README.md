@@ -1,15 +1,15 @@
 # Blurt relay for iPhone
 
 Passes sealed bytes between a paired iPhone and Mac when they aren't on one network. It can't read them and stores nothing: everything is
-sealed end to end with keys only the two devices have (docs/design/remote.md §Security). Blurt doesn't run a relay for anyone: you run your
-own, on one of these two, and give Blurt its address.
+sealed end to end with keys only the two devices have (docs/design/remote.md §Security). Blurt doesn't run a relay that carries sessions
+(its go-between, below, only helps the two meet): you run your own, on one of these two, and give Blurt its address.
 
 | | You need | Good for |
 |---|---|---|
 | Cloudflare Worker | A domain on Cloudflare, a free account | No server to keep. Screen over the relay for about 8 hours a day on the free plan |
 | Your own server | A server with a public IP; a domain if you want `wss://` | No quota, and the shortest path if the server is near you |
 
-From mainland China, a server there is far faster than Cloudflare's free network. A domain served from a mainland server needs an ICP filing.
+Which is faster depends on where you and your computers are: time a few HTTPS requests from here to Cloudflare and to your server, and pick the shorter round trip. Check the rules where the server is, too: some countries require registering a website served from there (mainland China's ICP filing, for one).
 The picture over a relay follows what the link carries, up to 4 Mbps by default; 2 Mbps out for each person using it at once is plenty.
 
 **Give it a secret path.** Anyone who finds the relay's host can otherwise use it as a free pipe for their own traffic (they can't
@@ -26,6 +26,20 @@ node test.mjs wss://relay.example.com/<secret>    # Node 22 or later, from anywh
 Then paste the address into Blurt → Settings → iPhone → Relay Address. The phone gets it from the Mac the next time it connects on the same
 network, and from then on connects from anywhere. Copy Instructions next to it gives you a prompt for Claude Code or
 Codex that does all of this.
+
+## Blurt's go-between
+
+`wss://meet.blurt.work` is Blurt's public go-between: the same protocol, so a phone and its computer can meet there, do the handshake and
+open a direct path between them, but on a strict budget per connection: 16 KiB a message, 96 KiB in all, 24 KiB in any 5 s, and a phone
+for 12 h at most. Past any of them both ends are closed with 4003. It carries no picture or audio, and it is best effort: on a network
+where the direct path won't open, or once the day's free quota is gone, it can't help. A relay of your own always works, so it's the one
+to set up. The go-between is `src/meet.js` with `wrangler.meet.toml` (docs/design/remote-go-between.md).
+
+To try it without Cloudflare, `BUDGET=1 node server.js` applies the same limits (and answers `GET /` like the go-between), then:
+
+```bash
+node test-meet.mjs ws://127.0.0.1:8787      # about 30 s; or wss://meet.blurt.work
+```
 
 ## Cloudflare Worker
 
@@ -104,5 +118,7 @@ relay.example.com {
 }
 ```
 
-With no domain, set `HOST=0.0.0.0`, remove `TRUST_PROXY=1`, open the port in the firewall, and use `ws://<ip>:8787/<secret>`. What passes is sealed either way, but some mobile
-networks interfere with unencrypted WebSockets, so `wss://` on 443 is more dependable.
+With no domain, set `HOST=0.0.0.0`, remove `TRUST_PROXY=1`, open the port in the firewall, and use `ws://<ip>:8787/<secret>`. What your devices say to each other is sealed
+either way, but over `ws://` the secret path is in the clear: anyone on the same Wi-Fi or network path can see it, use your relay
+as a pipe and keep knocking your phone off it until you change the secret. Some mobile networks also interfere with unencrypted
+WebSockets. Use `wss://` on 443 unless the network between is yours.

@@ -125,9 +125,28 @@ class PadEngineTest {
         val e = PadEngine()
         e.scrollEdge = 374.0..400.0
         e.began(listOf(t(1, 390, 100)), 0.0)
-        assertEquals(listOf(scroll(began)), e.moved(listOf(t(1, 390, 120)), 0.05))
+        assertEquals(listOf(scroll(began), PadOutput.EdgeScroll(true)), e.moved(listOf(t(1, 390, 120)), 0.05))
         val o = e.moved(listOf(t(1, 390, 130)), 0.07).firstOrNull()
         assertTrue(o is Scroll && o.phase == RemoteScrollPhase.CHANGED, "$o")
+        assertEquals(listOf(scroll(ended), PadOutput.EdgeScroll(false)), e.ended(listOf(1), 0.5), "the edge's mark hears it end")
+    }
+
+    @Test fun twoFingersScrollingIsNoEdgeScroll() {
+        val e = PadEngine()
+        e.scrollEdge = 374.0..400.0
+        e.began(listOf(t(1, 300, 300), t(2, 390, 300)), 0.0)
+        val o = e.moved(listOf(t(1, 300, 320), t(2, 390, 320)), 0.05) + e.moved(listOf(t(1, 300, 340), t(2, 390, 340)), 0.08) +
+            e.ended(listOf(1, 2), 0.5)
+        assertTrue(scroll(began) in o, "$o")
+        assertFalse(o.any { it is PadOutput.EdgeScroll }, "$o")
+    }
+
+    @Test fun anEdgeScrollCancelledEnds() {
+        val e = PadEngine()
+        e.scrollEdge = 374.0..400.0
+        e.began(listOf(t(1, 390, 100)), 0.0)
+        e.moved(listOf(t(1, 390, 120)), 0.05)
+        assertEquals(listOf(scroll(ended), PadOutput.EdgeScroll(false)), e.cancel())
     }
 
     @Test fun acrossTheEdgeIsThePointer() {
@@ -194,6 +213,73 @@ class PadEngineTest {
         assertEquals(listOf(PadOutput.System(RemoteSystemMove.ZOOM_IN), Haptic(PadHaptic.STEP)), e.moved(listOf(t(1, 40, 300), t(2, 260, 300)), 0.1))
     }
 
+    /** every zoom step a two-finger gesture sends, fed as a straight path in small moves like a real finger's */
+    private fun zooms(a: Pair<PadPoint, PadPoint>, b: Pair<PadPoint, PadPoint>, e: PadEngine = PadEngine(), n: Int = 30): List<PadOutput> {
+        val out = e.began(listOf(t(1, a.first.x, a.first.y), t(2, a.second.x, a.second.y)), 0.0).toMutableList()
+        for (i in 1..n) {
+            val f = i.toDouble() / n
+            out += e.moved(
+                listOf(
+                    t(1, a.first.x + (b.first.x - a.first.x) * f, a.first.y + (b.first.y - a.first.y) * f),
+                    t(2, a.second.x + (b.second.x - a.second.x) * f, a.second.y + (b.second.y - a.second.y) * f),
+                ),
+                i * 0.012,
+            )
+        }
+        return out + e.ended(listOf(1, 2), n * 0.012 + 0.05)
+    }
+
+    private fun count(m: RemoteSystemMove, o: List<PadOutput>) = o.count { it == PadOutput.System(m) }
+
+    @Test fun aSpreadWithTheThumbHeldStillZoomsIn() {
+        // thumb and finger start close, the thumb stays put and the finger goes out: the middle moves half as far as they come apart
+        val o = zooms(pt(150, 400) to pt(190, 360), pt(150, 400) to pt(250, 300))
+        assertTrue(count(RemoteSystemMove.ZOOM_IN, o) >= 2, "$o")
+        assertFalse(o.any { it is Scroll }, "never a scroll: $o")
+        assertEquals(0, count(RemoteSystemMove.ZOOM_OUT, o))
+    }
+
+    @Test fun aSpreadFromCloseZoomsAsReadilyAsAPinchFromWide() {
+        // the same ratio either way, 60 ↔ 150 apart: as many steps out as in
+        val a = pt(170, 300) to pt(230, 300)
+        val b = pt(125, 300) to pt(275, 300)
+        val out = count(RemoteSystemMove.ZOOM_IN, zooms(a, b))
+        val back = count(RemoteSystemMove.ZOOM_OUT, zooms(b, a))
+        assertTrue(out >= 2)
+        assertEquals(out, back)
+    }
+
+    @Test fun aSmallSpreadFromCloseIsAZoomStep() {
+        // 60 → 85 apart was nothing before: it took 61 pt, twice the starting span, for the first step
+        val o = zooms(pt(170, 300) to pt(230, 300), pt(158, 300) to pt(243, 300))
+        assertEquals(1, count(RemoteSystemMove.ZOOM_IN, o), "$o")
+    }
+
+    @Test fun aSpreadAfterTheHandDriftedStillZooms() {
+        // the hand was still settling when the fingers landed (8 pt of drift: a scroll), then they spread
+        val e = PadEngine()
+        e.began(listOf(t(1, 150, 400), t(2, 190, 360)), 0.0)
+        val o = e.moved(listOf(t(1, 156, 405), t(2, 196, 365)), 0.02).toMutableList()
+        assertEquals(listOf<PadOutput>(scroll(began)), o)
+        for (i in 1..20) o += e.moved(listOf(t(1, 156, 405), t(2, 196 + i * 3, 365 - i * 3)), 0.02 + i * 0.012)
+        assertTrue(count(RemoteSystemMove.ZOOM_IN, o) >= 1, "$o")
+        assertEquals(emptyList(), e.ended(listOf(1, 2), 0.4), "and no fling of the scroll it started as")
+    }
+
+    @Test fun aScrollWhoseFingersDriftNeverZooms() {
+        // a long scroll with the fingers coming 30 pt apart on the way
+        val o = zooms(pt(150, 200) to pt(200, 200), pt(140, 500) to pt(220, 500))
+        assertEquals(0, count(RemoteSystemMove.ZOOM_IN, o) + count(RemoteSystemMove.ZOOM_OUT, o), "$o")
+        assertTrue(scroll(began) in o)
+    }
+
+    @Test fun aTwoFingerTapWithAWobbleIsStillARightClick() {
+        val e = PadEngine()
+        e.began(listOf(t(1, 150, 300), t(2, 200, 300)), 0.0)
+        e.moved(listOf(t(1, 148, 301), t(2, 203, 299)), 0.05)
+        assertEquals(listOf(Click(right), tap), e.ended(listOf(1, 2), 0.12))
+    }
+
     private fun view(o: List<PadOutput>): PadOutput.View = o.firstOrNull() as? PadOutput.View ?: fail("$o")
 
     @Test fun withTheScreenShowingAPinchZoomsTheView() {
@@ -225,6 +311,51 @@ class PadEngineTest {
         e.moved(listOf(t(1, 120, 300), t(2, 220, 300)), 0.05)
         val o = e.moved(listOf(t(1, 140, 300), t(2, 240, 300)), 0.08).firstOrNull()
         assertTrue(o is Scroll && o.phase == RemoteScrollPhase.CHANGED && o.dx > 0 && o.dy == 0f, "$o")
+    }
+
+    @Test fun withThePictureAndTheZoomModifierHeldAPinchZoomsTheComputer() {
+        // ⌘ (Ctrl elsewhere) held: the same pinch as with the picture off, in the same steps, and the picture stays as it is
+        var held = true
+        val e = PadEngine()
+        e.pinchZoomsView = true
+        e.computerZoomHeld = { held }
+        val o = zooms(pt(170, 300) to pt(230, 300), pt(125, 300) to pt(275, 300), e)
+        val off = zooms(pt(170, 300) to pt(230, 300), pt(125, 300) to pt(275, 300))
+        assertTrue(count(RemoteSystemMove.ZOOM_IN, o) >= 2, "$o")
+        assertEquals(count(RemoteSystemMove.ZOOM_IN, off), count(RemoteSystemMove.ZOOM_IN, o))
+        assertFalse(o.any { it is PadOutput.View || it == PadOutput.ViewEnd }, "nothing for the picture: $o")
+        // a once-held modifier used up by the first step: the pinch already decided goes on zooming the computer
+        val e2 = PadEngine().apply { pinchZoomsView = true; computerZoomHeld = { held } }
+        val o2 = e2.began(listOf(t(1, 100, 300), t(2, 200, 300)), 0.0).toMutableList()
+        for (i in 1..20) {
+            o2 += e2.moved(listOf(t(1, 100 - i * 4, 300), t(2, 200 + i * 4, 300)), i * 0.012)
+            if (count(RemoteSystemMove.ZOOM_IN, o2) > 0) held = false
+        }
+        assertTrue(count(RemoteSystemMove.ZOOM_IN, o2) >= 2, "$o2")
+        assertFalse(o2.any { it is PadOutput.View }, "$o2")
+    }
+
+    @Test fun withThePictureAndNoModifierAPinchStillZoomsThePicture() {
+        val e = PadEngine()
+        e.pinchZoomsView = true
+        e.computerZoomHeld = { false }
+        val o = zooms(pt(170, 300) to pt(230, 300), pt(125, 300) to pt(275, 300), e)
+        assertTrue(o.any { it is PadOutput.View && it.scale > 1 }, "$o")
+        assertEquals(0, count(RemoteSystemMove.ZOOM_IN, o) + count(RemoteSystemMove.ZOOM_OUT, o), "$o")
+        assertEquals(PadOutput.ViewEnd, o.last())
+    }
+
+    @Test fun withThePictureAndTheModifierHeldAScrollThatSpreadsZoomsTheComputer() {
+        // fingers that drifted into a scroll and then spread: the computer's zoom, as with the picture off
+        val e = PadEngine()
+        e.pinchZoomsView = true
+        e.computerZoomHeld = { true }
+        e.began(listOf(t(1, 150, 400), t(2, 190, 360)), 0.0)
+        val o = e.moved(listOf(t(1, 156, 405), t(2, 196, 365)), 0.02).toMutableList()
+        assertEquals(listOf<PadOutput>(scroll(began)), o)
+        for (i in 1..20) o += e.moved(listOf(t(1, 156, 405), t(2, 196 + i * 3, 365 - i * 3)), 0.02 + i * 0.012)
+        assertTrue(count(RemoteSystemMove.ZOOM_IN, o) >= 1, "$o")
+        assertFalse(o.any { it is PadOutput.View }, "$o")
     }
 
     @Test fun aScrollThatClearlyPinchesZoomsThePicture() {

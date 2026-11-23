@@ -1,12 +1,13 @@
 //! The dictation key on Windows (TODO.md §Dictation, Windows): a low-level keyboard hook (`WH_KEYBOARD_LL`) on a
 //! thread of its own with a message loop, read like the Mac's DictationKeys reads its event tap. The key is right
-//! Alt (`VK_RMENU`) used alone. What the hook sees goes to the trigger (trigger.rs) as events stamped with their own
+//! Alt (`VK_RMENU`) used alone, or either Alt (`record.dictation.key`, `DICTATION_KEY`). What the hook sees goes to the trigger (trigger.rs) as events stamped with their own
 //! time (the hook's `time`, ms since boot), never the time we got round to them.
 //!
 //! * AltGr layouts send a fake left Ctrl (scan code 0x21D) before right Alt: ignored, so AltGr+key stays a shortcut.
-//! * Alt pressed and let go alone opens the menu bar of the app in front. When the key was used alone its release is
-//!   swallowed and sent again behind the menu mask key (VK 0xE8, unassigned — AutoHotkey's `#MenuMaskKey`), so the app
-//!   sees "Alt + something" and keeps its menu shut.
+//! * Alt pressed and let go alone opens the menu bar of the app in front, and the caret leaves the field the words are
+//!   for. When the dictation key was used alone its release is swallowed and sent again behind the menu mask key (VK
+//!   0xE8, unassigned — AutoHotkey's `#MenuMaskKey`), so the app sees "Alt + something" and keeps its menu shut. That
+//!   is every key the setting names (trigger.rs `AltAlone`): with "either Alt", the left one too.
 //! * Our own injected input (the mask, Ctrl+V, Return) is marked with `INJECT_TAG` and never read back.
 //! * Every other key is reported, never eaten: the trigger reads Esc, Shift and Ctrl inside a take. Esc alone is
 //!   reported and kept from the app in front while a dictation listens (`ESC_DICTATION`) or in a voice note's first
@@ -20,6 +21,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS,
     KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, VIRTUAL_KEY, VK_LCONTROL, VK_RMENU,
 };
+
+use super::trigger::{AltAlone, Key};
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, DispatchMessageW, GetMessageW, SetWindowsHookExW, TranslateMessage,
     KBDLLHOOKSTRUCT, LLKHF_INJECTED, MSG, WH_KEYBOARD_LL, WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN,
@@ -51,9 +54,8 @@ static HOOK: OnceLock<Hook> = OnceLock::new();
 /// Active trigger key spec: 0 RightAlt, 1 EitherAlt, 2 RightCtrl, 3 RightShift, 4 CtrlWin, 5 CapsLock,
 /// 0x10000|vk Custom(vk), 0xFFFF_FFFF disabled.
 static TRIGGER_SPEC: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-/// the Alt dictation key is down and nothing else was pressed with it (its release is then masked)
-static ALONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-static ALT_HELD: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// a dictation Alt key is down and nothing else was pressed with it (its release is then masked)
+static ALONE: std::sync::Mutex<AltAlone> = std::sync::Mutex::new(AltAlone { alone: None, held: [false; 2] });
 static WIN_CHORD_MASK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static SWALLOWED_VK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 /// Esc is Blurt's (a voice note's first seconds, voice.rs): it is reported but never reaches the app in front
@@ -141,21 +143,17 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
             if down || up {
                 use std::sync::atomic::Ordering::SeqCst;
                 let spec = TRIGGER_SPEC.load(SeqCst);
-                let alt_trig = (spec == 0 && k.vkCode == VK_RMENU.0 as u32)
-                    || (spec == 1 && (k.vkCode == VK_RMENU.0 as u32 || k.vkCode == 0xA4));
-                if down && alt_trig {
-                    let prev = ALT_HELD.load(SeqCst);
-                    if prev == 0 {
-                        ALT_HELD.store(k.vkCode, SeqCst);
-                        ALONE.store(true, SeqCst); // a fresh press (not a key repeat) starts alone
-                    } else if prev != k.vkCode {
-                        ALONE.store(false, SeqCst);
+                let lone_release = if spec == 0 || spec == 1 {
+                    let alt_key = if spec == 1 { Key::EitherAlt } else { Key::RightAlt };
+                    ALONE.lock().map(|mut a| a.key(alt_key, k.vkCode, down)).unwrap_or(false)
+                } else {
+                    if down {
+                        if let Ok(mut a) = ALONE.lock() {
+                            a.alone = None;
+                        }
                     }
-                } else if down {
-                    ALONE.store(false, SeqCst);
-                } else if alt_trig && ALT_HELD.load(SeqCst) == k.vkCode {
-                    ALT_HELD.store(0, SeqCst);
-                }
+                    false
+                };
 
                 // Ctrl + Win chord: track so releasing Win after Ctrl+Win masks the Start menu
                 let is_win = k.vkCode == 0x5B || k.vkCode == 0x5C;
@@ -200,8 +198,9 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
                 if eat_non_mod {
                     return LRESULT(1);
                 }
-                if alt_trig && up && ALONE.swap(false, SeqCst) {
-                    // swallow this release and send mask + release again, so no menu bar opens
+                if lone_release {
+                    // swallow this release and send mask + release again, so no menu bar opens (right Alt is an extended
+                    // key, left Alt is not)
                     send_keys(&[
                         (VK_MASK, false, false),
                         (VK_MASK, true, false),

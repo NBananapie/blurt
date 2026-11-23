@@ -2,7 +2,7 @@
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Blurt",
   "mainBinaryName": "blurt",
-  "version": "1.0.21",
+  "version": "1.1.0",
   "identifier": "dev.blurt.desktop",
   "build": {
     "beforeDevCommand": {
@@ -65,17 +65,8 @@
       "icons/icon.ico"
     ],
     "resources": {
-      "../../../skills/blurt/SKILL.md": "skill/SKILL.md",
-      "../../../skills/blurt/scripts/*.py": "skill/scripts/",
-      "../../../skills/blurt/scripts/*.json": "skill/scripts/",
-      "../../../skills/blurt/scripts/.python-version": "skill/scripts/.python-version",
-      "../../../skills/blurt/scripts/review.html": "skill/scripts/review.html",
-      "../../../skills/blurt/reference/*.md": "skill/reference/",
-      "../../../skills/blurt/reference/lenses/*.md": "skill/reference/lenses/",
-      "../../../skills/blurt/models/*": "skill/models/",
-      "../../../skills/blurt/assets/*.png": "skill/assets/",
-      "../../../skills/blurt/assets/*.webp": "skill/assets/",
-      "../../../skills/blurt/assets/icons/*.png": "skill/assets/icons/",
+      "gen/skill/": "skill/",
+      "../../../skills/blurt/models/*": "models/",
       "sounds/*.wav": "sounds/"
     },
     "createUpdaterArtifacts": false,
@@ -113,6 +104,7 @@
           "gstreamer1.0-plugins-good",
           "gstreamer1.0-plugins-ugly",
           "gstreamer1.0-plugins-bad",
+          "gstreamer1.0-libav",
           "libpipewire-0.3-0"
         ],
         "recommends": [

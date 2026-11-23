@@ -13,6 +13,10 @@
     <uses-feature android:name="android.hardware.microphone" android:required="false" />
     <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
 
+    <!-- a relay the owner runs themselves may be ws:// (plain HTTP) when they have no domain for wss://.
+         The frames are sealed on the phone, so nobody on the way reads or forges them; the address (the
+         relay's secret), the room and the hello do travel in the clear (docs/design/remote.md). Android
+         blocks plain sockets from API 28 unless the app asks for them here; this app has no other HTTP. -->
     <application
         android:name=".App"
         android:allowBackup="true"
@@ -23,6 +27,7 @@
         android:label="@string/app_name"
         android:localeConfig="@xml/locales_config"
         android:supportsRtl="true"
+        android:usesCleartextTraffic="true"
         android:resizeableActivity="true"
         android:theme="@style/Theme.Blurt"
         tools:targetApi="36">

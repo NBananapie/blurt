@@ -13,6 +13,7 @@
 //                             its items are moved, the same way.
 // Either way the island then says "Moved to Y · Undo" ("3 items moved to Y" for several); Undo moves exactly the
 // items that moved back where they were — the ones still in Y — the same way the main window's ⌘Z does.
+// Projects are Recording & Items' (BlurtCore Capabilities): with it off none of these lines is said.
 import AppKit
 import BlurtCore
 
@@ -38,6 +39,7 @@ enum Refile {
     /// which project, how long that usually takes on this Mac (`usual`, seconds: OrganizeProgress — nil when there is
     /// no measure yet) and that the items appear there; and Change.
     static func offerRecording(_ dir: URL, project: String?, usual: Double? = nil) {
+        guard Capability.projectsShown else { return }       // (switched off mid-take: no line about a project)
         let where_ = project ?? "inbox"
         emit(["event": "recording_filed", "session": dir.path, "project": where_,
               "usual_minutes": usual.map { OrganizeEstimate.minutes($0) as Any } ?? NSNull()])
@@ -51,6 +53,34 @@ enum Refile {
         }
         t.badge = badge(where_)
         t.seconds = 8
+        t.key = "refile.\(dir.path)"
+        // and the way to the video (the Windows/Linux island says the same)
+        t.secondTitle = T("app.record.show_in_finder")
+        t.second = { App.revealVideo(dir) }
+        island.toast(t)
+    }
+
+    /// A take saved with no agent to organize it in the background (checked before anything is said): that it is
+    /// saved and not organized, and what to do — set up an agent, copy what to say in an agent app with the skill
+    /// (WorkBuddy, Cursor…), or go to the video. No job is started: the recording stays unorganized until then.
+    static func savedNotOrganized(_ dir: URL) {
+        emit(["event": "recording_saved_no_agent", "session": dir.path])
+        var t = Island.Toast(text: Loc.t("capture.recording.no_agent", table: "Capture"), actionTitle: T("home.recording.set_up_agent")) {
+            AppEnvironment.settings?.show(pane: "agents/agents.organize")
+        }
+        t.secondTitle = Loc.t("capture.recording.copy_request", table: "Capture")
+        t.second = {
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(Loc.t("capture.sort.request", table: "Capture"), forType: .string)
+            emit(["event": "organize_request_copied", "session": dir.path])
+            var done = Island.Toast(text: Loc.t("capture.recording.request_copied", table: "Capture"), actionTitle: nil, action: nil)
+            done.icon = .check
+            island.toast(done)
+        }
+        t.thirdTitle = T("app.record.show_in_finder")
+        t.third = { App.revealVideo(dir) }
+        t.icon = .warning           // a failure leads with the attention triangle (system.md §3.2)
+        t.seconds = 12
         t.key = "refile.\(dir.path)"
         island.toast(t)
     }
@@ -99,6 +129,7 @@ enum Refile {
 
     /// "Filed to X · AW-14 · Change": these items to another project.
     static func items(_ uids: [String], from: String) {
+        guard Capability.projectsShown else { return }
         pick(title: Loc.t("capture.drawer.pick_title", table: "Capture"), current: from) { to in move(uids, to: to, from: from) }
     }
 

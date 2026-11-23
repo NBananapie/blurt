@@ -180,6 +180,12 @@ def test_command_headless(env, tmp_path):
     assert out["cwd"] == str(tmp_path.resolve()) and out["env"] == {
         "BLURT_AGENT": "codex", "BLURT_RUN_ID": "r-1", "UV_CACHE_DIR": str(uv_box), "BLURT_NO_INDEX": "1"}
     assert uv_box.is_dir() and out["scripts"] == str(SCRIPTS)
+    # the app's spelling of the scripts folder (a symlink / junction above it): the allowlist uses that one, as its
+    # prompt does
+    linked = cli("command", "claude", "headless", "--prompt", "p", "--repo", tmp_path, "--var", "scripts=/link/skill/scripts")
+    assert linked["scripts"] == "/link/skill/scripts"
+    assert any("Bash(uv run /link/skill/scripts/items.py:*)" in x for x in linked["argv"]), linked["argv"]
+    assert not any(str(SCRIPTS) + "/items.py" in x for x in linked["argv"])
     # unattended on recording-derived text: never full access; a plain run (routing) writes only its cwd
     a = out["argv"]
     assert "danger-full-access" not in a and a[a.index("--sandbox") + 1] == "workspace-write"
@@ -297,12 +303,37 @@ def test_install_dry_run_and_real(env, tmp_path):
 
 def test_install_codex_uses_codex_home(env):
     """Regression: CODEX_HOME must reach `codex mcp add` (a stripped CODEX_HOME writes the user's ~/.codex)."""
+    dry = cli("install", "codex", "--mcp", "--dry-run")["changes"]
+    # Connect's preview lists the approval line with the server: the reporting tools only, nothing that takes a key
+    assert [c["action"] for c in dry] == ["run", "toml_set"]
+    assert dry[1]["lines"] == ['[mcp_servers.blurt.tools.mark_fixed] approval_mode = "approve"',
+                               '[mcp_servers.blurt.tools.get_item] approval_mode = "approve"',
+                               '[mcp_servers.blurt.tools.search_items] approval_mode = "approve"']
     out = cli("install", "codex", "--mcp")
     assert out["applied"]
     cfg = Path(os.environ["CODEX_HOME"]) / "config.toml"
     assert cfg.exists() and "mcp_server.py" in cfg.read_text()
+    assert cfg.read_text().count('approval_mode = "approve"') == 3 and "setup_connect" not in cfg.read_text()
     assert not (env["home"] / ".codex").exists()
     assert {c["action"] for c in cli("install", "codex", "--mcp")["changes"]} == {"exists"}
+
+
+def test_codex_approvals_in_toml(tmp_path):
+    """The approval tables go in without touching anything else; one already there is set, not repeated."""
+    tools = ["mark_fixed", "get_item", "search_items"]
+    text = ('model = "gpt-5"\n\n[mcp_servers.blurt]\ncommand = "uv"\nargs = ["run"]\n\n'
+            '[mcp_servers.blurt.tools.get_item]\napproval_mode = "prompt"\n\n[profiles.work]\nmodel = "o3"\n')
+    assert agents._approvals_missing(text, "blurt", tools) == tools
+    out = agents._with_approvals(text, "blurt", tools)
+    assert out.startswith(text.split("[mcp_servers.blurt.tools.get_item]")[0])
+    assert agents._approvals_missing(out, "blurt", tools) == [] and out.count("[mcp_servers.blurt.tools.get_item]") == 1
+    assert 'approval_mode = "prompt"' not in out and '[profiles.work]\nmodel = "o3"' in out
+    import tomllib
+    doc = tomllib.loads(out)
+    assert doc["model"] == "gpt-5" and doc["profiles"]["work"]["model"] == "o3"
+    assert {t: v["approval_mode"] for t, v in doc["mcp_servers"]["blurt"]["tools"].items()} == dict.fromkeys(tools, "approve")
+    assert agents._with_approvals(out, "blurt", tools) == out
+    assert agents._approvals_missing("", "blurt", tools) == tools
 
 
 def test_install_kimi_json_merge(env):
@@ -321,7 +352,7 @@ def test_install_kimi_json_merge(env):
 
 @pytest.mark.parametrize("agent, skill_dir, mcp_json", [
     ("workbuddy", ".workbuddy/skills", ".workbuddy/mcp.json"),
-    ("cursor", ".agents/skills", ".cursor/mcp.json"),
+    ("cursor", ".cursor/skills", ".cursor/mcp.json"),
     ("codebuddy", ".codebuddy/skills", ".codebuddy/mcp.json"),
 ])
 def test_install_connect_only_agents(env, tmp_path, agent, skill_dir, mcp_json):
@@ -449,10 +480,10 @@ def test_install_rewrites_a_stale_mcp_entry(env):
     (codex_home / "blurt.json").write_text(json.dumps(
         {"name": "blurt", "transport": {"command": "uv", "args": ["run", "--script", str(agents.MCP_SERVER)]}}))
     dry = cli("install", "codex", "--mcp", "--dry-run")["changes"]
-    assert [c["action"] for c in dry] == ["run"] and dry[0]["replaces"] == "stale"
+    assert [c["action"] for c in dry] == ["run", "toml_set"] and dry[0]["replaces"] == "stale"
     out = cli("install", "codex", "--mcp")
     assert out["applied"] and json.loads((codex_home / "blurt.json").read_text())["transport"]["command"] == str(uv)
-    assert [c["action"] for c in cli("install", "codex", "--mcp")["changes"]] == ["exists"]
+    assert [c["action"] for c in cli("install", "codex", "--mcp")["changes"]] == ["exists", "exists"]
     (env["home"] / ".claude-mcp-blurt").write_text(f"--scope user blurt -- uv run --script {agents.MCP_SERVER}\n")
     out = cli("install", "claude", "--mcp")
     assert out["applied"] and out["changes"][0]["replaces"] == "stale"
@@ -546,3 +577,34 @@ def test_detect_probes_agents_side_by_side(tmp_path):
     d = agents.detect(["kimi", "claude", "codex"], login=False, version=True, env=env)
     assert [r["id"] for r in d["agents"]] == ["kimi", "claude", "codex"]
     assert time.monotonic() - t < 5
+
+
+def test_opencode_status_reads_v1_and_v2_auth_list():
+    # v1 ends "└  3 credentials"; v2 (#83) prints a table whose last column is "stored", one row per connection
+    oc = next(a for a in agents.registry()["agents"] if a["id"] == "opencode")
+    v1 = "┌  Credentials ~/.local/share/opencode/auth.json\n│\n●  Anthropic api\n│\n└  3 credentials\n"
+    v2 = "Provider A        API key     stored\nOpenCode Console  Personal    stored\n"
+    assert agents.parse_status(oc, 0, v1, {}) == "configured"
+    assert agents.parse_status(oc, 0, v2, {}) == "configured"
+    assert agents.parse_status(oc, 0, "┌  Credentials ~/.local/share/opencode/auth.json\n└  0 credentials\n", {}) == "logged_out"
+    # v2's own words (packages/cli/src/commands/handlers/auth/list.ts): a key from the environment is a row too; none at all
+    assert agents.parse_status(oc, 0, "DeepSeek          API key     environment\r\n", {}) == "configured"
+    assert agents.parse_status(oc, 0, v2.replace("\n", "\r\n"), {}) == "configured"
+    assert agents.parse_status(oc, 0, "No authenticated integrations\n", {}) == "logged_out"
+
+
+def test_cursor_has_a_windows_app():
+    # #92: an app-only agent with nothing for this platform always read "not installed"; since 1.0.26 the app is an
+    # id that doesn't move with the install folder (the program's stem, found through the registry and shortcuts)
+    cur = next(a for a in agents.registry()["agents"] if a["id"] == "cursor")
+    assert cur["app"]["windows"] == ["cursor"] and cur["home"] == "~/.cursor"
+
+
+def test_app_path_takes_a_path_or_a_list(tmp_path, monkeypatch):
+    app = tmp_path / "Second.app"
+    app.mkdir()
+    key = "macos" if sys.platform == "darwin" else "windows" if os.name == "nt" else "linux"
+    assert agents.app_path({"app": {key: str(app)}}) == str(app)
+    assert agents.app_path({"app": {key: [str(tmp_path / "missing"), str(app)]}}) == str(app)
+    assert agents.app_path({"app": {key: [str(tmp_path / "missing")]}}) is None
+    assert agents.app_path({"app": {}}) is None

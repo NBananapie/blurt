@@ -61,6 +61,7 @@ enum SelfTests {
             RunLoop.main.add(t, forMode: .common)
         }
         emit(["event": "wp6_ready", "channel": channel])
+        DispatchQueue.main.async { MainActor.assumeIsolated { LayoutCheck.prepare() } }
     }
 
     @MainActor
@@ -685,7 +686,7 @@ enum SelfTests {
         case "mainhandoff":             // mainhandoff instruction|full: copy for your own agent
             let c = MainWindowController.shared
             c.handOff(uids: c.list.selectedItems.map(\.uid), what: arg.isEmpty ? "instruction" : arg) { r in
-                out(["text": r?["text"] ?? NSNull(), "clipboard": NSPasteboard.general.string(forType: .string) ?? ""])
+                out(["text": r?["text"] ?? NSNull(), "clipboard": DictationInsert.pasteboard.string(forType: .string) ?? ""])
             }
         case "mainbundle":              // mainbundle [PATH.zip | cancel]: Export Hand-off Bundle… on the selection —
                                         // no PATH: its Save sheet (the suggested name back); PATH: written there, no panel
@@ -768,4 +769,6 @@ final class StubMainWindow: MainWindowHosting {
     func reveal(job: String) { emit(["event": "mainwindow", "call": "reveal_job", "job": job]) }
     func reveal(project: String) { emit(["event": "mainwindow", "call": "reveal_project", "project": project]) }
     func showInbox() { emit(["event": "mainwindow", "call": "show_inbox"]) }
+    func showCards() { emit(["event": "mainwindow", "call": "show_cards"]) }
+    func toggleCards(via: String) { emit(["event": "mainwindow", "call": "toggle_cards", "via": via]) }
 }

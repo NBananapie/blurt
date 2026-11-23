@@ -50,6 +50,15 @@ final class WelcomeLineTests: XCTestCase {
         XCTAssertFalse(l.args.contains("Fn"))
     }
 
+    func testDictationModelsUnreadableOnlineSaysSoWithTryAgain() {
+        // the list failed while online, twice (a script error): not "isn't set up" (it sent people to set up what was
+        // there) — the models couldn't be checked, with Try Again
+        let l = WelcomeLine.compose(dictation: .unreadable, dictationKey: "Fn", snap: "⌥⇧A", record: "⌥⇧R", conflicts: [])
+        XCTAssertEqual(l.key, "app.toast.welcome_unreadable")
+        XCTAssertEqual(l.action, .readModelsAgain)
+        XCTAssertFalse(l.args.contains("Fn"))
+    }
+
     func testDictationOff() {
         XCTAssertEqual(WelcomeLine.compose(dictation: .off, dictationKey: "Fn", snap: "⌥⇧A", record: "⌥⇧R", conflicts: []).key,
                        "app.toast.welcome_no_dictation")
@@ -57,6 +66,55 @@ final class WelcomeLineTests: XCTestCase {
                        "app.toast.welcome_snap_only")
         XCTAssertEqual(WelcomeLine.compose(dictation: .off, dictationKey: "Fn", snap: nil, record: nil, conflicts: []).key,
                        "app.toast.welcome_plain")
+    }
+
+    // MARK: only the keys of capabilities that are on (Capabilities.swift)
+
+    func testCardsOffNamesNoSnapKey() {
+        let l = WelcomeLine.compose(dictation: .works, dictationKey: "Fn", snap: "⌥A", record: "⌥R", conflicts: [], off: [.cards])
+        XCTAssertEqual(l.key, "app.toast.welcome_dictation_only")
+        XCTAssertEqual(l.args, ["Fn"])
+        // …and without dictation there is no key left that the line has words for: where Blurt lives, nothing else
+        let plain = WelcomeLine.compose(dictation: .off, dictationKey: "Fn", snap: "⌥A", record: "⌥R", conflicts: [], off: [.cards])
+        XCTAssertEqual(plain.key, "app.toast.welcome_plain")
+        XCTAssertEqual(plain.args, [])
+    }
+
+    func testRecordingOffNamesNoRecordKey() {
+        let l = WelcomeLine.compose(dictation: .off, dictationKey: "Fn", snap: "⌥A", record: "⌥R", conflicts: [], off: [.recording])
+        XCTAssertEqual(l.key, "app.toast.welcome_snap_only")
+        XCTAssertEqual(l.args, ["⌥A"])
+    }
+
+    func testDictationOffSaysNothingAboutDictation() {
+        // switched off as a capability: no key, no "dictation is off · Turn On…", no model to download
+        for d in [WelcomeLine.Dictation.works, .needsSetup, .noModel, .unknown, .unreadable, .off] {
+            let l = WelcomeLine.compose(dictation: d, dictationKey: "Fn", snap: "⌥A", record: "⌥R", conflicts: [], off: [.dictation])
+            XCTAssertEqual(l.key, "app.toast.welcome_no_dictation", "\(d)")
+            XCTAssertEqual(l.args, ["⌥A", "⌥R"], "\(d)")
+            XCTAssertNil(l.action, "\(d)")
+        }
+    }
+
+    func testOnlyDictationOn() {
+        let l = WelcomeLine.compose(dictation: .works, dictationKey: "Fn", snap: "⌥A", record: "⌥R", conflicts: [],
+                                    off: [.cards, .screenText, .recording, .phone])
+        XCTAssertEqual(l.key, "app.toast.welcome_dictation_only")
+        XCTAssertEqual(l.args, ["Fn"])
+    }
+
+    func testEverythingOffIsThePlainLine() {
+        let l = WelcomeLine.compose(dictation: .works, dictationKey: "Fn", snap: "⌥A", record: "⌥R", conflicts: [],
+                                    off: Set(Capability.allCases))
+        XCTAssertEqual(l.key, "app.toast.welcome_plain")
+        XCTAssertEqual(l.args, [])
+        XCTAssertNil(l.action)
+    }
+
+    func testScreenTextAndPhoneChangeNothing() {
+        let all = WelcomeLine.compose(dictation: .works, dictationKey: "Fn", snap: "⌥A", record: "⌥R", conflicts: [])
+        XCTAssertEqual(WelcomeLine.compose(dictation: .works, dictationKey: "Fn", snap: "⌥A", record: "⌥R", conflicts: [],
+                                           off: [.screenText, .phone]), all)
     }
 }
 
@@ -93,6 +151,7 @@ final class WelcomeLineWidthTests: XCTestCase {
                 case .turnOnDictation?: main["app.toast.welcome_setup.action"]
                 case .downloadModel?: main["app.toast.welcome_no_model.action"]
                 case .setUpDictation?: main["app.toast.welcome_not_set_up.action"]
+                case .readModelsAgain?: main["app.toast.welcome_unreadable.action"]
                 case .changeShortcut?: main["app.toast.change_shortcut"]
                 case nil: nil
                 }
@@ -103,7 +162,7 @@ final class WelcomeLineWidthTests: XCTestCase {
                     add(WelcomeLine.compose(dictation: .works, dictationKey: k, snap: snap, record: "⌥⇧R", conflicts: []))
                 }
             }
-            for d in [WelcomeLine.Dictation.works, .needsSetup, .noModel, .unknown, .off] {
+            for d in [WelcomeLine.Dictation.works, .needsSetup, .noModel, .unknown, .unreadable, .off] {
                 for conflicts in [[], ["⌃⌥⇧⌘A"], ["⌥⇧A", "⌥⇧R", "⌥⇧V"]] {
                     for (snap, record) in [("⌥⇧A", "⌥⇧R"), ("⌥⇧A", nil), (nil, nil)] as [(String?, String?)] {
                         add(WelcomeLine.compose(dictation: d, dictationKey: keyNames[2], snap: snap, record: record, conflicts: conflicts))

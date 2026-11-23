@@ -22,9 +22,15 @@ object DeckText {
         "Reopen Tab" to "恢复标签页", "Rewind" to "回退", "Save" to "保存", "Select All" to "全选", "Send" to "发送", "Sidebar" to "侧栏",
         "Snap" to "截图", "Snip" to "截取屏幕", "Space" to "空格", "Spotlight" to "Spotlight", "Start" to "开始菜单", "Stop" to "停止",
         "Task Manager" to "任务管理器", "Task View" to "任务视图", "Terminal Panel" to "终端面板", "Terminal" to "终端", "Transcript" to "详细记录",
-        "Translate" to "翻译", "Undo" to "撤销", "Voice Note" to "语音便签", "Windows" to "切换窗口", "Word Left" to "上一单词",
+        "Translate" to "翻译", "Undo" to "撤销", "Voice Note" to "语音备注", "Windows" to "切换窗口", "Word Left" to "上一单词",
         "Word Right" to "下一单词", "Zoom In" to "放大", "Zoom Out" to "缩小", "Option" to "Option", "Shift" to "Shift",
         "Next tab, ⌘⇧] in a terminal" to "下一标签（终端里用 ⌘⇧]）",
+        // the section templates (Deck.template)
+        "Empty" to "空白", "Writing" to "写作", "Design" to "设计", "Presenting" to "演示", "Spreadsheet" to "表格",
+        "Paste as Plain Text" to "纯文本粘贴", "Bold" to "加粗", "Italic" to "斜体", "Underline" to "下划线", "Duplicate" to "复制一份",
+        "Group" to "编组", "Ungroup" to "取消编组", "Zoom to Fit" to "适合窗口", "Actual Size" to "实际大小", "Play" to "播放",
+        "Play from Here" to "从当前页播放", "Black Screen" to "黑屏", "Project" to "投影", "Edit Cell" to "编辑单元格", "Clear" to "清除",
+        "Previous Sheet" to "上一张表", "Next Sheet" to "下一张表", "Fill" to "填充",
         // what the screen costs (ScreenQuality)
         "Auto" to "自动", "Sharp" to "清晰", "Balanced" to "均衡", "Data Saver" to "省流量",
         "Sharpest on your own network, lighter on mobile data" to "同一网络下最清晰，用流量时自动节省",

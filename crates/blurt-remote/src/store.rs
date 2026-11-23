@@ -21,6 +21,56 @@ pub struct Device {
     pub added: i64,
     #[serde(rename = "lastSeen", default, skip_serializing_if = "Option::is_none")]
     pub last_seen: Option<i64>,
+    /// a phone, or a computer driving this one (its hello listed `viewer`); records from before say nothing: a phone
+    #[serde(default, skip_serializing_if = "DeviceKind::is_phone")]
+    pub kind: DeviceKind,
+    /// the owner's own name for it (double-click the name, or ⋯ → Rename…; remote-1.1.md §6): shown in `name`'s place, kept when
+    /// its hello names it again, never sent anywhere; the id is never touched. Records from before have none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alias: Option<String>,
+}
+
+impl Device {
+    /// What this computer calls it: the owner's name for it, else its own.
+    pub fn shown(&self) -> &str {
+        self.alias.as_deref().unwrap_or(&self.name)
+    }
+}
+
+/// A name typed for a paired device or computer, as kept: trimmed, at most 64 characters; empty (or the device's own name) is
+/// none, so its own name shows again.
+pub fn alias(typed: &str, own: &str) -> Option<String> {
+    let a: String = typed.trim().chars().take(64).collect();
+    (!a.is_empty() && a != own).then_some(a)
+}
+
+/// What a paired device is (the UI's icon and words): on disk `"kind": "computer"`, nothing for a phone.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DeviceKind {
+    #[default]
+    Phone,
+    Computer,
+}
+
+impl DeviceKind {
+    /// From a hello's `features`: `viewer` is a computer.
+    pub fn of_hello(viewer: bool) -> DeviceKind {
+        if viewer {
+            DeviceKind::Computer
+        } else {
+            DeviceKind::Phone
+        }
+    }
+    pub fn is_phone(&self) -> bool {
+        *self == DeviceKind::Phone
+    }
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            DeviceKind::Phone => "phone",
+            DeviceKind::Computer => "computer",
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -39,6 +89,14 @@ pub struct Settings {
     /// a paired phone may ask for the screen
     #[serde(default = "yes")]
     pub screen: bool,
+    /// Blurt's go-between (wss://meet.blurt.work) for away from home, when no relay of the owner's is set
+    /// (docs/design/remote-go-between.md). On unless the owner turned it off.
+    #[serde(rename = "goBetween", default = "yes")]
+    pub go_between: bool,
+    /// 保持可连接 (docs/design/remote-1.1.md §1): while devices can connect, the computer doesn't idle-sleep (a laptop only while plugged
+    /// in); the screen still turns off. On unless the owner turned it off.
+    #[serde(rename = "stayAwake", default = "yes")]
+    pub stay_awake: bool,
 }
 
 fn yes() -> bool {
@@ -60,6 +118,22 @@ pub fn now_ms() -> i64 {
 }
 
 /// The folder and its two files.
+/// One line of the connection log: a session (start, end; `route` as Status says it) or a new pairing.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Connection {
+    pub id: u64,
+    pub device_id: String,
+    pub name: String,
+    pub start: i64,
+    #[serde(default)]
+    pub end: Option<i64>,
+    #[serde(default)]
+    pub route: Option<String>,
+    #[serde(default)]
+    pub paired: bool,
+}
+
 pub struct Files {
     dir: PathBuf,
 }
@@ -95,6 +169,25 @@ impl Files {
         std::fs::read(self.dir.join("devices.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
     }
 
+    /// 连接记录 (remote-1.1.md §3): every session and pairing here, the last 200, owner-only.
+    pub fn connections(&self) -> Vec<Connection> {
+        std::fs::read(self.dir.join("connections.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
+    }
+
+    pub fn change_connections(&self, f: impl FnOnce(&mut Vec<Connection>)) {
+        let mut list = self.connections();
+        f(&mut list);
+        if list.len() > 200 {
+            let extra = list.len() - 200;
+            list.drain(..extra);
+        }
+        if let Ok(b) = serde_json::to_vec(&list) {
+            if let Err(e) = write_private(&self.dir.join("connections.json"), &b) {
+                eprintln!("blurt remote: connections.json: {e}");
+            }
+        }
+    }
+
     pub fn save_devices(&self, list: &[Device]) {
         if let Ok(b) = serde_json::to_vec_pretty(list) {
             if let Err(e) = write_private(&self.dir.join("devices.json"), &b) {
@@ -110,7 +203,7 @@ impl Files {
                 return s;
             }
         }
-        let s = Settings { id: crate::crypto::new_id(), port: 0, relay: None, relay_from_phone: false, screen: true };
+        let s = Settings { id: crate::crypto::new_id(), port: 0, relay: None, relay_from_phone: false, screen: true, go_between: true, stay_awake: true };
         self.save_settings(&s);
         s
     }
@@ -173,6 +266,7 @@ mod tests {
         let mut s = f.settings();
         assert_eq!(s.relay, None);
         assert!(s.screen);
+        assert!(s.go_between, "the go-between is on until the owner turns it off");
         let id = s.id.clone();
         s.relay = Some(None);
         f.save_settings(&s);
@@ -186,8 +280,50 @@ mod tests {
         assert_eq!(k.get("a"), Some(vec![1, 2, 3]));
         k.delete("a");
         assert_eq!(k.get("a"), None);
-        f.save_devices(&[Device { id: "x".into(), name: "Pixel".into(), added: 1, last_seen: None }]);
+        f.save_devices(&[Device {
+            id: "x".into(),
+            name: "Pixel".into(),
+            added: 1,
+            last_seen: None,
+            kind: DeviceKind::Phone,
+            alias: None,
+        }]);
         assert_eq!(f.devices().len(), 1);
+        // a phone's record says nothing of its kind; one from before kinds reads as a phone, a computer's says so
+        assert!(!std::fs::read_to_string(d.join("devices.json")).unwrap().contains("kind"));
+        std::fs::write(d.join("devices.json"), r#"[{"id":"a","name":"Pixel","added":1},{"id":"b","name":"Den PC","added":2,"kind":"computer"}]"#).unwrap();
+        let kinds: Vec<DeviceKind> = f.devices().iter().map(|d| d.kind).collect();
+        assert_eq!(kinds, [DeviceKind::Phone, DeviceKind::Computer]);
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn an_alias_is_kept_beside_the_name_and_old_records_load() {
+        let d = std::env::temp_dir().join(format!("blurt-remote-alias-{}", crate::crypto::new_id()));
+        let f = Files::new(&d);
+        // a devices.json from before aliases: no alias, its own name shows
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("devices.json"), r#"[{"id":"a","name":"Pixel 9","added":1,"lastSeen":5}]"#).unwrap();
+        let mut list = f.devices();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].alias, None);
+        assert_eq!(list[0].shown(), "Pixel 9");
+        // renamed here; saved and read again, the id and its own name untouched
+        list[0].alias = alias("  Kitchen phone ", &list[0].name);
+        f.save_devices(&list);
+        let mut list = f.devices();
+        assert_eq!((list[0].id.as_str(), list[0].name.as_str(), list[0].shown()), ("a", "Pixel 9", "Kitchen phone"));
+        // its hello names it again (greet): the name follows, the alias stays first
+        list[0].name = "Pixel 9 Pro".into();
+        assert_eq!(list[0].shown(), "Kitchen phone");
+        // empty, or its own name typed back: none, its own name shows
+        assert_eq!(alias("   ", "Pixel 9 Pro"), None);
+        assert_eq!(alias("Pixel 9 Pro", "Pixel 9 Pro"), None);
+        assert_eq!(alias(&"x".repeat(80), "y").map(|a| a.chars().count()), Some(64));
+        // a record without an alias writes none
+        list[0].alias = None;
+        f.save_devices(&list);
+        assert!(!std::fs::read_to_string(d.join("devices.json")).unwrap().contains("alias"));
         let _ = std::fs::remove_dir_all(d);
     }
 }

@@ -7,13 +7,25 @@ object RemoteRelay {
     const val PHONE_LEFT = 4000
     const val MAC_GONE = 4001
     const val REPLACED = 4002
+    /** the go-between closed it: past its budget for one connection (remote-go-between.md §The go-between server) */
+    const val BUDGET = 4003
+
+    /** Blurt's own go-between: free, best effort, and only for phones and hosts that move their stream (RemoteFeature.MOVE) */
+    const val GO_BETWEEN = "wss://meet.blurt.work"
+
+    /** The address is Blurt's go-between rather than a relay of the owner's own. */
+    fun isGoBetween(address: String?): Boolean {
+        val a = address?.let { address(it) } ?: return false
+        val host = a.substringAfter("://").substringBefore('/').substringAfterLast('@').substringBefore(':').lowercase()
+        return a.startsWith("wss://") && host == GO_BETWEEN.substringAfter("://")
+    }
 
     /** base64url(HMAC-SHA256(paired, "blurt-relay-room")), no padding: unguessable, and it says nothing about the pair. */
     fun room(key: ByteArray): String = RemoteCrypto.base64url(RemoteCrypto.hmac(key, "blurt-relay-room".toByteArray()))
 
     /**
-     * What someone typed, as the address to use: `relay.example.com` means wss://. null if it can't be one. `ws://` is allowed: what passes
-     * is sealed either way. No query or fragment; trailing slashes go.
+     * What someone typed, as the address to use: `relay.example.com` means wss://. null if it can't be one. `ws://` is allowed: the frames
+     * are sealed either way, though the address (with its secret) and the room travel in the clear. No query or fragment; trailing slashes go.
      */
     fun address(typed: String): String? {
         var t = typed.trim()
@@ -52,6 +64,9 @@ object RemoteRelay {
 object RemoteSTUN {
     const val SERVER = "stun.cloudflare.com"
     const val PORT = 3478
+    /** Asked together, the first answer taken, as every other Blurt does: Cloudflare's, and one that answers from mainland China, where
+     *  Cloudflare's doesn't. Wherever the user is, one of them does. */
+    val SERVERS = listOf("stun.cloudflare.com" to 3478, "stun.miwifi.com" to 3478)
     private val COOKIE = byteArrayOf(0x21, 0x12, 0xA4.toByte(), 0x42)
 
     fun newTransaction(): ByteArray = RemoteCrypto.random(12)

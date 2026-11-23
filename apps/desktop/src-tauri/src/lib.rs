@@ -8,9 +8,11 @@
 //! web/apps/overlays (the island, picker and note bubble).
 
 pub mod agents;
+pub mod capabilities;
 pub mod capture;
 pub mod control;
 pub mod dictation;
+pub mod draglog;
 pub mod folder_drop;
 pub mod hotkeys;
 pub mod housekeeping;
@@ -24,12 +26,16 @@ pub mod location;
 pub mod onboarding;
 pub mod paths;
 pub mod projects;
+pub mod recordings;
 pub mod remote; // Blurt on the phone: this computer as its host (crates/blurt-remote)
 pub mod screen_text;
 pub mod scripts;
 pub mod settings;
 pub mod setup;
+pub mod skill;
 pub mod tray;
+pub mod viewer; // one computer driving another: the list, pairing, a window per computer (crates/blurt-remote viewer.rs)
+pub mod viewer_keys;
 pub mod watcher;
 
 use std::sync::RwLock;
@@ -89,6 +95,11 @@ pub fn retitle(app: &AppHandle) {
 pub fn dispatch(app: &AppHandle, action: &str) {
     let st = app.state::<AppState>();
     let recording = st.capture.recording();
+    // an action of a capability that is off does nothing, whoever asks: a key, the tray, a deep link, a paired phone
+    // (capabilities.rs) — also on Wayland, where the portal's shortcuts stay bound until the next launch
+    if !capabilities::allows(action, &capabilities::off_now(), recording) {
+        return;
+    }
     let res = match action {
         "record" => {
             capture::toggle(app);
@@ -184,7 +195,8 @@ pub fn handle_url(app: &AppHandle, raw: &str) {
         "record" | "snap"
             if cfg!(windows)
                 && !app.get_webview_window("main").and_then(|w| w.is_focused().ok()).unwrap_or(false)
-                && !app.state::<AppState>().capture.recording() =>
+                && !app.state::<AppState>().capture.recording()
+                && capabilities::allows(&host, &capabilities::off_now(), false) =>
         {
             capture::confirm_from_url(app, &host)
         }
@@ -301,6 +313,13 @@ fn index_sessions(state: tauri::State<'_, AppState>, q: Option<SessionQuery>) ->
     state.index().sessions(&q.unwrap_or_default())
 }
 
+/// The newest recordings (video sessions) with their folder's facts: recordings.rs.
+#[tauri::command(async)]
+fn recordings_list(state: tauri::State<'_, AppState>, limit: Option<usize>) -> R<Vec<Value>> {
+    let live = state.capture.recording_session();
+    recordings::list(&state.index(), live.as_deref(), limit.unwrap_or(40).clamp(1, 500))
+}
+
 #[tauri::command(async)]
 fn index_summary(state: tauri::State<'_, AppState>) -> R<Value> {
     state.index().summary()
@@ -334,6 +353,13 @@ fn projects_use(app: AppHandle, state: tauri::State<'_, AppState>, id: String) -
 #[tauri::command(async)]
 fn projects_set(state: tauri::State<'_, AppState>, id: String, patch: Value) -> R<Value> {
     projects::set(&state.runner(), &id, &patch)
+}
+
+#[tauri::command(async)]
+fn projects_order(app: AppHandle, state: tauri::State<'_, AppState>, ids: Vec<String>) -> R<Value> {
+    let r = projects::order(&state.runner(), &ids)?;
+    island::refresh(&app);
+    Ok(r)
 }
 
 #[tauri::command]
@@ -396,6 +422,191 @@ fn items_undo_state(state: tauri::State<'_, AppState>, uids: Vec<String>, to: St
 #[tauri::command(async)]
 fn items_add(state: tauri::State<'_, AppState>, project: String, item: Value) -> R<Value> {
     items::add(&state.runner(), &project, &item)
+}
+
+// Drops on the main window (docs/design/drag-drop.md §4): files and text on an item, hanging cards from the island.
+
+/// Something dropped on an item: pictures as frames, other files referenced (or copied, from a temporary place),
+/// text after the details; `restore` (the "before" an earlier call returned): the Undo.
+#[tauri::command(async)]
+fn items_attach(state: tauri::State<'_, AppState>, uid: String, frames: Vec<String>, files: Vec<String>, text: Option<String>, restore: Option<Value>) -> R<Value> {
+    items::attach(&state.runner(), &uid, &frames, &files, text.as_deref(), restore.as_ref())
+}
+
+/// Dropped files' paths the page found itself (Linux: a file manager's text/uri-list): which are folders (projects,
+/// on the sidebar) — and each file may show as a thumbnail in New Item (the asset protocol may read it, that file
+/// only). An empty or relative path stays as it is ('' : no path).
+#[tauri::command(async)]
+fn drop_paths(app: AppHandle, paths: Vec<String>) -> Vec<Value> {
+    paths
+        .into_iter()
+        .map(|p| {
+            let path = std::path::Path::new(&p);
+            let ok = path.is_absolute() && path.exists();
+            let dir = ok && path.is_dir();
+            if ok && !dir {
+                let _ = app.asset_protocol_scope().allow_file(path);
+            }
+            json!({"path": if ok { p.as_str() } else { "" }, "dir": dir})
+        })
+        .collect()
+}
+
+/// Ctrl+V in the main window (drag-drop.md §0.6): what the system clipboard holds, read here — a page learns no file
+/// paths, WebKitGTK may give it no files at all, and only here can a document's copy (rich text with a picture of
+/// itself) or Blurt's own copy be told apart. → {images, files, text}: pictures and other files by path (a picture
+/// that came as data is written to a temporary PNG first), text only when nothing else came. Each file may then show
+/// as a thumbnail in New Item. Blurt's own copies and files in its own folders are never pasted back as files.
+#[tauri::command(async)]
+fn clipboard_things(app: AppHandle) -> Value {
+    use island::drop_in;
+    let read = island::clipboard_read();
+    let (rich, ours) = (read.rich, read.ours);
+    let c = drop_in::clipboard_pick(read, |p| p.is_dir(), drop_in::is_mine);
+    let mut images: Vec<String> = c.images.iter().map(|p| p.to_string_lossy().into_owned()).collect();
+    if let Some(png) = &c.png {
+        if let Ok(p) = items::save_temp_image("pasted.png", png) {
+            images.push(p);
+        }
+    }
+    let files: Vec<String> = c.files.iter().map(|p| p.to_string_lossy().into_owned()).collect();
+    for p in images.iter().chain(&files) {
+        let _ = app.asset_protocol_scope().allow_file(p);
+    }
+    json!({"images": images, "files": files, "text": c.text, "rich": rich, "ours": ours})
+}
+
+/// The main window's own drop and paste events for the drag log (draglog.rs; never their words).
+#[tauri::command]
+fn drag_log(event: Value) {
+    draglog::log(event);
+}
+
+/// The review page's "Show in folder" and its file rows (a frame, a recording, an item's attached file — the user's
+/// own PDF or video, anywhere on disk). Only a file the page was served is shown — one in Blurt's stores, or one a doc
+/// it loaded names (the Mac's `attached()`: the path is in the item's own file) — never any path a page asks for.
+/// `open`: opened in its default app (the detail's Space / Quick Look, Windows and Linux having none); a program or
+/// script is never run that way — it is shown in its folder instead. → "opened" | "revealed".
+#[tauri::command]
+fn review_file(app: AppHandle, state: tauri::State<'_, AppState>, path: String, open: Option<bool>) -> R<String> {
+    let p = std::path::Path::new(&path);
+    if !p.exists() {
+        return Err(format!("not found: {path}"));
+    }
+    if !(state.docs.listed(&path) || app.asset_protocol_scope().is_allowed(p)) {
+        return Err(format!("not a file of this item: {path}"));
+    }
+    if open.unwrap_or(false) && !runs_as_program(p) && !p.is_dir() {
+        open_path(app, path)?;
+        return Ok("opened".into());
+    }
+    app.opener().reveal_item_in_dir(&path).map_err(|e| e.to_string())?;
+    Ok("revealed".into())
+}
+
+/// A file that opening would run rather than show: a program, a script, a shortcut, an installer (Windows: by its
+/// extension; Linux: a .desktop launcher, an AppImage, or anything executable).
+fn runs_as_program(p: &std::path::Path) -> bool {
+    const RUNS: &[&str] = &[
+        "exe", "com", "bat", "cmd", "msi", "msix", "msp", "ps1", "psm1", "vbs", "vbe", "js", "jse", "wsf", "wsh", "hta", "scr", "pif",
+        "cpl", "msc", "lnk", "url", "reg", "jar", "appref-ms", "application", "gadget", "inf", "sh", "bash", "zsh", "run", "desktop",
+        "appimage", "command", "app", "py", "pyw", "pl", "rb",
+    ];
+    let ext = p.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+    if RUNS.contains(&ext.as_str()) {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if std::fs::metadata(p).map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0).unwrap_or(false) {
+            return true;
+        }
+    }
+    false
+}
+
+/// The item detail's "Add image or file…" (the review page's `host.addFiles`): the system's Open dialog, any files,
+/// then attached as a drop would be — pictures as frames (copied in), other files referenced where they are (copied
+/// when in a temporary place), folders not taken. Ok(None): cancelled or nothing to add; else items.py's {before,
+/// added} for the toast's Undo.
+#[tauri::command(async)]
+fn items_add_files(app: AppHandle, state: tauri::State<'_, AppState>, uid: String) -> R<Option<Value>> {
+    let picked: Vec<std::path::PathBuf> = tauri_plugin_dialog::DialogExt::dialog(&app)
+        .file()
+        .set_title(l10n::t("mainwin.add_files.title"))
+        .blocking_pick_files()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|f| f.into_path().ok())
+        .collect();
+    let (frames, files) = split_picked(&picked);
+    draglog::log(json!({"event": "item_add_files", "picked": picked.len(), "images": frames.len(), "files": files.len()}));
+    if frames.is_empty() && files.is_empty() {
+        return Ok(None);
+    }
+    let r = items::attach(&state.runner(), &uid, &frames, &files, None, None)?;
+    Ok(Some(r))
+}
+
+/// Picked files as a drop sorts them: pictures (frames) and other files (attachments); folders left out.
+fn split_picked(picked: &[std::path::PathBuf]) -> (Vec<String>, Vec<String>) {
+    let (mut frames, mut files) = (Vec::new(), Vec::new());
+    for p in picked.iter().filter(|p| !p.is_dir()) {
+        let s = p.to_string_lossy().into_owned();
+        if island::drop_in::is_picture(p) {
+            frames.push(s);
+        } else {
+            files.push(s);
+        }
+    }
+    (frames, files)
+}
+
+/// The main window's Cards page: the cards at the top of the screen now (`current`) and the ones used in other apps
+/// in the last 7 days (`history`), as the Cards panel shows them (capture.rs). Each card's `src` is an asset URL the
+/// main window loads as it is (the same scope as the island's). Nothing while Cards is off.
+#[tauri::command(async)]
+fn cards_list() -> Value {
+    if !capabilities::on_now(capabilities::Capability::Cards) {
+        return json!({"current": [], "history": []});
+    }
+    json!({"current": capture::load_card_values(), "history": capture::load_history()})
+}
+
+/// A card's action from the Cards page, as the Cards panel does it (island.rs on_action): copy | copy_text | remove |
+/// restore | reveal | putback. `cards://changed` follows a change.
+#[tauri::command]
+fn card_action(app: AppHandle, action: String, session: String, n: u64) -> R<()> {
+    if !["copy", "copy_text", "remove", "restore", "reveal", "putback"].contains(&action.as_str()) {
+        return Err(format!("unknown card action {action}"));
+    }
+    island::on_action(&app, &serde_json::json!({"action": format!("card.{action}"), "session": session, "n": n}));
+    Ok(())
+}
+
+/// The island cards of the drag under way (`[{session, n}]`), if it is one: the list asks as a drag of files enters.
+#[tauri::command(async)]
+fn cards_dragging() -> Option<Value> {
+    island::dragging_cards()
+}
+
+/// Hanging cards dropped on a project (the sidebar's row, or the list of a project): filed there.
+#[tauri::command(async)]
+fn cards_file(app: AppHandle, cards: Vec<Value>, project: String) {
+    island::cards_into_project(&app, &cards, &project);
+}
+
+/// Hanging cards dropped on an item: added to it, then taken. Ok(items.py's {before, added}) for the Undo.
+#[tauri::command(async)]
+fn cards_attach(app: AppHandle, state: tauri::State<'_, AppState>, cards: Vec<Value>, uid: String) -> R<Value> {
+    island::cards_into_item(&app, &state.runner(), &cards, &uid)
+}
+
+/// Undo of `cards_attach`: the cards hang again.
+#[tauri::command(async)]
+fn cards_put_back(app: AppHandle, cards: Vec<Value>) {
+    island::cards_put_back(&app, &cards);
 }
 
 /// The Save dialog (with the Mac's file name), then the bundle; Ok(None) when the dialog was cancelled.
@@ -461,9 +672,39 @@ fn save_temp_image(app: AppHandle, request: tauri::ipc::Request<'_>) -> R<String
     Ok(p)
 }
 
+/// The jobs: the running ones (`active`), or the newest 100 and every failed organising still waiting for a Retry or a
+/// Dismiss (`waiting: true`, a week: the Mac's JobFailures).
 #[tauri::command(async)]
 fn jobs_list(active: Option<bool>) -> Vec<Value> {
-    jobs::list(active.unwrap_or(false), 100)
+    if active.unwrap_or(false) {
+        jobs::list(true, 100)
+    } else {
+        jobs::list_for_window(100)
+    }
+}
+
+/// Organise this recording (or batch) now — the list's Organize, a failed job's Retry: Err("no_agent") when no agent
+/// can run in the background (no job then); the job already organising it, when there is one.
+#[tauri::command(async)]
+fn session_process(app: AppHandle, dir: String) -> R<()> {
+    let session = std::path::PathBuf::from(&dir);
+    if !session.is_dir() {
+        return Err("missing".into());
+    }
+    // a Retry of a run on some of a batch's captures: those captures again, where they were going
+    let me = paths::normalize(&session);
+    let last = jobs::list_for_window(500).into_iter().find(|j| {
+        j["type"] == "process" && j["waiting"] == json!(true) && j["session"].as_str().is_some_and(|s| paths::normalize(std::path::Path::new(s)) == me)
+    });
+    let captures: Option<Vec<u64>> = last.as_ref().and_then(|j| j["captures"].as_array()).map(|a| a.iter().filter_map(Value::as_u64).collect()).filter(|c: &Vec<u64>| !c.is_empty());
+    let project = captures.as_ref().and(last.as_ref()).and_then(|j| j["project"].as_str().map(str::to_owned));
+    agents::process(&app, &session, captures, project, None, None).map(|_| ())
+}
+
+/// Dismiss a failed job: it leaves the list (the jobs watcher sees the file change and says so).
+#[tauri::command(async)]
+fn job_dismiss(id: String) -> R<()> {
+    jobs::dismiss(&id)
 }
 
 #[tauri::command(async)]
@@ -471,10 +712,17 @@ fn agents_models(state: tauri::State<'_, AppState>, agent: String) -> R<Value> {
     agents::models(&state.runner(), &agent)
 }
 
-/// `login` false: no sign-in probes (fast); `ids`: only these agents.
+/// `login` false: no sign-in probes (fast); `ids`: only these agents; `fresh`: look for the agents' apps again
+/// (Check Again; else what was found in the last 10 minutes).
 #[tauri::command(async)]
-fn agents_detect(state: tauri::State<'_, AppState>, login: Option<bool>, ids: Option<Vec<String>>) -> R<Value> {
-    agents::detect_with(&state.runner(), login.unwrap_or(true), ids.as_deref())
+fn agents_detect(state: tauri::State<'_, AppState>, login: Option<bool>, ids: Option<Vec<String>>, fresh: Option<bool>) -> R<Value> {
+    agents::detect_fresh(&state.runner(), login.unwrap_or(true), ids.as_deref(), fresh.unwrap_or(false))
+}
+
+/// An agent can organise recordings in the background now (agents::ready: the full detect, cached).
+#[tauri::command(async)]
+fn agents_ready(state: tauri::State<'_, AppState>) -> R<bool> {
+    agents::ready(&state.runner())
 }
 
 /// K6: hand these items to the user's own agent — the sheet is written, the items are marked handed off, and the
@@ -534,6 +782,10 @@ fn settings_set(app: AppHandle, patch: Value) -> R<Value> {
     }
     if patch.pointer("/app/island_idle").is_some() {
         island::refresh(&app); // the resting pill goes or comes back at once
+    }
+    // a capability's switch (Settings' own dictation switch writes record.dictation.enabled): the app follows now
+    if patch.pointer("/record/dictation/enabled").is_some() || patch.pointer("/app/capabilities").is_some() || patch.get("app").is_some_and(Value::is_null) {
+        capabilities::changed(&app);
     }
     if patch.get("lang").is_some() {
         retitle(&app);
@@ -765,9 +1017,18 @@ fn test_channel(app: &AppHandle) {
 #[cfg(windows)]
 fn browser_ui_off(wv: &tauri::Webview) {
     let overlay = wv.label() != "main";
+    let island = wv.label() == blurt_capture::overlay::Kind::Island.label();
     let _ = wv.with_webview(move |p| unsafe {
-        use webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2Settings3;
+        use webview2_com::Microsoft::Web::WebView2::Win32::{ICoreWebView2Controller4, ICoreWebView2Settings3};
         use windows::core::Interface;
+        // the island (as big as the work area) is never a drop target: a file let go over a hanging card or the pill
+        // would vanish into it, and under its transparent parts other apps must get their drops. Another app's drops
+        // come in through the catcher over the notch (island_drop_win.rs).
+        if island {
+            if let Ok(c4) = p.controller().cast::<ICoreWebView2Controller4>() {
+                let _ = c4.SetAllowExternalDrop(false);
+            }
+        }
         let Ok(core) = p.controller().CoreWebView2() else { return };
         let Ok(settings) = core.Settings() else { return };
         if overlay {
@@ -822,6 +1083,10 @@ pub fn run() {
             let handle = app.handle().clone();
             hotkeys::mark_main_thread(); // hotkeys::apply runs here, whoever calls it
             retitle(&handle);
+            // the skill to $BLURT_HOME/skill before anything runs a script (skill.rs), and what agent-started runs
+            // read to match ours (setup::write_agent_env)
+            skill::sync_at_launch(handle.path().resource_dir().ok());
+            setup::write_agent_env();
             app.manage(AppState {
                 runner: RwLock::new(Runner::new(&handle)),
                 capture: capture::Capture::default(),
@@ -880,7 +1145,9 @@ pub fn run() {
                     eprintln!("blurt: dictation key not available: {e}");
                 }
             }
-            remote::start(&handle); // Blurt on the phone: idle until a code shows or a phone is paired
+            viewer::start(&handle); // the computers this one drives: nothing connects until a window opens
+            remote::start(&handle); // Blurt on the phone: idle until a code shows or a phone is paired (and off with Phone off)
+            capabilities::watch(&handle); // the switches, whoever writes them (capabilities.rs)
             housekeeping::start(&handle); // launch messages, housekeeping, the update check
             control::start(&handle); // Set Up with Agent…'s endpoint (agent-setup.md; run/control.json)
             test_channel(&handle);
@@ -896,6 +1163,14 @@ pub fn run() {
             }
             if matches!(ev, WindowEvent::ThemeChanged(_)) {
                 tray::retint(w.app_handle());
+            }
+            // a computer's window: keys only ever go to the one in front, and its session ends with it
+            if w.label().starts_with("viewer-") {
+                match ev {
+                    WindowEvent::Focused(f) => viewer::window_focused(w.label(), *f),
+                    WindowEvent::Destroyed => viewer::window_closed(w.label()),
+                    _ => {}
+                }
             }
             // closing the window keeps Blurt in the tray (hotkeys keep working); Quit is in the tray menu
             if let WindowEvent::CloseRequested { api, .. } = ev {
@@ -921,6 +1196,10 @@ pub fn run() {
             dictation::commands::dictation_dashscope_model,
             screen_text_allow,
             screen_text_allowed,
+            screen_text::history::screen_text_history,
+            screen_text::direction::translate_auto_pair,
+            screen_text::history::screen_text_history_delete,
+            screen_text::history::screen_text_history_clear,
             dictation::commands::dictation_key_forward,
             dictation::commands::dictation_words,
             dictation::commands::dictation_words_edit,
@@ -943,15 +1222,21 @@ pub fn run() {
             onboarding::login_item_get,
             onboarding::login_item_set,
             app_status,
+            capabilities::capabilities_get,
+            capabilities::capability_set,
+            cards_list,
+            card_action,
             index_query,
             index_item,
             index_sessions,
+            recordings_list,
             index_summary,
             index_rescan,
             projects_list,
             projects_add,
             projects_use,
             projects_set,
+            projects_order,
             projects_open_folder,
             projects_locate,
             items_doc,
@@ -961,6 +1246,16 @@ pub fn run() {
             items_move,
             items_undo_state,
             items_add,
+            items_attach,
+            items_add_files,
+            clipboard_things,
+            drag_log,
+            review_file,
+            cards_dragging,
+            drop_paths,
+            cards_file,
+            cards_attach,
+            cards_put_back,
             items_export_bundle,
             pick_images,
             projects_remove,
@@ -972,9 +1267,12 @@ pub fn run() {
             mainwin::items_drag_out_available,
             jobs_list,
             agents_detect,
+            agents_ready,
             agents_models,
             handoff_create,
             process_captures,
+            session_process,
+            job_dismiss,
             voice_start,
             voice_stop,
             settings_get,
@@ -1017,22 +1315,55 @@ pub fn run() {
             housekeeping::agents_registry,
             housekeeping::agents_install,
             housekeeping::agents_test,
+            housekeeping::agents_manual,
+            housekeeping::agents_custom,
+            housekeeping::mcp_clients,
+            housekeeping::skill_zip,
             housekeeping::feedback_send,
             control::agent_setup_instruction,
             control::agent_setup_state,
             control::agent_setup_stop,
             control::agent_setup_dismiss,
             control::agent_setup_answer,
-            // Blurt on the phone: Settings → Phone (docs/design/remote-protocol.md §The desktop app)
+            // Blurt on the phone: Settings → Remote Control (docs/design/remote-protocol.md §The desktop app)
             remote::remote_status,
             remote::remote_show_pairing,
+            remote::remote_pairing_link_copied,
             remote::remote_answer_pairing,
             remote::remote_remove_device,
+            remote::remote_rename_device,
             remote::remote_set_relay,
             remote::remote_check_relay,
             remote::remote_set_screen_allowed,
+            remote::remote_set_go_between,
+            remote::remote_set_stay_awake,
+            remote::remote_end_session,
+            remote::remote_connections,
+            remote::remote_set_service,
             remote::remote_relay_instructions,
             remote::remote_allow_firewall,
+            viewer::computers_status,
+            viewer::computers_browse,
+            viewer::computers_pair,
+            viewer::computers_cancel_pairing,
+            viewer::computers_retry_pairing,
+            viewer::computers_add_again,
+            viewer::computers_remove,
+            viewer::computers_rename,
+            viewer::computers_open,
+            viewer::viewer_attach,
+            viewer::viewer_screen,
+            viewer::viewer_pointer,
+            viewer::viewer_button,
+            viewer::viewer_scroll,
+            viewer::viewer_key,
+            viewer::viewer_capture,
+            viewer::viewer_options,
+            viewer::viewer_show_display,
+            viewer::viewer_privacy,
+            viewer::viewer_system,
+            viewer::viewer_send_files,
+            viewer::viewer_decode_failed,
         ])
         .build(tauri::generate_context!())
         .expect("error while building Blurt");

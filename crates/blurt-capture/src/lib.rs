@@ -15,9 +15,13 @@ pub mod region;
 pub mod status;
 #[cfg(windows)]
 pub mod wgc_win;
+pub mod winver;
 
 #[cfg(feature = "overlay")]
 pub mod overlay;
+/// Linux: a card's system drag out of the island (GTK)
+#[cfg(all(feature = "overlay", target_os = "linux"))]
+pub mod linux_dnd;
 
 pub use engine::{record, start, CaptureError, CaptureHandle, CaptureOptions, CaptureState, Launcher, Mic};
 pub use region::{CssRect, Region};

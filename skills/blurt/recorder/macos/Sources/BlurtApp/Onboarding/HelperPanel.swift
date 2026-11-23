@@ -313,6 +313,12 @@ struct HelperPanelView: View {
                 Text(T("settings.perm.restart_hint")).font(.system(size: 11)).foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true).padding(.top, 8)
             }
+            // the switch is on and nothing happened (the 12 s that bring the restart hint): maybe an older version's row
+            if k == .screen && g.suggestRestart && !g.reauthorize {
+                Button(T("settings.perm.screen.readd_action")) { g.readdScreen() }
+                    .buttonStyle(.borderless).font(.system(size: 11))
+                    .padding(.top, 8)
+            }
             // what's needed only sometimes: System Settings closed, or Screen Recording's restart
             let reopen = g.noWindow && !(k == .microphone && SystemAccess.state(.microphone) == .notAsked)
             if reopen || k == .screen {
@@ -371,7 +377,9 @@ struct HelperPanelView: View {
         .frame(minHeight: 44)
         .background(RoundedRectangle(cornerRadius: 8, style: .continuous).fill(Color.primary.opacity(0.04)))
         .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).strokeBorder(Color.primary.opacity(0.08), lineWidth: 0.5))
-        .accessibilityElement(children: .combine)
+        // the step's words and its control stay two elements (combined, step 3 read "…restart Blurt, Restart Blurt" and
+        // its button couldn't be reached on its own)
+        .accessibilityElement(children: .contain)
     }
 
     /// The step or the walk done: the ok disc (16 pt, the same check as everywhere) and one line, a quieter one under it.

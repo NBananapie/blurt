@@ -44,8 +44,9 @@ from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
+from _common import uv_bin  # noqa: E402
 from _common import (BLURT_HOME, MODELS_DIR, SERVE_IDLE, download_lock, load_json, save_json,  # noqa: E402
-                     server_exit, serve_exit_reason, serve_said, watch_parent)
+                     server_exit, serve_exit_reason, serve_said, watch_parent, disk_full)
 
 HERE = Path(__file__).parent
 RUN_DIR = BLURT_HOME / "run"
@@ -195,7 +196,7 @@ def ensure_vlm() -> None:
     if not supported():
         raise Fail("the OCR model needs Apple Silicon (MLX)", "unsupported", 4)
     import shutil
-    uv = shutil.which("uv") or str(BLURT_HOME / "bin" / "uv")
+    uv = uv_bin() or str(BLURT_HOME / "bin" / "uv")
     if os.environ.get("BLURT_SCREEN_TEXT_REEXEC") or not Path(uv).exists() or not sys.argv[0].endswith(".py"):
         raise Fail(f"mlx-vlm is not installed (run with: uv run --with {MLX_VLM_PACKAGE} {Path(sys.argv[0]).name} …)", "deps", 4)
     os.environ["BLURT_SCREEN_TEXT_REEXEC"] = "1"
@@ -531,11 +532,15 @@ def main():
          "eval": cmd_eval}[a.cmd](a)
     except Fail as e:
         print(f"ERROR: {e}", file=sys.stderr)
-        emit({"ok": False, "error": str(e), "code": e.code})
+        emit({"ok": False, "error": str(e), "code": "disk_full" if disk_full(e) else e.code})
         if a.cmd == "serve":
             server_exit(e.exit_code)
         sys.exit(e.exit_code)
-    except Exception:  # noqa: BLE001 — a server never goes through the interpreter's teardown (server_exit)
+    except Exception as e:  # noqa: BLE001 — a server never goes through the interpreter's teardown (server_exit)
+        if a.cmd == "setup" and disk_full(e):
+            print(f"ERROR: {e}", file=sys.stderr)
+            emit({"ok": False, "error": str(e)[:300], "code": "disk_full"})
+            sys.exit(1)
         if a.cmd != "serve":
             raise
         import traceback

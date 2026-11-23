@@ -17,6 +17,7 @@ ID is the agent's draft id (I-001) or a uid; "." means the session itself (title
   patch      REF | SESSION ID --set key=VALUE … [--unset key …] [--force]
              VALUE is JSON if it parses (list, object, number, true/false, "quoted"), else a plain string
   set-frames REF | SESSION ID PATH[@T][#CAPTION] … [--append]     PATH relative to SESSION, or absolute
+  attach REF [--frame PATH]… [--file PATH]… [--text T] [--restore JSON]   the user's drop on an item (Undo: --restore)
   done       SESSION                                   processing finished (the page stops saying "still working")
   get        REF | SESSION ID                          → {"item": {…}, "session": …}; every path absolute
   list       [SESSION] [--project P|inbox] [--kind K]… [--state S]…     (--status / --work / --fix-state: old names)
@@ -478,6 +479,80 @@ def parse_frame(spec: str) -> dict:
     return f
 
 
+def attach(ref: str, frames: list[str], files: list[str], text: str | None, restore: dict | None = None,
+           keep: list[str] | None = None) -> dict:
+    """The user added to an item by dropping something on it (v1.0.23, the main window): pictures become frames
+    (copied into assets/<uid>/), other files are referenced by absolute path in `attachments` (never copied: a PDF,
+    a video), text goes after its details. All of it is the user's own edit (_user). `restore`: the "before" an
+    earlier call returned — the Undo. Returns {"before": {frames, attachments, details}, "added": {...}}."""
+    import time  # noqa: PLC0415
+    path, _uid, into = locate(None, ref)
+    if path is None or into is not None:
+        fail(f"no item {ref}", "not_found")
+    keep = keep or []
+    for f in frames + keep:
+        if not os.path.isabs(f) or not Path(f).is_file():
+            fail(f"{f}: no such file", "not_found")
+    root = st.store_of_item(path).root
+    # the user's own pictures are copied, never hard-linked (link_or_copy would share the file with the original)
+    import tempfile  # noqa: PLC0415
+    tmp = Path(tempfile.mkdtemp(prefix="blurt-attach-"))
+    copies = []
+    for i, f in enumerate(frames):
+        c = tmp / f"{i}-{Path(f).name}"
+        shutil.copyfile(f, c)
+        copies.append(str(c))
+    now = round(time.time(), 1)
+
+    def fn(it):
+        before = {k: it.get(k) for k in ("frames", "attachments", "details")}
+        user = it.setdefault("_user", {})
+        if restore is not None:
+            for k in ("frames", "attachments", "details"):
+                if restore.get(k) is None:
+                    it.pop(k, None)
+                else:
+                    it[k] = restore[k]
+                user[k] = now
+            return {"ok": True, "id": it["id"], "uid": it["uid"], "restored": True, "before": before}
+        added = {}
+        if frames:
+            have = it.get("frames") or []
+            new = import_media(it, "frames", [{"path": f} for f in copies], None, root, allow_external=True)
+            known = {f.get("path") for f in have if isinstance(f, dict)}
+            new = [f for f in new if f["path"] not in known]
+            it["frames"] = have + new
+            user["frames"] = now
+            added["frames"] = [f["path"] for f in new]
+        kept = []
+        for f in keep:  # a file in a temporary place (a chat app's cache, /var/folders): a copy in assets/<uid>/
+            adir = media_path(root, str(_asset_dir(root, it["uid"]).relative_to(root)))
+            adir.mkdir(parents=True, exist_ok=True)
+            dst, n = adir / Path(f).name, 2
+            while dst.exists():  # its own name kept (the agent and the user read it), numbered if taken
+                dst, n = adir / f"{Path(f).stem}-{n}{Path(f).suffix}", n + 1
+            shutil.copyfile(f, dst)
+            kept.append(str(dst))
+        if files or kept:
+            have = [a for a in (it.get("attachments") or []) if isinstance(a, str)]
+            new = [a for a in [os.path.abspath(f) for f in files] + kept if a not in have]
+            it["attachments"] = have + new
+            user["attachments"] = now
+            added["attachments"] = new
+        if text and text.strip():
+            d = (it.get("details") or "").rstrip()
+            it["details"] = (d + "\n\n" if d else "") + text.strip()
+            user["details"] = now
+            added["details"] = text.strip()
+        if not added:
+            return {"ok": True, "id": it["id"], "uid": it["uid"], "added": {}, "before": before, "_write": False}
+        return {"ok": True, "id": it["id"], "uid": it["uid"], "added": added, "before": before}
+    try:
+        return mutate(path, fn)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def set_frames(session: Path | None, ref: str, frames: list[dict], append: bool, force: bool) -> dict:
     path, uid, into = locate(session, ref)
     redirected = None
@@ -879,6 +954,9 @@ def set_state(item: dict, state: str, given: dict, by: str, undo: bool = False, 
         if not hist:
             item.pop("work_history", None)
         return {**out, "work": item["work"]}
+    if undo and state not in WORK_TRACKED and not hist:
+        item.pop("work", None)  # ⌘Z on a first hand-off: back to new / to do as it was, with no hand-off record
+        return {**out, "work": None}
     given = {k: v for k, v in given.items() if v is not None}
     now = now_iso()
     if same and cur_work:
@@ -889,7 +967,11 @@ def set_state(item: dict, state: str, given: dict, by: str, undo: bool = False, 
         w = cur_work or {}
         carry = w if cur in ("handed_off", "in_progress", "to_verify") and state != "todo" else {}
         new = {"to": given.get("to") or carry.get("to"),
-               "agent": given.get("agent") or carry.get("agent") or ("human" if by == "user" else None),
+               # the user's own change is the user's ("human"), never credited to the agent that had the item; an
+               # agent's report keeps the agent it went to, but not the "human" of the user's hand-off (an external
+               # hand-off doesn't know which agent: no name beats a wrong one)
+               "agent": given.get("agent") or (carry.get("agent") if by != "user" and carry.get("agent") != "human"
+                                               else None) or ("human" if by == "user" else None),
                "job": given.get("job") or carry.get("job"), "handoff": given.get("handoff") or carry.get("handoff"),
                "claim": given.get("claim"), "note": given.get("note") or "",
                "commit": given.get("commit") or (carry.get("commit") if state != "in_progress" else None),
@@ -912,7 +994,9 @@ def legacy_status_target(cur: str, status: str) -> str | None:
 
 
 def change_state(session: Path | None, refs: list[str], state: str | None, action: str | None, given: dict,
-                 by: str, undo: bool = False) -> dict:
+                 by: str, undo: bool = False, only_from: str | None = None) -> dict:
+    """only_from: change only the items still in that state (the user's ⌘Z: the state its step left them in); the
+    rest are left as they are and listed in "kept" — an agent reported in between, and that report stays."""
     given = dict(given)
     given.setdefault("agent", None)
     if not given.get("agent") and os.environ.get("BLURT_AGENT") and by != "user":
@@ -935,7 +1019,9 @@ def change_state(session: Path | None, refs: list[str], state: str | None, actio
         if to is None:
             fail(f"{it.get('id')}: can't {action.replace('_', ' ')} an item that is {state_of(it)}", "bad_transition")
         return to
-    targets = []
+    if only_from is not None and only_from not in STATES:
+        fail(f"--from-state must be one of {', '.join(STATES)}", "bad_value")
+    targets, kept = [], []
     for ref in refs:
         path, uid, into = locate(session, ref)
         if path is None and into is None:
@@ -944,6 +1030,9 @@ def change_state(session: Path | None, refs: list[str], state: str | None, actio
             targets.append((ref, None, into))
             continue
         it = load(path)
+        if only_from is not None and state_of(it) != only_from:
+            kept.append({"uid": it.get("uid"), "id": it.get("id"), "state": state_of(it)})
+            continue
         set_state(json.loads(json.dumps(it)), target(it), given, by, undo)  # check every item before writing any
         targets.append((ref, path, into))
     out = []
@@ -954,7 +1043,7 @@ def change_state(session: Path | None, refs: list[str], state: str | None, actio
             continue
         out.append(mutate(path, lambda it: set_state(it, target(it), given, by, undo)))
         touch_batch(st.read_header(path))
-    return {"ok": True, "items": out}
+    return {"ok": True, "items": out, **({"kept": kept} if kept else {})}
 
 
 def fix(session: Path | None, ref: str, state: str, given: dict) -> dict:
@@ -1601,6 +1690,14 @@ def build_parser() -> Parser:
     s.add_argument("--set", action="append", default=[], metavar="KEY=VALUE")
     s.add_argument("--unset", action="append", default=[], metavar="KEY")
     s.add_argument("--force", action="store_true", help="overwrite fields the user edited (only if they asked)")
+    s = sub.add_parser("attach", help="the user added pictures / files / text to an item (a drop in the main window)")
+    s.add_argument("ref")
+    s.add_argument("--frame", action="append", default=[], metavar="PATH", help="a picture (absolute path): copied in")
+    s.add_argument("--file", action="append", default=[], metavar="PATH", help="any file: referenced, never copied")
+    s.add_argument("--text")
+    s.add_argument("--keep", action="append", default=[], metavar="PATH",
+                   help="a file in a temporary place: copied into the item's assets, then referenced")
+    s.add_argument("--restore", metavar="JSON", help="undo: the 'before' a previous attach returned")
     s = sub.add_parser("set-frames")
     s.add_argument("target", nargs="+", metavar="REF | SESSION ID, then PATH[@T][#CAPTION] …")
     s.add_argument("--append", action="store_true")
@@ -1619,6 +1716,7 @@ def build_parser() -> Parser:
     g.add_argument("--state", choices=list(STATES))
     g.add_argument("--action", choices=list(ACTIONS))
     s.add_argument("--undo", action="store_true", help=argparse.SUPPRESS)  # the user takes back their last change
+    s.add_argument("--from-state", choices=list(STATES), help=argparse.SUPPRESS)  # ⌘Z: only items still in this state
     s.add_argument("--to", choices=["session", "external"])
     s.add_argument("--agent")
     s.add_argument("--job")
@@ -1721,6 +1819,8 @@ def run(a) -> dict:
         out = patch(path, sets, a.unset, a.force, session)
         touch_batch(st.read_header(path))
         return out
+    if a.cmd == "attach":
+        return attach(a.ref, a.frame, a.file, a.text, json.loads(a.restore) if a.restore else None, a.keep)
     if a.cmd == "set-frames":
         session, rest = target_of(a.target)
         if session is not None:
@@ -1741,7 +1841,7 @@ def run(a) -> dict:
             fail(f"{a.cmd}: expected REF …")
         given = {"to": a.to, "agent": a.agent, "job": a.job, "handoff": a.handoff, "claim": a.claim,
                  "commit": a.commit, "pr": a.pr, "note": a.note}
-        return change_state(session, refs, a.state, a.action, given, a.by, a.undo)
+        return change_state(session, refs, a.state, a.action, given, a.by, a.undo, a.from_state)
     if a.cmd == "move":
         session, refs = target_of(a.target)
         return move(session, refs, a.project, a.only_from)

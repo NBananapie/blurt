@@ -1,6 +1,373 @@
 {
   "sourceLanguage" : "en",
   "strings" : {
+    "Actual Size" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "实际大小"
+          }
+        }
+      }
+    },
+    "Black Screen" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "黑屏"
+          }
+        }
+      }
+    },
+    "Bold" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "加粗"
+          }
+        }
+      }
+    },
+    "Clear" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "清除"
+          }
+        }
+      }
+    },
+    "Design" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "设计"
+          }
+        }
+      }
+    },
+    "Duplicate" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "复制一份"
+          }
+        }
+      }
+    },
+    "Edit Cell" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "编辑单元格"
+          }
+        }
+      }
+    },
+    "Empty" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "空白"
+          }
+        }
+      }
+    },
+    "Exit Full Screen" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "退出全屏"
+          }
+        }
+      }
+    },
+    "Fill" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "填充"
+          }
+        }
+      }
+    },
+    "Full Screen" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "全屏"
+          }
+        }
+      }
+    },
+    "Group" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "编组"
+          }
+        }
+      }
+    },
+    "Italic" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "斜体"
+          }
+        }
+      }
+    },
+    "Next Sheet" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "下一张表"
+          }
+        }
+      }
+    },
+    "One finger up or down the thumb-side edge" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "单指沿拇指一侧边缘上下滑"
+          }
+        }
+      }
+    },
+    "Paste as Plain Text" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "纯文本粘贴"
+          }
+        }
+      }
+    },
+    "Pinch with Ctrl held" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "按着 Ctrl 捏合"
+          }
+        }
+      }
+    },
+    "Pinch with ⌘ held" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "按着 ⌘ 捏合"
+          }
+        }
+      }
+    },
+    "Play" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "播放"
+          }
+        }
+      }
+    },
+    "Play from Here" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "从当前页播放"
+          }
+        }
+      }
+    },
+    "Presenting" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "演示"
+          }
+        }
+      }
+    },
+    "Previous Sheet" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "上一张表"
+          }
+        }
+      }
+    },
+    "Privacy Policy" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "隐私政策"
+          }
+        }
+      }
+    },
+    "Project" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "投影"
+          }
+        }
+      }
+    },
+    "Scroll at the pointer" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "在光标处滚动"
+          }
+        }
+      }
+    },
+    "Spreadsheet" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "表格"
+          }
+        }
+      }
+    },
+    "Support" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "支持"
+          }
+        }
+      }
+    },
+    "template.writing" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Writing"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "写作"
+          }
+        }
+      }
+    },
+    "Two fingers scroll · Pinch with Ctrl held zooms the computer" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "两指滑动可滚动 · 按着 Ctrl 捏合缩放电脑上的内容"
+          }
+        }
+      }
+    },
+    "Two fingers scroll · Pinch with ⌘ held zooms the Mac" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "两指滑动可滚动 · 按着 ⌘ 捏合缩放 Mac 上的内容"
+          }
+        }
+      }
+    },
+    "Underline" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "下划线"
+          }
+        }
+      }
+    },
+    "Ungroup" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "取消编组"
+          }
+        }
+      }
+    },
+    "With the keys put away in landscape, esc, delete and return stay by the thumb." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "横屏收起按键后，esc、删除和回车留在拇指边。"
+          }
+        }
+      }
+    },
+    "Zoom on the computer" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "缩放电脑上的内容"
+          }
+        }
+      }
+    },
+    "Zoom on the Mac" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "缩放 Mac 上的内容"
+          }
+        }
+      }
+    },
+    "Zoom to Fit" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "适合窗口"
+          }
+        }
+      }
+    },
     "⌘ on This Keyboard" : {
       "localizations" : {
         "zh-Hans" : {
@@ -31,32 +398,12 @@
         }
       }
     },
-    "%@ no longer knows this iPhone." : {
-      "localizations" : {
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "%@ 已不再认识这台 iPhone。"
-          }
-        }
-      }
-    },
     "%@ · Direct" : {
       "localizations" : {
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "%@ · 直连"
-          }
-        }
-      }
-    },
-    "%@ · Internet" : {
-      "localizations" : {
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "%@ · 外网"
           }
         }
       }
@@ -196,7 +543,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "请在电脑上 Blurt 的设置中允许这台 iPhone，并确认显示的数字为 %@。"
+            "value" : "在电脑上 Blurt 的设置里允许这台 iPhone，确认两边的数字都是 %@。"
           }
         }
       }
@@ -211,12 +558,12 @@
         }
       }
     },
-    "Another phone is connected. Touch to take over." : {
+    "Another phone is connected" : {
       "localizations" : {
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "另一台设备已连接。轻点以接管。"
+            "value" : "另一台手机已连接"
           }
         }
       }
@@ -226,7 +573,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "另一台设备正在使用"
+            "value" : "另一台手机正在用"
           }
         }
       }
@@ -387,26 +734,6 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "取消"
-          }
-        }
-      }
-    },
-    "Can’t reach %@. Check that Blurt is running and both are on the same network." : {
-      "localizations" : {
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "无法连接 %@。请检查 Blurt 是否在运行，以及两台设备是否在同一网络。"
-          }
-        }
-      }
-    },
-    "Can’t reach %@. Check that it’s awake and Blurt is running." : {
-      "localizations" : {
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "连不上 %@。请确认 Mac 没有休眠，Blurt 正在运行。"
           }
         }
       }
@@ -667,26 +994,6 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "终端里复制"
-          }
-        }
-      }
-    },
-    "Couldn’t reach %@. Put this iPhone on the same network, or set a relay on that computer first." : {
-      "localizations" : {
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "连不上 %@。请让 iPhone 和它在同一网络，或先在那台电脑上设置中转。"
-          }
-        }
-      }
-    },
-    "Couldn’t reach %@. Scan a fresh code on that computer." : {
-      "localizations" : {
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "连不上 %@。请在那台电脑上重新扫码。"
           }
         }
       }
@@ -1426,7 +1733,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "请在 Mac 上为 Blurt 开启辅助功能。"
+            "value" : "在 Mac 的系统设置里给 Blurt 打开辅助功能。"
           }
         }
       }
@@ -1436,27 +1743,17 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "请在 Mac 上为 Blurt 开启屏幕录制。"
+            "value" : "在 Mac 的系统设置里给 Blurt 打开屏幕录制。"
           }
         }
       }
     },
-    "On your computer, open Blurt’s Settings and choose Phone." : {
+    "On your computer, open Blurt’s Remote Control page and choose Add Device." : {
       "localizations" : {
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "在电脑上打开 Blurt 设置，选择“手机”。"
-          }
-        }
-      }
-    },
-    "One finger along the edge" : {
-      "localizations" : {
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "单指沿边缘滑动"
+            "value" : "在电脑上打开 Blurt 的「远程控制」页，点「添加设备…」。"
           }
         }
       }
@@ -2531,12 +2828,12 @@
         }
       }
     },
-    "Use iPhone Microphone" : {
+    "Use This Device’s Microphone" : {
       "localizations" : {
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "使用 iPhone 麦克风"
+            "value" : "使用本机麦克风"
           }
         }
       }
@@ -2576,7 +2873,7 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "语音便签"
+            "value" : "语音备注"
           }
         }
       }
@@ -2587,16 +2884,6 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "切换窗口"
-          }
-        }
-      }
-    },
-    "With the keys put away in landscape, esc, return and space stay, or the keys in their places." : {
-      "localizations" : {
-        "zh-Hans" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "横屏收起按键后，esc、return 和空格仍会显示，或放在这三个位置上的键。"
           }
         }
       }
@@ -2771,6 +3058,106 @@
         }
       }
     },
+    "Can’t control %@" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "无法控制 %@"
+          }
+        }
+      }
+    },
+    "Can’t reach %@" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "连不上 %@"
+          }
+        }
+      }
+    },
+    "Can’t show the screen" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "无法显示屏幕"
+          }
+        }
+      }
+    },
+    "Check that Blurt is running and both are on the same network. To connect from anywhere, set a relay in Blurt’s Settings → Remote Control on the computer." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "确认 Blurt 在运行，两台设备在同一网络。\n要在外面连，先在电脑上设置中转。"
+          }
+        }
+      }
+    },
+    "Check that the computer isn’t asleep and Blurt is running." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "确认电脑没有进入睡眠，Blurt 在运行。"
+          }
+        }
+      }
+    },
+    "Connected to %@" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "已连接 %@"
+          }
+        }
+      }
+    },
+    "Pair with your computer" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "与电脑配对"
+          }
+        }
+      }
+    },
+    "Pairing didn’t work" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "配对没有成功"
+          }
+        }
+      }
+    },
+    "Reconnecting to %@…" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "正在重新连接 %@…"
+          }
+        }
+      }
+    },
+    "Retry" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "重试"
+          }
+        }
+      }
+    },
     "Slide here to move the pointer" : {
       "localizations" : {
         "zh-Hans" : {
@@ -2787,6 +3174,276 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "点 %@ 显示屏幕"
+          }
+        }
+      }
+    },
+    "Touch to take over." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "轻点这里，换成这台手机。"
+          }
+        }
+      }
+    },
+    "Waiting for your computer" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "等待电脑确认"
+          }
+        }
+      }
+    },
+    "%@ · Tailscale" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@ · Tailscale"
+          }
+        }
+      }
+    },
+    "Can’t connect directly. Set up your own relay on the computer." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "无法直连。请在电脑上设置自建中转。"
+          }
+        }
+      }
+    },
+    "Its own relay isn’t responding. Trying the public connection service…" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "对方的自建中转无响应，正在改用公共连接服务…"
+          }
+        }
+      }
+    },
+    "Someone at %@ ended the connection." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@ 那边断开了连接。"
+          }
+        }
+      }
+    },
+    "Touch to reconnect." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "轻点这里重新连接。"
+          }
+        }
+      }
+    },
+    "Ended at the computer" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "对方已断开"
+          }
+        }
+      }
+    },
+    "The public connection service has reached today’s limit. Try again later, or use your own relay." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "公共连接服务今日已达上限。请稍后再试，或使用自建中转。"
+          }
+        }
+      }
+    },
+    "%@ · Virtual network" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@ · 虚拟局域网"
+          }
+        }
+      }
+    },
+    "%@ · Public connection service" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@ · 公共连接服务"
+          }
+        }
+      }
+    },
+    "%@ · Own relay" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@ · 自建中转"
+          }
+        }
+      }
+    },
+    "Connected · Tailscale" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "已连接 · Tailscale"
+          }
+        }
+      }
+    },
+    "Connected · Virtual network" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "已连接 · 虚拟局域网"
+          }
+        }
+      }
+    },
+    "Connected · Public connection service" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "已连接 · 公共连接服务"
+          }
+        }
+      }
+    },
+    "Uses the public connection service" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "使用公共连接服务"
+          }
+        }
+      }
+    },
+    "Public connection service" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "公共连接服务"
+          }
+        }
+      }
+    },
+    "Free, with no guarantee. If a network can’t connect directly, set up your own relay." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "免费，不保证可用。无法直连时，请设置自建中转。"
+          }
+        }
+      }
+    },
+    "This code has expired or was already used." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "这个二维码已过期或已被用过。"
+          }
+        }
+      }
+    },
+    "On %@, open Add Device and scan the code it shows now." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "请在 %@ 上打开“添加设备”，扫描它现在显示的二维码。"
+          }
+        }
+      }
+    },
+    "No one answered on %@ in time." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@ 那边没有人及时回应。"
+          }
+        }
+      }
+    },
+    "Pairing stopped when Blurt left the screen." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "口喷鸡离开了屏幕，配对已停止。"
+          }
+        }
+      }
+    },
+    "Can’t reach %@." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "连不上 %@。"
+          }
+        }
+      }
+    },
+    "Make sure %@ is on and Blurt is open there." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "请确认 %@ 已开机，并且打开了口喷鸡。"
+          }
+        }
+      }
+    },
+    "Put this iPhone and the computer on the same network. To connect from anywhere, set a relay in Blurt’s Settings → Remote Control on the computer first." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "确认两台设备在同一网络；要在外面连，先在电脑上设置中转。"
+          }
+        }
+      }
+    },
+    "%@ removed this iPhone." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@ 已移除这台 iPhone。"
+          }
+        }
+      }
+    },
+    "Removed this iPhone" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "已移除这台 iPhone"
           }
         }
       }

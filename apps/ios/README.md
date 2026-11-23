@@ -41,7 +41,8 @@ the test variables) and run it with `BLURT_TEST_COMMANDS=1 BLURT_TEST_REMOTE=1`.
 (`remote_pairing`) and every input event (`remote_input`) instead of posting them; open the link with `xcrun simctl openurl`.
 `BLURT_TEST_REMOTE_POST=1` posts them for real. On the phone side, `SIMCTL_CHILD_BLURT_REMOTE_TEST_WAV=clip.wav` stands in for the mic, and
 `SIMCTL_CHILD_BLURT_REMOTE_TEST_HOST=windows` (or `linux`, `mac`) shows that kind of computer as connected, with no connection, among three of
-mixed kinds: for looking at its keys and words (debug builds only; nothing is saved).
+mixed kinds: for looking at its keys and words (debug builds only; nothing is saved). `SIMCTL_CHILD_BLURT_REMOTE_TEST_AWAY=nodirect` (or
+`busy`) shows the card for a session the public connection service couldn't carry, connecting nowhere (docs/design/remote-go-between.md).
 
 `SIMCTL_CHILD_BLURT_REMOTE_PAIR=<link>` pairs with that code at launch, as the in-app scanner would (no tap needed), and
 `SIMCTL_CHILD_BLURT_DISPLAY_TEST=1` then walks the display switcher on its own, logging each step on the computer (docs/design/remote.md
@@ -56,3 +57,8 @@ debug builds only, each with the `SIMCTL_CHILD_` prefix. On the Mac, `BLURT_SCRE
 Layout without a computer (debug builds): `SIMCTL_CHILD_BLURT_REMOTE_PRETEND=1` lights the keys as if connected, `=screen` also shows a
 made-up desktop where the picture goes, and `SIMCTL_CHILD_BLURT_REMOTE_PRETEND_DISPLAYS=1` adds a second display for the switcher. `TEST_RUNNER_BLURT_RENDER_DIR=<folder>` makes `RenderTests` draw the main screen at every iPad
 and iPhone Duo size and fold into that folder (docs/design/remote.md §iPad and iPhone Duo).
+
+What the pad says when the connection isn't there (docs/design/remote.md §What the pad says), without a Mac: Android's fake computer speaks the
+same wire. `./gradlew :fakehost:installDist` in `apps/android`, run `fakehost/build/install/fakehost/bin/fakehost --address 127.0.0.1`, and pair
+the simulator with the link it prints (`SIMCTL_CHILD_BLURT_REMOTE_PAIR`). Stop it to see "Reconnecting…" and then "Can't reach…"; start it again
+and the phone comes back by itself. `TEST_RUNNER_BLURT_RENDER_DIR` also makes `LinkStatusTests` draw every card (`-testLanguage en` or `zh-Hans`).

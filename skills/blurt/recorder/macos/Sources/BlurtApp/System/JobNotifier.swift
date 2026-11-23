@@ -7,6 +7,8 @@
 //   • Nothing at all while recording (the counts still update).
 //   • Failures: a line with the reason, a notification when not frontmost.
 //   • The same kind of notification within 10 s collapses into one.
+//   • Jobs and items are Recording & Items' (BlurtCore Capabilities): with it off nothing is said — no line, no
+//     notification — and the badge is empty; its 2 s timer doesn't read the index.
 import AppKit
 import BlurtCore
 import UserNotifications
@@ -52,12 +54,18 @@ final class JobNotifier: NSObject, UNUserNotificationCenterDelegate {
     func setting(_ key: String) -> Bool { Config.shared["notify.\(key)"] as? Bool ?? true }
 
     private func event(_ j: Job, before: String?) {
-        guard !recording else { return }
+        guard !recording, Capability.recording.isOn else { return }
         let ran = (j.ended ?? Date()).timeIntervalSince(j.started ?? j.created)
         switch (j.type, j.state) {
         case (.process, .done), (.route, .done):
             // a capture filed from its note (no agent) already said "Filed to …" in the island
             if let u = j.usage, u.agent == nil { MenuGlyph.shared.done(); return }
+            // a capture organized into nothing: said so (the Windows/Linux island says the same), Show = the job
+            if j.session != nil, j.items.isEmpty {
+                quiet(T("notify.done.none"), action: T("notify.show"), art: .done) { AppEnvironment.mainWindow?.reveal(job: j.id) }
+                MenuGlyph.shared.done()
+                return
+            }
             let n = j.items.isEmpty ? nil : j.items.count
             // a recording says where its items are (BA-61): "Organized into Atlas Web · 5 new", Open = that batch
             let what = j.session.map { isShotsSession($0) ? T("notify.done.snaps")
@@ -164,11 +172,12 @@ final class MenuBadge {
     private var version = -1
     private var timer: Timer?
 
-    var count: Int { testCount ?? new + verify }
+    var count: Int { testCount ?? (Capability.recording.isOn ? new + verify : 0) }
     /// Tests only (the `menuglyph` self-test): a stand-in count, to render the status button with a number.
     var testCount: Int?
     var tooltip: String {
         var parts: [String] = []
+        guard Capability.recording.isOn else { return T("app.name") }
         if new > 0 { parts.append(TP("app.menu.new", new)) }
         if verify > 0 { parts.append(TP("app.menu.to_verify", verify)) }
         return parts.isEmpty ? T("app.name") : parts.joined(separator: " · ")
@@ -179,6 +188,11 @@ final class MenuBadge {
     }
 
     func refresh() {
+        // items are Recording & Items': off, nothing is counted (and read again from scratch when it comes back)
+        guard Capability.recording.isOn else {
+            if version != -1 { version = -1; new = 0; verify = 0 }
+            return
+        }
         if reader == nil { reader = try? IndexReader(url: BlurtPaths.indexDB) }
         if let r = reader {
             let v = r.dataVersion

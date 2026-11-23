@@ -54,10 +54,29 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSToolba
         return p
     }
     var dictationIfLoaded: DictationPage? { page }
+    /// The pages that take the whole content area (the detail column steps aside): Home, Cards, Phone — each made on
+    /// first use (HomePage.swift, CardsPage.swift, PhonePage.swift).
+    private var fullPages: [Scope: FullPage] = [:]
+    func fullPage(_ s: Scope) -> FullPage? {
+        if let p = fullPages[s] { return p }
+        let p: FullPage
+        switch s {
+        case .home: p = HomePage()
+        case .cards: p = CardsPage()
+        case .phone: p = PhonePage()
+        case .screenText: p = ScreenTextPage()
+        default: return nil
+        }
+        fullPages[s] = p
+        return p
+    }
+    private var shownFullPage: FullPage?
     private var entriesWatch: AnyCancellable?
     /// The search field of the list on show: the items' (their heading's) or the Dictation history's.
     var searchField: NSSearchField? {
-        model.scope == .dictation ? (dictation.model.tab == .history ? dictation.search : nil) : list.heading.search
+        if model.scope == .dictation { return dictation.model.tab == .history ? dictation.search : nil }
+        if model.scope == .cards { return (fullPage(.cards) as? CardsPage)?.search }
+        return model.scope.isPage ? nil : list.heading.search
     }
     var watcher: IndexWatcher?
     var watchedRoots: [String] = []
@@ -90,8 +109,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSToolba
         w.tabbingMode = .disallowed
         w.titlebarSeparatorStyle = .automatic
         w.toolbarStyle = .unified
-        // the place's name is ours: the list's heading (ListHeading), which keeps its weight in a window that isn't
-        // key — the title still names the window (Window menu, Mission Control); the Dictation page's is a bar item
+        // the place's name is ours: the list's heading (ListHeading, DictationPageHeader) or the page's own, which keep
+        // their weight in a window that isn't key — the title still names the window (Window menu, Mission Control)
         w.titleVisibility = .hidden
         w.collectionBehavior.insert(.fullScreenPrimary)
         w.delegate = self
@@ -101,13 +120,16 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSToolba
         }
 
         let side = NSSplitViewItem(sidebarWithViewController: sidebar)
-        side.minimumThickness = 190
+        // every built-in place's name whole (SidebarController.minimumWidth: 197 pt in English, 190 in Chinese); the
+        // detail column gives up what the sidebar takes over 190, so the window's minimum stays 900 pt
+        let sideMin = SidebarController.minimumWidth
+        side.minimumThickness = sideMin
         side.maximumThickness = 320
         side.canCollapse = true
         let content = NSSplitViewItem(contentListWithViewController: listColumn)
         content.minimumThickness = 330     // 190 + 330 + 380 = the window's 900 pt minimum
         let det = NSSplitViewItem(viewController: detailColumn)
-        det.minimumThickness = 380
+        det.minimumThickness = 380 - (sideMin - 190)
         det.canCollapse = true
         det.holdingPriority = .init(249)
         split.addSplitViewItem(side)
@@ -150,6 +172,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSToolba
         }
         model.onSidebar = { [weak self] in self?.sidebar.rebuild(); self?.updateWatcher() }
         model.onJobs = { [weak self] in self?.list.reloadJobs() }
+        // whether an agent can organise decides a recording's action (Organize, or Set Up an Agent…)
+        RecordingLook.refresh { [weak self] in self?.list.reloadJobs() }
         model.onIndexState = { [weak self] in
             guard let self = self else { return }
             self.list.reload()
@@ -177,6 +201,15 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSToolba
         NotificationCenter.default.addObserver(forName: NSApplication.willTerminateNotification, object: nil, queue: .main) { [weak self] _ in
             self?.saveState(open: self?.window?.isVisible == true)
         }
+        // the Cards place's count is the cards hanging under the notch
+        NotificationCenter.default.addObserver(forName: .blurtCardsChanged, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { if self?.restored == true { self?.sidebar.rebuild() } }
+        }
+        // a capability turned on or off (Home's tiles, Settings → General): its place comes or goes in the sidebar, the
+        // toolbar and the menus follow, and a window standing in a place that just went away goes Home
+        NotificationCenter.default.addObserver(forName: Capability.didChange, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.capabilitiesChanged() }
+        }
     }
     required init?(coder: NSCoder) { fatalError() }
 
@@ -186,7 +219,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSToolba
     /// window that finds no index starts reading one by itself — there is nothing to ask.
     func syncIndexChrome() {
         let f = list.heading.search
-        guard model.scope != .dictation else { return }
+        guard !model.scope.isPage else { return }
         let ready = !model.nothingListed
         if f.isEnabled != ready {
             if !ready, window?.firstResponder === f.currentEditor() { window?.makeFirstResponder(list.table) }
@@ -204,6 +237,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSToolba
         window?.makeKeyAndOrderFront(nil)
         window?.orderFrontRegardless()
         if model.scope == .dictation { dictation.didShow() }
+        shownFullPage?.didShow()
         if window?.firstResponder == nil || window?.firstResponder === window { focusList() }
     }
 
@@ -231,30 +265,91 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSToolba
                     self.window?.makeFirstResponder(t)
                 }
             }
+        } else if let p = shownFullPage, model.scope.isPage {
+            window?.makeFirstResponder(p.viewController.view)
         } else {
             window?.makeFirstResponder(list.table)
         }
     }
 
+    func capabilitiesChanged() {
+        guard restored else { return }
+        if let c = model.scope.capability, !c.isOn { go(.home) }
+        sidebar.rebuild()
+        sidebar.select(model.scope)
+        syncToolbar(for: model.scope)
+        if NSApp.activationPolicy() == .regular { NSApp.mainMenu = MainMenu.build() }
+    }
+
+    /// Home (⌘0, the Go menu, the palette, a capability turned off under the place on show).
+    func showHome() {
+        show()
+        go(.home)
+    }
+
+    /// The app the user was in when ⌥H brought the window forward, and whether the window was showing then: ⌥H again
+    /// hands the keyboard back to that app and, if ⌥H opened the window, closes it again.
+    private var cardsCameFrom: (app: NSRunningApplication?, opened: Bool)?
+
+    /// The Cards page (the menu bar's Show Cards, the island's cards row, Home): the window forward on it.
+    func showCards() {
+        show()
+        go(.cards)
+        focusList()
+    }
+
+    /// ⌥H: the window forward on the Cards page — or, when it is in front on that page already, away again, the
+    /// keyboard back in the app the user was in (BlurtCore CardsPageRules.hotkey).
+    func toggleCards(via: String) { toggleCards(via: via, assumeKey: nil) }
+
+    /// `assumeKey`: tests, the window counted as in front (a scripted run can't take the keyboard from the user's app).
+    func toggleCards(via: String, assumeKey: Bool?) {
+        let key = assumeKey ?? (window?.isKeyWindow == true && NSApp.isActive)
+        let act = CardsPageRules.hotkey(windowKey: key, onCards: model.scope == .cards)
+        switch act {
+        case .open:
+            let front = NSWorkspace.shared.frontmostApplication
+            let other = front.flatMap { $0.processIdentifier == getpid() ? nil : $0 }
+            cardsCameFrom = (other, window?.isVisible != true)
+            showCards()
+        case .hide:
+            let from = cardsCameFrom
+            cardsCameFrom = nil
+            // opened by ⌥H (or nothing known of how it came): it closes, as the window's close button would; it was
+            // showing already: it stays where it was, behind the app the keyboard goes back to
+            if from?.opened ?? true { window?.close() }
+            if let app = from?.app, !app.isTerminated { app.activate() }
+        }
+        emit(["event": "cards_hotkey", "via": via, "action": act == .open ? "open" : "hide", "was_key": key,
+              "visible": window?.isVisible == true, "scope": "\(model.scope)"])
+    }
+
     /// The columns follow the scope: the Dictation page in place of the items and their detail (each list with its own
     /// search field), and the toolbar without the items' actions there.
     func syncPage() {
-        let on = model.scope == .dictation
-        let showing = listColumn.current !== list
-        guard on != showing else { return }
-        syncToolbar(dictation: on)
-        if on {
+        let scope = model.scope
+        let full = fullPage(scope)
+        let want: NSViewController = scope == .dictation ? dictation.list : full?.viewController ?? list
+        guard listColumn.current !== want else { return }
+        if listColumn.current === page?.list { page?.didHide() }
+        shownFullPage?.didHide()
+        shownFullPage = full
+        syncToolbar(for: scope)
+        if scope == .dictation {
             let p = dictation
             p.search.delegate = self
             listColumn.show(p.list)
             detailColumn.show(p.detail)
             p.didShow()
-            if QLPreviewPanel.sharedPreviewPanelExists(), QLPreviewPanel.shared().isVisible { QLPreviewPanel.shared().orderOut(nil) }
+        } else if let f = full {
+            listColumn.show(f.viewController)
+            detailColumn.show(detail)
+            f.didShow()
         } else {
-            page?.didHide()
             listColumn.show(list)
             detailColumn.show(detail)
         }
+        if scope.isPage, QLPreviewPanel.sharedPreviewPanelExists(), QLPreviewPanel.shared().isVisible { QLPreviewPanel.shared().orderOut(nil) }
     }
 
     /// Tests and the search field: the Dictation page's search.
@@ -278,15 +373,91 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSToolba
     /// …holding what ⌘V or a drop on the list brought (BA-52).
     func newItemHolding(_ prefill: NewItemSheet.Prefill) { openNewItem(prefill) }
 
-    private func openNewItem(_ prefill: NewItemSheet.Prefill?) {
+    /// ⌘V in the window (the list or the sidebar has the keys; a text field pastes for itself, the detail page adds
+    /// to its item): the clipboard's pictures, files or text as a new item in the place on show — the sheet a drop
+    /// opens, holding them (↩ creates it; nothing is written before). Not rows or cards copied in Blurt itself.
+    @objc func paste(_ sender: Any?) { paste(from: .general) }
+
+    func paste(from pb: NSPasteboard) {
+        let d = DropIn.clipboard(pb)
+        emit(["event": "main_paste", "to": "new_item", "images": d.images.count, "files": d.files.count, "has_text": d.text != nil])
+        guard !d.isEmpty else { return NSSound.beep() }
+        newItem(from: d, in: dropTarget())
+    }
+
+    func dropTarget() -> String {
+        switch model.scope {
+        case .project(let id): return id
+        case .inbox, .unassigned: return "inbox"
+        default: return ProjectStore.shared.currentID ?? "inbox"
+        }
+    }
+
+    /// A New Item sheet holding a drop from another app (v1.0.23): its pictures, its files (referenced; one in a
+    /// temporary place is copied), its text; with only files, the first one's name is the title (↩ creates it).
+    func newItem(from d: DropIn, in project: String) {
+        var pre = d.text.map { NewItemSheet.Prefill(text: $0, images: d.images) } ?? NewItemSheet.Prefill(images: d.images)
+        pre.files = d.files
+        if pre.title.isEmpty, d.images.isEmpty, let f = d.files.first { pre.title = f.deletingPathExtension().lastPathComponent }
+        openNewItem(pre, target: project)
+    }
+
+    /// Another app's drop on an item: added to it, no dialog; "Added to “X” · 2 pictures · Undo" (⌘Z too).
+    func add(_ d: DropIn, to it: ItemRow) {
+        var args = ["attach", it.fileURL.path]
+        for u in d.images { args += ["--frame", u.path] }
+        for u in d.files { args += [FilePlace.isTemporary(u) ? "--keep" : "--file", u.path] }
+        if let t = d.text { args.append("--text=" + t) }       // (a text starting with "-" is still the value)
+        attach(args, to: it, what: d.summary, cards: [])
+    }
+
+    /// Hanging cards dropped on an item: each one's picture (a file card: its file) and the notes, in the cards'
+    /// order; the cards are used (Recently Taken), and Undo puts them back with the item as it was.
+    func add(cards: [Shot], to it: ItemRow) {
+        var args = ["attach", it.fileURL.path]
+        var notes: [String] = []
+        for s in cards {
+            if let r = s.refURL { args += [FilePlace.isTemporary(r) ? "--keep" : "--file", r.path] }
+            else if s.kind == .shot, let u = s.bestURL { args += ["--frame", u.path] }
+            if let n = s.copyText { notes.append(n) }
+        }
+        if !notes.isEmpty { args.append("--text=" + notes.joined(separator: "\n\n")) }
+        attach(args, to: it, what: TP("main.drop.cards", cards.count), cards: cards)
+    }
+
+    private func attach(_ args: [String], to it: ItemRow, what: String, cards: [Shot]) {
+        let title = ItemListController.shortTitle(it)
+        let name = T("main.drop.added_undo", title)
+        let step = UndoStep<String>()
+        emit(["event": "item_drop_add", "uid": it.uid, "args": args.count, "cards": cards.map(\.n)])
+        writes.run { [weak self] in
+            guard let self = self else { return }
+            switch await Scripts.awaiting({ Scripts.call("items.py", args, timeout: 60, done: $0) }) {
+            case .success(let o):
+                step.value = (o["before"]).flatMap { try? JSONSerialization.data(withJSONObject: $0) }.flatMap { String(data: $0, encoding: .utf8) }
+                // ⌘Z (and the toast's Undo) once there is something to undo: the item as it was, the cards back
+                self.register(name, step) { c, s in
+                    guard let before = s.value else { return }
+                    c.writes.run {
+                        _ = await Scripts.awaiting({ Scripts.call("items.py", ["attach", it.fileURL.path, "--restore", before], timeout: 30, done: $0) })
+                        for k in cards { snapper.putBack(k) }
+                        c.wrote([it])
+                    }
+                }
+                snapper.usedInItem(cards)
+                self.wrote([it])
+                self.reveal(uid: it.uid)
+                appDelegate?.toast(T("main.drop.added", title, what), icon: .check, undo: self.undoToast(name))
+            case .failure(let f):
+                self.alert(T("main.drop.add_failed"), f.localized)
+            }
+        }
+    }
+
+    private func openNewItem(_ prefill: NewItemSheet.Prefill?, target given: String? = nil) {
         show()
         guard let w = window, w.attachedSheet == nil else { return }
-        let target: String
-        switch model.scope {
-        case .project(let id): target = id
-        case .inbox, .unassigned: target = "inbox"
-        default: target = ProjectStore.shared.currentID ?? "inbox"
-        }
+        let target = given ?? dropTarget()
         let name = target == "inbox" ? T("project.inbox") : ProjectStore.shared.project(id: target)?.name ?? T("project.inbox")
         var sheet: NSWindow?
         let host = NSHostingController(rootView: NewItemSheet(target: target, targetName: name, prefill: prefill) { [weak self] uid in
@@ -351,9 +522,13 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSToolba
             appDelegate?.toast(T("main.toast.session_gone"))
             return
         }
-        if !model.scope.showsJobs || !model.jobs.contains(where: { $0.id == job }) {
-            go(j.project.map { $0 == "inbox" ? .unassigned : .project($0) } ?? .inProgress)
-            if !model.jobs.contains(where: { $0.id == job }) { go(.inProgress) }
+        // listed here: as a job row, or as its recording's row (a recording's run is drawn as the recording)
+        let listed = { [unowned self] in
+            model.jobs.contains { $0.id == job } || model.recordings.contains { $0.state.job == job }
+        }
+        if !model.scope.showsJobs || !listed() {
+            go(j.project.map { $0 == "inbox" ? .unassigned : .project($0) } ?? .unassigned)
+            if !listed() { go(.inProgress) }
         }
         selectJob(job)
     }
@@ -390,6 +565,11 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSToolba
             focusList()
             return
         }
+        if s.isPage {
+            list.table.deselectAll(nil)
+            focusList()
+            return
+        }
         if list.table.selectedRow < 0, model.rowCount > 0 { list.table.selectRowIndexes([0], byExtendingSelection: false) }
         list.scrollToStart()
         listSelectionChanged()
@@ -412,7 +592,6 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSToolba
 
     func updateTitle() {
         defer {
-            titleView.set(title: window?.title ?? "", subtitle: window?.subtitle ?? "")
             list.heading.set(title: window?.title ?? "", counts: window?.subtitle ?? "")
             // a session's page lists what one recording made: items are added in a place, not into a recording
             if case .session = model.scope { list.heading.add.isHidden = true } else { list.heading.add.isHidden = false }
@@ -420,9 +599,13 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSToolba
         }
         let q = model.text.trimmingCharacters(in: .whitespaces)
         // a search is a mode of its own: the heading says what it looks for, the counts how much of the place it found
-        window?.title = q.isEmpty || model.scope == .dictation ? model.scopeTitle : T("main.search.title", q)
+        window?.title = q.isEmpty || model.scope.isPage ? model.scopeTitle : T("main.search.title", q)
         if model.scope == .dictation {
             window?.subtitle = page?.subtitle ?? ""          // the page's one count, following its tab and search
+            return
+        }
+        if model.scope.isPage {
+            window?.subtitle = ""
             return
         }
         window?.subtitle = listSubtitle
@@ -457,7 +640,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSToolba
         let items = split.splitViewItems
         guard items.count == 3 else { return }
         let d = items[2]
-        let fold = model.scope != .dictation && shownJob == nil && (model.placeIsEmpty || model.nothingListed)
+        // a full page (Home, Cards, Phone) has the whole content area; the items' empty states too
+        let fold = model.scope != .dictation && (model.scope.isPage || (shownJob == nil && (model.placeIsEmpty || model.nothingListed)))
         if fold, !d.isCollapsed {
             detailWidthBeforeFold = Double(d.viewController.view.frame.width)
             foldedForEmpty = true
@@ -473,7 +657,6 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSToolba
     var quietDetail: Bool { model.isEmptyWorld || model.nothingListed || model.rowCount == 0 }
 
     /// The Dictation page's title in the toolbar (the item places have the list's heading instead).
-    let titleView = ToolbarTitle()
 
     /// The inbox's subtitle (K3): "3 new · 2 to verify" under the title "Inbox" — the same words as the menu bar
     /// menu's rows; a zero part left out; nothing when both are zero (the empty state says it).
@@ -495,7 +678,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSToolba
 
     func listSelectionChanged() {
         let items = list.selectedItems
-        if !items.isEmpty { shownJob = nil; list.jobs.selected = nil; if focusedBanner != nil { focusBanner(nil) } }
+        if !items.isEmpty { shownJob = nil; list.jobs.selected = nil; list.recordings.selected = nil; if focusedBanner != nil { focusBanner(nil) } }
         if shownJob != nil { return }
         if items.count == 1, let it = items.first {
             detail.show(item: it, projects: model.projects)
@@ -607,7 +790,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSToolba
         if name != nil {
             list.table.deselectAll(nil)
             shownJob = nil
-            list.jobs.selected = nil
+            list.jobs.selected = nil; list.recordings.selected = nil
         }
         focusedBanner = name
         list.captures.selected = name == "captures"
@@ -619,6 +802,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSToolba
         list.table.deselectAll(nil)
         shownJob = id
         list.jobs.selected = id
+        list.recordings.selected = id
         detail.show(job: j, projectName: j.project.flatMap { ProjectStore.shared.project(id: $0) }?.name)
         fitDetailToPlace()          // a job shown over an empty place brings the detail back
     }
@@ -633,8 +817,10 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSToolba
         detail.web.evaluateJavaScript("window.blurtReview && window.blurtReview.focusTitle && window.blurtReview.focusTitle()")
     }
 
-    /// ⌘↩, Hand Off: the instruction for your own agent on the clipboard (handoff.py --to external --mark).
-    func handOffSelection() {
+    /// ⌘↩, Hand Off: the instruction for your own agent on the clipboard (handoff.py --to external --mark); ⇧⌘C,
+    /// Copy Full Text: the whole note. Both say why when the selection can't go, with the way out.
+    func handOffSelection() { handOffSelection(what: "instruction") }
+    func handOffSelection(what: String) {
         let items = list.selectedItems
         guard !items.isEmpty else { NSSound.beep(); return }
         if let why = handOffBlocker(items) {
@@ -651,7 +837,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSToolba
             }
             return
         }
-        handOff(uids: items.map(\.uid), what: "instruction") { _ in }
+        handOff(uids: items.map(\.uid), what: what) { _ in }
     }
 
     func renameSelection() {
@@ -694,6 +880,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSToolba
             let items = StateMenu.valid(action, self.model.items(uids: uids))
             guard !items.isEmpty else { return self.drop(step) }
             step.value = items.map { ($0.uid, $0.state) }
+            step.after = Dictionary(items.compactMap { it in Lifecycle.target(of: action, state: it.state).map { (it.uid, $0) } },
+                                    uniquingKeysWith: { a, _ in a })
             switch await Scripts.awaiting({ Scripts.state(items.map(\.uid), action: action, done: $0) }) {
             case .success:
                 self.wrote(items)
@@ -728,20 +916,30 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSToolba
     private func undoState(_ action: String, uids: [String], _ step: UndoStep<[(String, String)]>) {
         let redo = UndoStep<Void>()
         register(StateMenu.title(action), redo) { c, _ in c.apply(action, uids: uids, redoing: true) }
+        undoStates(step, redo: redo)
+    }
+
+    /// Each item back to the state it had before the step — only while it is still in the state the step left it in
+    /// (`step.after`): an item an agent has reported on since keeps that report (items.py --from-state), and a toast
+    /// says which ones weren't taken back.
+    private func undoStates(_ step: UndoStep<[(String, String)]>, redo: UndoStep<Void>?) {
         writes.run { [weak self] in
             guard let self = self, let before = step.value else { return }      // the action never ran: nothing to take back
-            for (state, group) in Dictionary(grouping: before, by: \.1) {
+            var kept: [String] = []
+            for (key, group) in Dictionary(grouping: before, by: { [$0.1, step.after[$0.0] ?? ""] }) {
                 let ids = group.map(\.0)
-                switch await Scripts.awaiting({ Scripts.undoState(ids, to: state, done: $0) }) {
-                case .success:
+                switch await Scripts.awaiting({ Scripts.undoState(ids, to: key[0], from: key[1].isEmpty ? nil : key[1], done: $0) }) {
+                case .success(let o):
+                    kept += (o["kept"] as? [[String: Any]] ?? []).compactMap { $0["id"] as? String }
                     self.wrote(self.model.items(uids: ids))
                     self.model.reloadAll()                  // back in this list (a discard undone): selected again
                     if ids.contains(where: { self.model.row(of: $0) != nil }) { self.list.reload(keep: ids) }
                 case .failure(let f):
-                    self.drop(redo)
+                    if let r = redo { self.drop(r) }
                     self.alert(T("main.error.save_title"), f.localized)
                 }
             }
+            if !kept.isEmpty { appDelegate?.toast(T("main.undo.kept", Loc.list(kept))) }
         }
     }
 
@@ -1163,27 +1361,51 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSToolba
 
     /// Copy instruction / full text for your own agent app (K6). The sheet is written and the items marked handed off
     /// when you copy — that click is the hand-off.
+    ///
+    /// It runs with the window's other writes (after an A or D pressed just before it), one at a time — a second ⌘↩
+    /// while one is being written is ignored, never a second note — and it is a step of its own on the undo stack: ⌘Z
+    /// puts the items back where they were (not past the hand-off to an older step), and leaves alone any item the
+    /// agent has reported on since.
     func handOff(uids: [String], what: String, reply: @escaping ([String: Any]?) -> Void) {
         let items = model.items(uids: uids).filter { !$0.discarded && !$0.readOnly }
-        guard !items.isEmpty else { NSSound.beep(); return reply(nil) }
-        Scripts.handoff(items.map(\.uid)) { [weak self] r in
-            switch r {
+        guard !items.isEmpty, !handingOff else { NSSound.beep(); return reply(nil) }
+        handingOff = true
+        let step = UndoStep<[(String, String)]>()
+        register(StateMenu.title("hand_off"), step) { c, s in
+            let redo = UndoStep<Void>()
+            c.register(StateMenu.title("hand_off"), redo) { c, _ in c.handOff(uids: uids, what: what) { _ in } }
+            c.undoStates(s, redo: redo)
+        }
+        writes.run { [weak self] in
+            guard let self = self else { return }
+            defer { self.handingOff = false }
+            let now = self.model.items(uids: items.map(\.uid)).filter { !$0.discarded && !$0.readOnly }
+            // what handoff.py --mark moves: new, to do (and handed off again, which stays as it is)
+            let moving = now.filter { ["new", "todo"].contains($0.state) }
+            switch await Scripts.awaiting({ Scripts.handoff(now.map(\.uid), done: $0) }) {
             case .success(let o):
+                step.value = moving.map { ($0.uid, $0.state) }
+                step.after = Dictionary(moving.map { ($0.uid, "handed_off") }, uniquingKeysWith: { a, _ in a })
+                if moving.isEmpty { self.drop(step) }
                 let text = (what == "full" ? o["full"] : o["instruction"]) as? String ?? ""
-                NSPasteboard.general.clearContents()
-                NSPasteboard.general.setString(text, forType: .string)
+                let pb = DictationInsert.pasteboard        // a test build's own, never the user's clipboard
+                pb.clearContents()
+                pb.setString(text, forType: .string)
                 appDelegate?.toast(T(what == "full" ? "main.handoff.copied_full" : "main.handoff.copied"), icon: .check)
-                self?.wrote(items)
+                self.wrote(now)
                 reply(["id": o["id"] ?? "", "path": o["path"] ?? "", "text": text])
             case .failure(let f):
-                self?.alert(T("main.handoff.failed"), f.localized)
+                self.drop(step)
+                self.alert(T("main.handoff.failed"), f.localized)
                 reply(nil)
             }
         }
     }
+    /// A hand-off being written (⌘↩ pressed twice: one note).
+    private var handingOff = false
 
-    @objc func mCopyInstruction() { handOff(uids: list.selectedItems.map(\.uid), what: "instruction") { _ in } }
-    @objc func mCopyFull() { handOff(uids: list.selectedItems.map(\.uid), what: "full") { _ in } }
+    @objc func mCopyInstruction() { handOffSelection(what: "instruction") }
+    @objc func mCopyFull() { handOffSelection(what: "full") }
     @objc func mExportBundle() { exportBundle(uids: list.selectedItems.map(\.uid)) }
     /// The app's own sentence for a script's error code ("main.error.<code>"), nil when it has none.
     static func errorSentence(_ code: String) -> String? {
@@ -1231,7 +1453,9 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSToolba
                     emit(["event": "bundle_failed", "code": f.code, "error": f.message])
                     AppEnvironment.island?.dropToasts(key: "bundle")
                     NSLog("blurt bundle: %@: %@", f.code, f.message)
-                    let ours = Loc.has("main.bundle.error.\(f.code)", table: "Main") ? T("main.bundle.error.\(f.code)") : Self.errorSentence(f.code)
+                    // which folder couldn't be written, by name
+                    let ours = f.code == "io" ? T("main.bundle.error.io", url.deletingLastPathComponent().lastPathComponent)
+                        : Loc.has("main.bundle.error.\(f.code)", table: "Main") ? T("main.bundle.error.\(f.code)") : Self.errorSentence(f.code)
                     self?.alert(T("main.bundle.failed"), HandoffBundle.failureText(ours: ours, fallback: f.localized))
                     done?(nil)
                 }
@@ -1285,7 +1509,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSToolba
         return m
     }
 
-    /// The first group of the context menu and the menu bar's Item menu: Hand Off to Your Agent (copies the
+    /// The first group of the context menu and the menu bar's Item menu: Copy Instruction for Agent (copies the
     /// instruction). `items` nil: the menu bar.
     func handOffActions(into m: NSMenu, items: [ItemRow]?) {
         let n = items?.count ?? 1
@@ -1302,7 +1526,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSToolba
     func itemActions(into m: NSMenu, items: [ItemRow]?, inSelection: Bool = false) {
         let one = items.map { $0.count == 1 } ?? true
         let bar = items == nil
-        if !inSelection { m.addItem(submenu(T("main.menu.move_to"), "arrow.turn.up.right", moveMenu())) }
+        if !inSelection { m.addItem(submenu(T("main.menu.move_to"), "folder", moveMenu())) }
         m.addItem(submenu(T("main.menu.kind"), "tag", kindMenu(items ?? [])))
         if bar || one { _ = add(m, T("main.menu.rename"), #selector(mRename), "pencil", key: "e", mods: []) }
         _ = add(m, T("main.menu.enrich"), #selector(mEnrich), "text.badge.plus")
@@ -1318,12 +1542,12 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSToolba
         }
     }
 
-    /// Copy ▸: the instruction for your own agent first (⇧⌘C), then the item's text, its link and its file's path
-    /// (⌥⌘C). Words only — the parent row carries the copy glyph.
+    /// Copy ▸: the item's whole hand-off note (⇧⌘C), its link and its file's path (⌥⌘C). The instruction for your
+    /// own agent is Copy Instruction for Agent (⌘↩), one row above — one command, not a second name for it here.
+    /// Words only — the parent row carries the copy glyph.
     func copyMenu() -> NSMenu {
         let m = NSMenu()
-        _ = add(m, T("main.cmd.copy_instruction"), #selector(mCopyInstruction), key: "c", mods: [.command, .shift])
-        _ = add(m, T("main.cmd.copy_full"), #selector(mCopyFull))
+        _ = add(m, T("main.cmd.copy_full"), #selector(mCopyFull), key: "c", mods: [.command, .shift])
         _ = add(m, T("main.menu.copy_link"), #selector(mCopyLink))
         _ = add(m, T("action.copy_path"), #selector(mCopyPath), key: "c", mods: [.command, .option])
         return m
@@ -1398,7 +1622,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSToolba
         let m = NSMenu()
         let here = Set(list.selectedItems.map(\.projectID))
         for p in ProjectStore.shared.projects {         // the one order: pinned, then the most recently used
-            let i = add(m, p.name, #selector(mMove(_:)), "folder", obj: p.id)
+            let i = add(m, ProjectLook.menuTitle(p.name), #selector(mMove(_:)), "folder", obj: p.id)
+            i.toolTip = ProjectLook.menuTip(p)
             i.state = here == [p.id] ? .on : .off
         }
         if !ProjectStore.shared.projects.isEmpty { m.addItem(.separator()) }
@@ -1511,7 +1736,9 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSToolba
             item.toolTip = why
             return Scripts.canWrite && why == nil && items.contains { !$0.discarded && !$0.readOnly }
         case #selector(mCopyInstruction), #selector(mCopyFull):
-            return Scripts.canWrite && items.contains { !$0.discarded && !$0.readOnly }
+            let why = handOffBlocker(items)
+            item.toolTip = why
+            return Scripts.canWrite && why == nil && items.contains { !$0.discarded && !$0.readOnly }
         case #selector(mExportBundle):
             return Scripts.canWrite && !bundling && items.contains { !$0.readOnly }
         case #selector(mState(_:)):
@@ -1543,10 +1770,10 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSToolba
             return shownProject != nil
         case #selector(mSort(_:)):
             item.state = item.representedObject as? String == model.sort ? .on : .off
-            return model.scope != .dictation
+            return !model.scope.isPage
         case #selector(mSortDirection(_:)):
             item.state = item.representedObject as? Bool == model.ascending ? .on : .off
-            return model.scope != .dictation
+            return !model.scope.isPage
         case #selector(mClearFilters):
             return model.filtered
         case #selector(mEnrich):
@@ -1601,13 +1828,15 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSToolba
             // a failure put away: it leaves the jobs section; the recording keeps its files
             JobFiles.rewrite(job.id) { $0["dismissed"] = true }
             JobStore.shared.rescan()
-            if shownJob == job.id { shownJob = nil; list.jobs.selected = nil; listSelectionChanged() }
+            if shownJob == job.id { shownJob = nil; list.jobs.selected = nil; list.recordings.selected = nil; listSelectionChanged() }
         case "items":
             if let first = job.items.first { reveal(uid: first) }
         case let a where a.hasPrefix("item:"):          // an item the job wrote, from its detail
             reveal(uid: String(a.dropFirst(5)))
         case "stop":                                     // an organising run: Stop in its detail (⌘.)
             JobStop.stop(job)
+        case "agents":                                   // a signed-out agent: Settings → Agents, where it signs in
+            AppEnvironment.settings?.show(pane: "agents")
         default: break
         }
     }
@@ -1627,14 +1856,21 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSToolba
             switch ch {
             case "k": palette.toggle(); return true
             case "f": focusSearch(); return true
-            case "o": openFolder(); return true
-            case "1": go(.inbox); return true
-            case "2": go(.inProgress); return true
-            case "3": go(.unassigned); return true
-            case "4": go(.all); return true
+            case "0": go(.home); return true
             default: break
             }
-            if let n = Int(ch), n >= 5, n <= 9 {
+            // the items' places and the projects exist with Recording on (Capabilities.swift)
+            if Capability.recording.isOn {
+                switch ch {
+                case "o": openFolder(); return true
+                case "1": go(.inbox); return true
+                case "2": go(.inProgress); return true
+                case "3": go(.unassigned); return true
+                case "4": go(.all); return true
+                default: break
+                }
+            }
+            if Capability.recording.isOn, let n = Int(ch), n >= 5, n <= 9 {
                 let ps = shortcutProjects
                 if n - 5 < ps.count { go(.project(ps[n - 5].id)) } else { NSSound.beep() }
                 return true
@@ -1642,7 +1878,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSToolba
             if e.keyCode == 36 || e.keyCode == 76, window?.firstResponder === list.table { handOffSelection(); return true }
         }
         if mods == [.command, .shift], ch == "r" { mReveal(); return true }
-        if mods == [.command, .shift], ch == "c", window?.firstResponder === list.table { mCopyInstruction(); return true }
+        if mods == [.command, .shift], ch == "c", window?.firstResponder === list.table { mCopyFull(); return true }
         if mods == [.command, .option], ch == "c" { copyPaths(); return true }
         return false
     }
@@ -1650,23 +1886,24 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSToolba
     // MARK: toolbar
 
     static let recordID = NSToolbarItem.Identifier("record"), snapID = NSToolbarItem.Identifier("snap")
-    static let titleID = NSToolbarItem.Identifier("title")
 
-    func toolbarDefaultItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] { Self.toolbarItems(dictation: false) }
+    func toolbarDefaultItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] { Self.toolbarItems(for: .inbox) }
 
     /// The items' toolbar: Record and Snap (the capture pair, the window's own actions); the place's name, its order,
     /// Filter and search are the list's (ListHeading), so they sit on the list, not over the detail. Moving and handing
     /// off act on the selection, so they live with it (the detail, the Item and context menus, M / ⌘↩, ⌘K) — not twice
-    /// on screen. The Dictation page has its own: its title (its history's search is on its list).
-    static func toolbarItems(dictation: Bool) -> [NSToolbarItem.Identifier] {
-        dictation ? [.toggleSidebar, .sidebarTrackingSeparator, titleID]
-                  : [.toggleSidebar, .sidebarTrackingSeparator, .flexibleSpace, recordID, snapID]
+    /// on screen. A page (Dictation, Home, Cards, Phone) names itself in its own heading and has its actions on the
+    /// page: only the sidebar button. Record and Snap show while their capabilities are on. No page has a title item.
+    static func toolbarItems(for scope: Scope) -> [NSToolbarItem.Identifier] {
+        if scope.isPage { return [.toggleSidebar, .sidebarTrackingSeparator] }
+        return [.toggleSidebar, .sidebarTrackingSeparator, .flexibleSpace]
+            + (Capability.recording.isOn ? [recordID] : []) + (Capability.cards.isOn ? [snapID] : [])
     }
 
     /// Swap the toolbar's items for the page's (the sidebar button stays as it is).
-    func syncToolbar(dictation: Bool) {
+    func syncToolbar(for scope: Scope) {
         guard let tb = window?.toolbar else { return }
-        let want = Self.toolbarItems(dictation: dictation)
+        let want = Self.toolbarItems(for: scope)
         for (n, it) in tb.items.enumerated().reversed() where !want.contains(it.itemIdentifier) { tb.removeItem(at: n) }
         for (n, id) in want.enumerated() where n >= tb.items.count || tb.items[n].itemIdentifier != id {
             tb.insertItem(withItemIdentifier: id, at: n)
@@ -1691,14 +1928,6 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSToolba
             return button(T("main.action.record"), "record.circle", #selector(record), tip: T("main.toolbar.record.tip", hk(.toggleRecord)))
         case Self.snapID:
             return button(T("main.action.snap"), "camera.viewfinder", #selector(snap), tip: T("main.toolbar.snap.tip", hk(.snap)))
-        case Self.titleID:
-            let i = NSToolbarItem(itemIdentifier: id)
-            i.view = titleView
-            i.label = T("main.toolbar.title")
-            i.paletteLabel = i.label
-            i.isBordered = false
-            i.visibilityPriority = .high
-            return i
         default: return nil
         }
     }
@@ -1863,6 +2092,9 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSToolba
         /// before 0.9: one filter for the whole window (read once, for the place it was saved in)
         var kinds: [String]?, state: String?
         var selected: [String]?, open: Bool?
+        /// the window has opened on Home once (v1.0.23: an install from before Home lands there the first time,
+        /// then where it was left, as ever)
+        var homeSeen: Bool?
         /// ⌘Q's "Blurt is still in the menu bar" was shown
     }
     static var stateURL: URL { BlurtPaths.home.appendingPathComponent("ui/main-window.json") }
@@ -1886,6 +2118,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSToolba
         s.sidebarCollapsed = items[0].isCollapsed
         s.detail = foldedForEmpty ? detailWidthBeforeFold : Double(items[2].viewController.view.frame.width)
         if case .session = model.scope {} else { s.scope = model.scope.key }
+        s.homeSeen = true
         s.filters = model.allFilters
         s.sort = model.sort; s.ascending = model.ascending
         s.selected = list.selectedIDs
@@ -1899,8 +2132,10 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSToolba
         _ = list.view; _ = sidebar.view; _ = detail.view
         let s = Self.loadState()
         if let f = s?.frame { w.setFrame(from: f) } else { w.center() }
-        if let sc = s?.scope.flatMap(Scope.init(key:)) { model.scope = sc }
-        if case .project(let p) = model.scope, ProjectStore.shared.project(id: p) == nil { model.scope = .inbox }
+        // Home the first time (a new install, or the first launch with a Home); then where the window was left
+        model.scope = s?.homeSeen == true ? s?.scope.flatMap(Scope.init(key:)) ?? .home : .home
+        if case .project(let p) = model.scope, ProjectStore.shared.project(id: p) == nil { model.scope = .home }
+        if let c = model.scope.capability, !c.isOn { model.scope = .home }     // its capability was turned off since
         var filters = s?.filters ?? PlaceFilters()
         if s?.filters == nil, let old = s, old.kinds?.isEmpty == false || old.state != nil {
             filters.set(PlaceFilter(kinds: old.kinds ?? [], state: old.state), for: model.scope.key)   // never a state the place can't show
@@ -1988,55 +2223,3 @@ final class ColumnController: NSViewController {
     }
 }
 
-/// The Dictation page's toolbar title: its name in 17 pt semibold (system.md §7, window titles 17–20), its count under
-/// it in 11 pt secondary (the item places name themselves in the list's heading, ListHeading).
-final class ToolbarTitle: NSView {
-    /// a label drawn as itself over the toolbar's material (not the vibrant, washed-out text of a bar item)
-    final class Label: NSTextField {
-        override var allowsVibrancy: Bool { false }
-    }
-    let title = Label(labelWithString: "")
-    let subtitle = Label(labelWithString: "")
-    override var allowsVibrancy: Bool { false }
-
-    override init(frame: NSRect) {
-        super.init(frame: frame)
-        title.font = .systemFont(ofSize: 17, weight: .semibold)
-        title.textColor = .labelColor
-        subtitle.font = .systemFont(ofSize: 11)
-        subtitle.textColor = .secondaryLabelColor
-        for t in [title, subtitle] {
-            t.lineBreakMode = .byTruncatingTail
-            t.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-            t.translatesAutoresizingMaskIntoConstraints = false
-            addSubview(t)
-        }
-        NSLayoutConstraint.activate([
-            title.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 4),
-            title.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor),
-            subtitle.leadingAnchor.constraint(equalTo: title.leadingAnchor),
-            subtitle.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor),
-            subtitle.topAnchor.constraint(equalTo: title.bottomAnchor, constant: -1),
-        ])
-        setAccessibilityElement(true)
-        setAccessibilityRole(.staticText)
-    }
-    required init?(coder: NSCoder) { fatalError() }
-
-    private var centred: NSLayoutConstraint?
-    func set(title t: String, subtitle s: String) {
-        title.stringValue = t
-        subtitle.stringValue = s
-        subtitle.isHidden = s.isEmpty
-        // without counts the title sits in the middle on its own
-        centred?.isActive = false
-        centred = title.centerYAnchor.constraint(equalTo: centerYAnchor, constant: s.isEmpty ? 0 : -7)
-        centred?.isActive = true
-        setAccessibilityLabel([t, s].filter { !$0.isEmpty }.joined(separator: ", "))
-        invalidateIntrinsicContentSize()
-    }
-    override var intrinsicContentSize: NSSize {
-        let w = max(title.intrinsicContentSize.width, subtitle.isHidden ? 0 : subtitle.intrinsicContentSize.width) + 8
-        return NSSize(width: min(320, ceil(w)), height: 38)
-    }
-}

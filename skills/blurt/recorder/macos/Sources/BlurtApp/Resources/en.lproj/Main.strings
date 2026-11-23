@@ -2,6 +2,7 @@
    Same keys and placeholders in the other language (tests/test_l10n.py). */
 
 "app.agent.fallback_notice" = "%1$@ — organizing with %2$@ instead";
+"app.agent.fallback_settings" = "Agent Settings…";
 "app.agent.list_sep" = ", ";
 "app.agent.can_be_used" = " can’t be used";
 "app.agent.checking" = "checking…";
@@ -16,6 +17,8 @@
 "app.agent.not_logged" = "not signed in";
 "app.agent.unfinished" = "%@ stopped before it finished";
 "app.agent.couldnt_start" = "%@ couldn’t start. Check that it runs in a terminal, then retry.";
+"app.agent.no_transcript" = "The recording wasn’t transcribed, and no items were written. See the log for what’s missing, then retry.";
+"app.agent.missing_tool" = "Organizing needs %@, which isn’t installed. Install it (%@), then retry.";
 
 "app.menu.after.keep" = "Keep the video only";
 "app.menu.after.organize" = "Organize into items";
@@ -64,7 +67,7 @@
 "app.record.reason.display_gone" = "The recorded display was disconnected";
 "app.record.reason.interrupted" = "Interrupted by sleep or the lock screen";
 "app.record.reason.writer" = "Couldn’t write the video file";
-"app.record.recovered" = "Recording saved · resumed after a write error";
+"app.record.recovered" = "Recording saved · Recovered from a write error";
 "app.record.recovered_lost" = "Recording saved · about %@ s missing after a write error";
 "app.record.recovered_parts" = "Recording saved in parts after a write error";
 "app.record.partial" = "%1$@ — the first %2$@ is kept";
@@ -83,12 +86,17 @@
 "app.url.no_item" = "Can’t find that item. It may have been deleted or moved.";
 "app.url.no_session" = "Can’t find that recording or snap. It may have been deleted or moved.";
 
-"main.action.record" = "Record";
+"main.action.record" = "Start Recording";
 "main.action.snap" = "Snap";
 
+"main.undo.kept" = "%@ changed since, so it wasn’t undone.";
 "main.banner.agent" = "an agent";
-"main.banner.ended" = "Session ended without the agent reporting back";
-"main.banner.external" = "Copied for your agent. Mark it done here when it’s finished.";
+"main.banner.ended" = "it stopped without reporting back";
+"main.banner.external" = "Handed off to your agent. Mark it done here when it’s finished.";
+"main.banner.quiet" = "Handed off %@ · no word from your agent yet";
+"main.banner.working" = "%@ is working on it · started %@";
+"main.banner.working_now" = "%@ is working on it";
+"main.banner.your_agent" = "Your agent";
 "main.banner.organizing" = "Organizing · %@";
 "main.banner.show_progress" = "Show Progress";
 "main.banner.with_agent" = "Handed off to %@ · %@";
@@ -141,7 +149,7 @@
 "main.empty.no_scripts" = "The blurt skill’s scripts are missing";
 "main.empty.no_scripts.detail" = "Blurt’s scripts are missing. Reinstall Blurt from blurt.work, then reopen this window.";
 "main.empty.nothing_in_progress" = "Nothing in progress";
-"main.empty.nothing_in_progress.detail" = "Items you hand off to an agent stay here until you verify them.";
+"main.empty.nothing_in_progress.detail" = "Items you’ve kept or handed off appear here until they’re done.";
 "main.empty.outdated" = "Updating your items…";
 "main.empty.outdated.detail" = "This takes a moment after an update. Nothing is lost.";
 "main.empty.project" = "Nothing in this project yet";
@@ -208,6 +216,7 @@
 "main.inbox.verify" = "%ld to verify";
 "main.item.untitled" = "Untitled";
 
+"main.job.sign_in" = "Sign In…";
 "main.job.error.auth" = "The agent isn’t signed in.";
 "main.job.error.auth.named" = "%@ isn’t signed in.";
 "main.job.error.conflict" = "The changes conflict with yours.";
@@ -216,9 +225,9 @@
 "main.job.error.network" = "The network connection was lost.";
 "main.job.error.quota" = "The agent ran out of quota.";
 "main.job.error.quota.named" = "%@ ran out of quota.";
-"main.job.hint.no_agent" = "No coding agent is ready. Install or sign in to one in Settings, under Agents.";
+"main.job.hint.no_agent" = "Organizing in the background needs an agent CLI. Install or sign in to one in Settings > Agents. Or say “Process my Blurt recordings” in an agent with the Blurt skill.";
 "main.job.capture" = "A capture";
-"main.job.no_agent" = "No coding agent is ready: %@.";
+"main.job.no_agent" = "No agent can organize in the background: %@. Or say “Process my Blurt recordings” in an agent with the Blurt skill.";
 "main.job.no_agent.sep" = "; ";
 "main.job.organized_by" = "Organized by %1$@ (%2$@)";
 "main.job.error.agent_exit" = "The agent stopped before it finished.";
@@ -254,7 +263,8 @@
 "main.keys.back" = "Send back or reopen";
 "main.keys.back.note" = "Also takes back a handed-off item or restores a discarded one";
 "main.keys.kind" = "Kind: issue, idea, note, task";
-"main.keys.copy_instruction" = "Copy instruction";
+"main.keys.copy_full" = "Copy full text";
+"main.keys.new_item" = "New item";
 "main.keys.move" = "Move to project";
 "main.keys.space" = "Space";
 "main.keys.copy_path" = "Copy path";
@@ -280,8 +290,8 @@
 "main.bundle.save" = "Export";
 "main.bundle.message" = "One .zip with a summary, every item and its screenshots. It opens on any computer.";
 "main.bundle.saved" = "Hand-off bundle saved: %@";
-"main.bundle.failed" = "Couldn’t export the hand-off bundle";
-"main.bundle.error.io" = "Couldn’t write there. Choose another folder.";
+"main.bundle.failed" = "Couldn’t save the bundle";
+"main.bundle.error.io" = "Can’t write to “%@”. Choose another folder.";
 "main.bundle.error.unreadable" = "A screenshot or clip couldn’t be read, so nothing was packed.";
 "main.bundle.error.no_items" = "There are no items to pack.";
 "main.bundle.packing" = "Packing the hand-off bundle (%@)…";
@@ -297,7 +307,7 @@
 "main.menu.quick_look" = "Quick Look";
 "main.menu.rename" = "Rename";
 "main.menu.review_batch" = "Review the Whole Capture";
-"main.menu.start_session" = "Hand Off to Your Agent";
+"main.menu.start_session" = "Copy Instruction for Agent";
 
 "main.misc.by_codex" = "Fixed by Codex";
 "main.misc.drag_finder_terminal" = "Drag to Finder or a terminal";
@@ -319,6 +329,7 @@
 "main.palette.only_kind" = "Show Only %@";
 "main.palette.placeholder" = "Type a command, a project or an item…";
 "main.palette.project" = "Project · %@";
+"main.palette.settings_pane" = "Settings · %@";
 
 "main.place.all" = "All Items";
 "main.place.inbox" = "Inbox";
@@ -372,8 +383,9 @@
 "main.missing.other" = "That folder is “%1$@”, not “%2$@”";
 "main.sidebar.not_opened" = "not opened as a project";
 "main.sidebar.open_folder.tip" = "Open a folder as a project (⌘O) — or drop folders here";
-"main.sidebar.progress.ax" = "In progress: items handed off to an agent, and running jobs";
+"main.sidebar.progress.ax" = "In progress: items to do, items with an agent, and running jobs";
 "main.sidebar.projects" = "Projects";
+"main.sidebar.items" = "Items";
 "main.sidebar.unassigned.ax" = "Unassigned: items not filed under a project yet";
 
 "main.state.ax" = "State: %@. Click to change it.";
@@ -383,7 +395,7 @@
 "main.speech.recommended" = "Recommended speech model · %@";
 "main.speech.recommended.action" = "Review";
 
-"main.toolbar.handoff" = "Hand Off";
+"main.toolbar.handoff" = "Copy for Agent";
 "main.toolbar.handoff.own" = "For Your Own Agent";
 "main.toolbar.handoff.tip" = "Copy an instruction for your own agent to work on these items";
 "main.toolbar.move" = "Move";
@@ -458,6 +470,7 @@
 "notify.done.recording" = "Recording organized";
 "notify.done.snaps" = "Snaps organized";
 "notify.done.recording_in" = "Organized into %@";
+"notify.done.none" = "No items found";
 
 "notify.failed" = "%@ didn’t finish";
 
@@ -483,7 +496,7 @@
 "main.dictation.mode.compare" = "Changes";
 "main.dictation.typed" = "Typed";
 "main.dictation.heard" = "Heard";
-"main.dictation.same" = "unchanged by polish";
+"main.dictation.same" = "no changes";
 "main.dictation.copied" = "Copied";
 "main.dictation.corrected" = "Corrected";
 "main.dictation.correct" = "Correct";
@@ -510,6 +523,7 @@
 "main.dictation.info.not_typed" = "Not typed";
 "main.dictation.info.polish" = "Polish";
 "main.dictation.info.polish.off" = "Off";
+"main.dictation.info.polish.not_used" = "not used";
 "main.dictation.info.asr" = "Speech model";
 "main.dictation.info.language" = "Language";
 "main.dictation.info.terms" = "Words used";
@@ -539,14 +553,17 @@
 "app.models.show" = "Show";
 "app.models.menu_unpacking" = "Unpacking speech models…";
 "app.models.stop" = "Stop";
+"app.models.disk_full" = "%1$@ needed, %2$@ free";
+"app.models.show_storage" = "Show Storage";
+"app.models.started" = "Downloading speech models in the background (%@)";
 "app.toast.welcome_dictation_only" = "Blurt is in the menu bar · %@ to dictate";
 "app.toast.welcome_no_model" = "Blurt is in the menu bar · no speech model yet";
 "app.toast.welcome_no_model.action" = "Download";
 "app.toast.welcome_plain" = "Blurt is in the menu bar";
 "app.toast.welcome_setup" = "Blurt is in the menu bar · dictation is off";
 "app.toast.welcome_setup.action" = "Turn On…";
-"app.toast.welcome_taken" = "Blurt is in the menu bar · %@ is unavailable";
-"app.toast.welcome_taken_many" = "Blurt is in the menu bar · %@ shortcuts are unavailable";
+"app.toast.welcome_taken" = "Blurt is in the menu bar · %@ is taken";
+"app.toast.welcome_taken_many" = "Blurt is in the menu bar · %@ shortcuts are taken";
 "app.toast.welcome_snap_only" = "Blurt is in the menu bar · %@ to snap";
 "app.url.ask_record" = "A link wants to start a screen recording";
 "app.url.ask_snap" = "A link wants to take a snap";
@@ -564,6 +581,8 @@
 // dogfood v0.9 review
 "app.toast.welcome_not_set_up" = "Blurt is in the menu bar · dictation isn’t set up yet";
 "app.toast.welcome_not_set_up.action" = "Set Up…";
+"app.toast.welcome_unreadable" = "Blurt is in the menu bar · couldn’t check speech models";
+"app.toast.welcome_unreadable.action" = "Retry";
 "app.config.show" = "Show File";
 "app.models.offline" = "Speech models download when you’re online";
 "main.speech.recommended_recordings" = "Recommended model for recordings · %@";
@@ -622,7 +641,6 @@
 "main.filter.kind_plural.task" = "tasks";
 "main.toolbar.filter" = "Filter";
 "main.toolbar.filter.tip" = "Show only some kinds or states";
-"main.toolbar.title" = "Title";
 "main.sidebar.project_tip" = "%@ · its ids start with %@";
 "main.palette.section.selected" = "Selected Item";
 "main.palette.section.selected_n" = "Selected Items";
@@ -641,7 +659,7 @@
 "main.palette.hint.copy_full" = "Copy the whole item as text";
 
 /* several items selected (SelectionView) */
-"main.selection.hand_off" = "Hand Off";
+"main.selection.hand_off" = "Copy for Agent";
 "main.selection.move" = "Move to Project…";
 "main.selection.more" = "More Actions";
 "main.selection.remove" = "Remove from Selection";
@@ -718,9 +736,42 @@
 "main.jobs.title.failed" = "Failed";
 
 /* An item whose session ended without reporting back */
-"main.row.session_ended" = "Session ended";
-"main.row.session_ended.help" = "It went to an agent session in an older version of Blurt, which ended without reporting the work as done. Mark it done or take it back.";
+"main.row.session_ended" = "No report";
+"main.row.session_ended.help" = "It went to an agent in an older version of Blurt, which stopped without reporting back. Mark it done or take it back.";
 
 /* A folder opened as a new project */
 "main.open.added" = "Added %1$@ · items start at %2$@-1";
 "main.open.rename" = "Rename";
+"main.drop.text" = "text";
+"main.drop.and" = ", ";
+"main.drop.new_item" = "Drop for a new item";
+"main.drop.new_item_in" = "New item in “%@”";
+"main.drop.add_to" = "Add to “%@”";
+"main.drop.file_to" = "File to “%@”";
+"main.drop.read_only" = "Read-only item — drop on the band above for a new one";
+"main.drop.folders" = "Folders open as projects — drop on the sidebar";
+"main.drop.folders_skipped" = "%@ · folder skipped";
+"main.drop.added" = "Added to “%@” · %@";
+"main.drop.added_undo" = "Add to “%@”";
+"main.drop.add_failed" = "Couldn’t add to the item";
+"main.new_item.remove_file" = "Remove %@";
+"main.drop.pick_add" = "Add";
+"main.drop.pick_message" = "Add pictures or files to “%@”";
+
+/* A recording's row on Home and in the items' places (RecordingViews.swift, BlurtCore Recordings) */
+"main.rec.section" = "Recordings";
+"main.rec.kind" = "Recording";
+"main.rec.state.unorganised" = "Not organized";
+"main.rec.state.organising" = "Organizing";
+"main.rec.state.failed" = "Didn’t finish";
+"main.rec.state.video_only" = "Video only";
+"main.rec.why.no_agent" = "No agent available";
+"main.rec.untitled" = "Untitled recording";
+"main.rec.show_details" = "Show Details";
+"main.rec.why.no_agent_then" = "No agent was available to organize this.";
+"main.rec.video_gone" = "Video deleted";
+"main.rec.play" = "Play Video";
+"main.rec.organise" = "Organize";
+"main.rec.review" = "Show Items";
+"main.rec.copy_request" = "Copy “%@”";
+"main.rec.request_copied" = "Copied. Paste it into your agent’s chat.";

@@ -106,9 +106,10 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).parent))
 import dictation_vocab  # noqa: E402
+from _common import uv_bin  # noqa: E402
 from _common import (BLURT_HOME, CPU_SERVE_IDLE, IS_MAC, IS_WIN, MODELS_DIR, SERVE_IDLE, die, ffmpeg_bin, fmt_ts, global_config,  # noqa: E402
                      landed_in, load_json, probe_duration, progress_line, save_config_if_readable, save_json,
-                     server_exit, serve_exit_reason, serve_said, use_system_certs)
+                     server_exit, serve_exit_reason, serve_said, use_system_certs, disk_full)
 from _common import (begin_download, download_lock, download_path, end_download, fetch, folder_complete,  # noqa: E402
                      safetensors_complete, watch_parent, write_text_atomic)
 
@@ -823,6 +824,8 @@ def model_path(m: dict) -> Path | None:
     if inst.get("archive"):
         d = MODELS_DIR / inst["dir"]
         need = [d / k.rstrip("/") for k in inst.get("keep", [])]
+        if inst.get("modelscope"):
+            return d if folder_complete(d, legacy=lambda _: all(p.exists() for p in need)) else None
         return d if d.is_dir() and all(p.exists() for p in need) else None
     if inst.get("hf"):
         own = MODELS_DIR / "asr" / inst["hf"].split("/")[-1]       # a ModelScope download (the mirror)
@@ -841,6 +844,83 @@ def model_path(m: dict) -> Path | None:
 def _own_legacy_complete(d: Path) -> bool:
     """A mirror download from before the manifest: its config, every weight shard, and no file still partial."""
     return (d / "config.json").exists() and safetensors_complete(d) and not any(d.glob("*.part"))
+
+
+def blurt_downloaded(m: dict) -> bool:
+    """The model's files are ones Blurt fetched: everything under MODELS_DIR (files, archives, a ModelScope copy, the
+    old faster-whisper folder), or a Hugging Face snapshot a Blurt `setup` saw finish (_hf_record). A model that is
+    only in the shared Hugging Face cache — put there by another tool (a Whisper for mlx-whisper) — is never chosen
+    automatically: dictation uses only models Blurt downloaded (the founder, 2026-11-21; dogfood 1.1.0: a cached
+    Whisper silently became the dictation engine while setup said macOS speech was ready). Downloading it from Blurt
+    is then quick (the files are already there) and makes it Blurt's. Cloud and built-in models count as Blurt's."""
+    if not m.get("local", True) or m.get("builtin"):
+        return True
+    inst = m.get("install") or {}
+    if not inst.get("hf"):
+        return True
+    if folder_complete(MODELS_DIR / "asr" / inst["hf"].split("/")[-1], legacy=_own_legacy_complete):
+        return True
+    p = model_path(m)
+    try:
+        # in the models folder, as found or as resolved (a models folder or model linked to another disk is still ours)
+        if p is not None and (p.is_relative_to(MODELS_DIR) or p.resolve().is_relative_to(MODELS_DIR.resolve())):
+            return True
+    except OSError:
+        pass
+    rec = load_json(_hf_record(inst["hf"]), None)
+    if isinstance(rec, dict) and rec.get("snapshot"):
+        return True
+    # dictated with through Blurt before: a download from before Blurt kept records (2026-10-25) stays the user's engine
+    if m.get("id") in _dictated_with():
+        return True
+    return m.get("backend") == "faster-whisper" and (MODELS_DIR / "faster-whisper").is_dir()
+
+
+_DICTATED: tuple = (None, frozenset())
+
+
+def _dictated_with() -> frozenset:
+    """The recognisers the dictation history says typed a take (its `asr_model`), read again only when the file changes."""
+    global _DICTATED
+    f = MODELS_DIR.parent / "dictation" / "history.jsonl"
+    try:
+        st = f.stat()
+    except OSError:
+        return frozenset()
+    key = (st.st_mtime_ns, st.st_size)
+    if _DICTATED[0] != key:
+        ids = set()
+        with open(f, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                if '"asr_model"' not in line:
+                    continue
+                try:
+                    v = json.loads(line).get("asr_model")
+                except (ValueError, AttributeError):
+                    continue
+                if isinstance(v, str):
+                    ids.add(v)
+        _DICTATED = (key, frozenset(ids))
+    return _DICTATED[1]
+
+
+def found_elsewhere(m: dict) -> bool:
+    """The model's files are here but not as Blurt's own (blurt_downloaded): never run by itself."""
+    inst = m.get("install") or {}
+    if not m.get("local", True) or m.get("builtin") or not inst.get("hf") or model_path(m) is None:
+        return False
+    return not blurt_downloaded(m)
+
+
+def adopt_snapshot(m: dict, snap: Path) -> None:
+    """A Download of a model whose files are already in the shared Hugging Face cache: that snapshot is Blurt's now
+    (the record setup writes when its own download finishes)."""
+    repo = ((m.get("install") or {}).get("hf")) or ""
+    if not repo or not snap.is_dir() or snap.resolve().is_relative_to(MODELS_DIR.resolve()):
+        return
+    write_text_atomic(_hf_record(repo), json.dumps(
+        {"snapshot": snap.name, "files": sorted(str(f.relative_to(snap)) for f in snap.rglob("*") if f.is_file()),
+         "adopted": True}))
 
 
 def installed(m: dict) -> bool:
@@ -963,6 +1043,8 @@ def install_model(m: dict) -> Path:
         return MODELS_DIR
     have = model_path(m)
     if have:
+        if found_elsewhere(m):
+            adopt_snapshot(m, have)          # asked for by name: the copy found here is this model's download
         if m.get("package"):
             ensure_package(m)
         return have
@@ -1004,7 +1086,11 @@ def _install_unlocked(m: dict) -> Path:
         for rel in inst["files"]:
             download(rel)
     elif inst.get("archive"):
-        _install_archive(m)
+        mirror = inst.get("modelscope")
+        if mirror and os.environ.get("BLURT_HF_MIRROR"):
+            _modelscope(mirror["repo"], float(m["size_mb"]), dest=MODELS_DIR / inst["dir"], files=mirror["files"])
+        else:
+            _install_archive(m)
     elif inst.get("hf"):
         mirrored = inst["hf"].startswith(("mlx-community/", "Qwen/"))   # ModelScope mirrors mlx-community & Qwen (fast from China)
         if mirrored and mirror_on():
@@ -1038,34 +1124,46 @@ def _install_unlocked(m: dict) -> Path:
     return path
 
 
-def _modelscope(repo: str, total_mb: float) -> Path:
-    """An mlx-community repo from ModelScope's mirror → MODELS_DIR/asr/<name>: the manifest and the download marker
-    first (the folder is a model only once every file is in: folder_complete), each file through <name>.part,
-    continued where a cut-short download left it."""
-    dest = MODELS_DIR / "asr" / repo.split("/")[-1]
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        while chunk := stream.read(1 << 20):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _modelscope(repo: str, total_mb: float, *, dest: Path | None = None,
+                files: dict[str, dict[str, str]] | None = None) -> Path:
+    """Download a ModelScope repo or a pinned subset, using the download marker and resumable .part files."""
+    dest = dest if dest is not None else MODELS_DIR / "asr" / repo.split("/")[-1]
     api = f"https://modelscope.cn/api/v1/models/{repo}/repo/files?Recursive=true"
     try:
         with urllib.request.urlopen(urllib.request.Request(api, headers={"User-Agent": "blurt"}), timeout=30) as r:
-            files = json.load(r)["Data"]["Files"]
+            listing = json.load(r)["Data"]["Files"]
     except Exception as e:  # noqa: BLE001
         raise Fail(f"could not download {repo} from ModelScope: {e}", "network")
-    want = [x for x in files if x.get("Type") == "blob" and not x["Path"].endswith((".md", ".gitattributes"))]
+    blobs = {x["Path"]: x for x in listing if x.get("Type") == "blob" and not x["Path"].endswith((".md", ".gitattributes"))}
+    want = {local: spec["path"] for local, spec in files.items()} if files is not None else {name: name for name in blobs}
+    if not want or any(name not in blobs for name in want.values()):
+        raise Fail(f"ModelScope is missing required files for {repo}", "network")
     try:
-        begin_download(dest, [{"path": x["Path"], "size": x.get("Size")} for x in want])
+        begin_download(dest, [{"path": local, "size": blobs[remote].get("Size")} for local, remote in want.items()])
     except ValueError as e:
         raise Fail(f"invalid ModelScope manifest: {e}", "network") from None
     done = 0.0
     base = float(os.environ.get("BLURT_SETUP_BASE_MB") or 0.0)
     span = max(1.0, total_mb - base)
     serve_said(f"downloading {repo} (ModelScope)")
-    for x in want:
-        p = download_path(dest, x["Path"])
-        if p.exists() and p.stat().st_size == x.get("Size"):
-            done += p.stat().st_size / 2**20
+    for local, remote in want.items():
+        p = download_path(dest, local)
+        size = blobs[remote].get("Size")
+        expected = files[local]["sha256"] if files is not None else None
+        if p.is_file() and p.stat().st_size == size and (expected is None or _sha256(p) == expected):
+            done += size / 2**20
             continue
         p.parent.mkdir(parents=True, exist_ok=True)
         tmp = p.with_name(p.name + ".part")
-        url = f"https://modelscope.cn/models/{repo}/resolve/master/{x['Path']}"
+        url = f"https://modelscope.cn/models/{repo}/resolve/master/{urllib.parse.quote(remote)}"
         t0 = [time.time()]
 
         def progress(have: int, _total: int) -> None:
@@ -1076,15 +1174,18 @@ def _modelscope(repo: str, total_mb: float) -> Path:
         got = 0
         for attempt in range(3):
             try:
-                got = fetch(url, tmp, x.get("Size"), progress)       # each try continues the last one's bytes
+                got = fetch(url, tmp, size, progress)       # each try continues the last one's bytes
             except Exception as e:  # noqa: BLE001
                 if attempt == 2:
                     raise Fail(f"could not download {repo} from ModelScope: {e}", "network")
                 continue
-            if not x.get("Size") or got == x["Size"]:          # a dropped connection can end the read quietly
+            if not size or got == size:          # a dropped connection can end the read quietly
                 break
             if attempt == 2:
-                raise Fail(f"could not download {repo} from ModelScope: {x['Path']} came short", "network")
+                raise Fail(f"could not download {repo} from ModelScope: {remote} came short", "network")
+        if expected is not None and _sha256(tmp) != expected:
+            tmp.unlink(missing_ok=True)
+            raise Fail(f"could not download {repo} from ModelScope: SHA-256 mismatch for {local}", "network")
         done += got / 2**20
         os.replace(tmp, p)
     end_download(dest)
@@ -1168,7 +1269,7 @@ def _proc_written_mb(handle: int) -> float:
 
 def _reexec_with(pkgs: list[str]) -> None:
     """Run this very command again under `uv run --with` these packages (and the ones already added)."""
-    uv = shutil.which("uv") or str(BLURT_HOME / "bin" / ("uv.exe" if IS_WIN else "uv"))
+    uv = uv_bin() or str(BLURT_HOME / "bin" / ("uv.exe" if IS_WIN else "uv"))
     tried = [p for p in os.environ.get("BLURT_ASR_REEXEC", "").split(",") if p]
     new = [p for p in dict.fromkeys(pkgs) if p not in tried]
     if not new or not Path(uv).exists() or not sys.argv[0].endswith(".py"):
@@ -3115,13 +3216,16 @@ def select(purpose: str, a=None) -> dict:
                                                                      if c["fits"] and len(c["speaks"]) == len(rec["languages"])]
     apple = entry(APPLE)
     apple_ok = bool(apple and runs_here(apple) and installed(apple) and all(speaks(apple, x) for x in rec["languages"]))
-    # a local model hears through the VAD (0.6 MB) too: one whose own files are already here from elsewhere (a Whisper
-    # in a shared Hugging Face cache) doesn't beat macOS's recogniser, which needs nothing, until the VAD is in
+    # only a model Blurt downloaded: one whose files are here from elsewhere (a Whisper in a shared Hugging Face cache,
+    # found_elsewhere) is never picked by itself — it cold-started a 1.6 GB model while setup said macOS's recogniser
+    # was ready (dogfood 2026-11-21). And a local model hears through the VAD (0.6 MB, shipped with the skill:
+    # bundled_vad): an install that lost it keeps macOS's recogniser, which needs nothing, until it is back.
     bundled_vad()
     vad = (MODELS_DIR / "silero_vad.onnx").is_file()
     for mid in dict.fromkeys(order):
         m = entry(mid)
-        if m and m.get("local", True) and runs_here(m) and installed(m) and (vad or m.get("builtin") or not apple_ok):
+        if m and m.get("local", True) and runs_here(m) and installed(m) and (mid == chosen or blurt_downloaded(m)) \
+                and (vad or m.get("builtin") or not apple_ok):
             return m
         if m and not m.get("local", True) and not local_only() and installed(m) and mid == chosen:
             return m
@@ -3275,6 +3379,26 @@ def print_summary(data: dict, files: list[str], **extra) -> None:
                      ensure_ascii=False, indent=2))
 
 
+LEVEL_QUIET = 0.08      # a take whose loudest moments stay under this (≈ −22 dBFS) is quiet: an ordinary take's are ~0.18
+LEVEL_PEAK = 0.25       # where a quiet take's loudest moments are brought to (≈ −12 dBFS)
+LEVEL_MAX_GAIN = 32.0   # +30 dB at most: below that it is a muted or dead input, not a quiet voice
+
+
+def level_up(samples: np.ndarray) -> np.ndarray:
+    """Quiet audio brought up to a speaking level before the VAD and the model hear it. Someone speaking softly, or
+    further from the microphone, records 10–30 dB under a normal take, and the VAD and the models hear that worse than
+    the same words at a normal level: whole sentences go missing (docs/design/dictation.md §Quiet speech). Only a take
+    that is quiet is touched — audio at a usual level is returned as it is, and nothing is ever turned down. The
+    loudest moments set the gain (the 99.9th percentile, so one click doesn't), and only where the VAD then decides
+    whether there is speech at all — a room's hiss made louder is still not handed to a model as words."""
+    if len(samples) == 0:
+        return samples
+    peak = float(np.percentile(np.abs(samples), 99.9))
+    if peak <= 0 or peak >= LEVEL_QUIET:
+        return samples
+    return (samples * min(LEVEL_MAX_GAIN, LEVEL_PEAK / peak)).astype(samples.dtype, copy=False)
+
+
 def transcribe_track(samples: np.ndarray, backend, name: str, workers: int, label: str | None = None,
                      quiet: bool = False):
     """VAD → chunks → backend. Returns ([(start, end, text, label[, language])], speech s, s that decoded to nothing).
@@ -3295,10 +3419,13 @@ def transcribe_track(samples: np.ndarray, backend, name: str, workers: int, labe
         # Only the ONNX build (Windows / Linux) is gated: the Mac's MLX model keeps its measured path, with no VAD pass
         if 0 < dur <= backend.max_chunk:
             gate = getattr(backend, "vad_gate", False)
+            if gate:
+                samples = level_up(samples)     # with the VAD deciding: a quiet voice at a usual level for both
             chunks = [(0.0, dur)] if not gate or vad_segments(samples, max_speech=min(25, backend.max_chunk)) else []
         else:
             chunks = pause_spans(samples, backend.max_chunk)
     else:
+        samples = level_up(samples)
         segs = vad_segments(samples, max_speech=min(25, backend.max_chunk))
         chunks = group_chunks(segs, backend.max_chunk)
     sp = sum(e - s for s, e in chunks)
@@ -3911,7 +4038,14 @@ class NoteEngine:
                 self.backend.close()     # its model goes before the next one loads (a language change keeps it)
             elif self.backend is not None and hasattr(self.backend, "_ex"):
                 self.backend._ex.shutdown(wait=False)   # the same model: only its thread goes
-            self.backend = make_backend(name, a, "note")
+            loading = SERVING and (self.backend is None or a.model_id != self.model_id)
+            if loading:
+                serve_loading(True)
+            try:
+                self.backend = make_backend(name, a, "note")
+            finally:
+                if loading:
+                    serve_loading(False)
             self.name, self.model_id, self.language = name, a.model_id, language or None
         return self
 
@@ -4197,6 +4331,23 @@ def serve_stream(conn: socket.socket, req: dict, extra: bytes) -> None:
 
 
 SERVE_FILE = RUN_DIR / "asr-serve.json"
+
+
+def serve_loading(on: bool) -> None:
+    """The server's run file says while its model loads (`loading_since`): a load answers nothing until it is done
+    (the preload runs before the loop; a cold `load` or `note` inside it), and a load waiting on the disk or the GPU
+    can show no CPU for seconds — the app took that for a hang, ended the server mid-load and loaded the same model
+    again in the CLI beside a fresh one (first dictation after setup: 31 s, dogfood 2026-11-21). Only this server's
+    own file is touched."""
+    info = load_json(SERVE_FILE, None)
+    if not isinstance(info, dict) or info.get("pid") != os.getpid():
+        return
+    if on:
+        info["loading_since"] = datetime.now().astimezone().isoformat(timespec="seconds")
+    else:
+        info.pop("loading_since", None)
+    with contextlib.suppress(OSError):
+        save_json(SERVE_FILE, info)
 
 
 def _server_call(req: dict, timeout: float = 120) -> dict | None:
@@ -4665,8 +4816,9 @@ def dictation_models(hw: dict | None = None) -> dict:
     # without the VAD, macOS's recogniser (the voice-note pick then) runs before a model whose files only are here —
     # unless the user chose that model
     pick = (configured,) if not vad and note_pick["id"] == APPLE else (configured, rec, *usable)
+    # only what Blurt downloaded runs unasked (blurt_downloaded); the model the user configured is their choice
     selected = next((mid for mid in pick if mid and entry(mid) and runs_here(entry(mid))
-                     and installed(entry(mid))), note_pick["id"])
+                     and installed(entry(mid)) and (mid == configured or blurt_downloaded(entry(mid)))), note_pick["id"])
     rows = []
     for mid in DICTATION_MODELS + DICTATION_CLOUD:
         m = entry(mid)
@@ -4678,7 +4830,8 @@ def dictation_models(hw: dict | None = None) -> dict:
             continue        # a cloud service: only with its key, never when recognition stays on this Mac
         if mid in (FUN_MLX, FUN_CPU) and not speaks_all(m, langs) and mid not in (configured, selected):
             continue        # three languages: not offered to someone who speaks another (unless already chosen)
-        have = installed(m)
+        # files only in the shared Hugging Face cache: not counted as installed (a Download makes them Blurt's at once)
+        have = installed(m) and (mid == configured or blurt_downloaded(m))
         rows.append({"id": mid, "name": m.get("name"), "backend": m["backend"], "size_mb": m["size_mb"],
                      "ram_mb": m.get("ram_mb"), "installed": have and (vad or not m.get("local", True) or bool(m.get("builtin"))),
                      "files": have,
@@ -4734,8 +4887,9 @@ def cmd_models(_a):
         r = {k: v for k, v in m.items() if k not in ("install", "rtf_ref", "error_ref")}
         r["local"] = m.get("local", True)
         r["role"] = "asr"
-        r["installed"] = installed(m)
-        p = model_path(m) if r["local"] else None
+        # a copy Blurt didn't download (the shared Hugging Face cache) isn't installed, nor its size Blurt's
+        r["installed"] = installed(m) and (m["id"] in sel.values() or not found_elsewhere(m))
+        p = model_path(m) if r["local"] and r["installed"] else None
         if p:
             r["path"] = str(p)
             r["size_mb"], r["approx"] = _du_mb(p), False
@@ -5137,11 +5291,15 @@ def main():
          "dictation-models": cmd_dictation_models, "check-cloud": cmd_check_cloud, "voiceprint": cmd_voiceprint}[a.cmd](a)
     except Fail as e:
         print(f"ERROR: {e}", file=sys.stderr)
-        emit({"ok": False, "error": str(e), "code": e.code})
+        emit({"ok": False, "error": str(e), "code": "disk_full" if disk_full(e) else e.code})
         if a.cmd == "serve":
             server_exit(e.exit_code)
         sys.exit(e.exit_code)
     except Exception as e:  # noqa: BLE001 — a server never goes through the interpreter's teardown (server_exit)
+        if a.cmd == "setup" and disk_full(e):
+            print(f"ERROR: {e}", file=sys.stderr)
+            emit({"ok": False, "error": str(e)[:300], "code": "disk_full"})
+            sys.exit(1)
         if a.cmd in ("note", "check-cloud"):
             # the app reads the last JSON line: a crash still says what it was (it read a bare "error" before)
             import traceback

@@ -25,7 +25,7 @@ enum JobLook {
     /// captured ("口喷鸡还在整理今天 19:40 的内容。") — never the job's own title, which starts with "整理" again.
     static func quitTitle(_ j: Job) -> String {
         if let s = j.session, let t = batchTitle(s) { return T("app.quit.organizing.title", t) }
-        if let s = j.session { return T("app.quit.organizing.title_at", sessionLabel(s)) }
+        if let s = j.session { return T("app.quit.organizing.title_at", sessionLabel(s, inSentence: true)) }
         return T("app.quit.organizing.title_n", 1)
     }
 
@@ -38,8 +38,9 @@ enum JobLook {
         return nil
     }
 
-    /// A session dir's batch title, else its time stamp as a date.
-    static func sessionLabel(_ dir: URL) -> String {
+    /// A session dir's batch title, else its time stamp as a date. inSentence: the date goes inside a sentence
+    /// ("…what you captured yesterday at 08:36"), so its relative word isn't capitalised.
+    static func sessionLabel(_ dir: URL, inSentence: Bool = false) -> String {
         if let t = batchTitle(dir) { return t }
         let name = dir.lastPathComponent
         let f = DateFormatter()
@@ -47,13 +48,13 @@ enum JobLook {
         f.dateFormat = "yyyyMMdd-HHmmss"
         // never the folder's own name: when it was made, else just "a capture"
         let made = (try? FileManager.default.attributesOfItem(atPath: dir.path)[.creationDate]) as? Date
-        return (f.date(from: String(name.prefix(15))) ?? made).map(Loc.dateTime) ?? T("main.job.capture")
+        return (f.date(from: String(name.prefix(15))) ?? made).map(inSentence ? Loc.dateTimeInSentence : Loc.dateTime) ?? T("main.job.capture")
     }
 
     /// A failed job's reason in words, naming its agent when it has one: the detail and the failure notification say
     /// the same thing.
     static func errorText(_ j: Job) -> String? {
-        j.error.map { errorText($0, agent: j.usage?.agent.map(AgentNames.name)) }
+        j.error.map { errorText($0, agent: j.usage?.agent.map(AgentNames.name) ?? agentName(j)) }
     }
 
     /// A failed job's reason in words: its hint, else the sentence composed when it failed (which agent, why, the fix
@@ -133,7 +134,7 @@ extension JobLook {
     static func detailTitle(_ j: Job) -> String {
         if j.type == .process, let s = j.session {
             if let t = batchTitle(s) { return T("main.job.title.organizing", t) }
-            return T("main.job.title.organizing_at", sessionLabel(s))
+            return T("main.job.title.organizing_at", sessionLabel(s, inSentence: true))
         }
         return title(j)
     }
@@ -348,6 +349,7 @@ final class JobsSection: NSView {
             text.append(NSAttributedString(attachment: a))
         }
         header.label.attributedStringValue = text
+        header.onTitle = true          // on the title column, as the list's own section headers are
         header.toolTip = folds ? jobs.map { JobLook.title($0) }.joined(separator: "\n") : nil
         setAccessibilityLabel(Self.headerText(jobs))
         stack.addArrangedSubview(header)
@@ -513,8 +515,10 @@ final class JobRow: NSView {
         }
         title.toolTip = name
         title.attributedStringValue = t
-        status.stringValue = JobLook.rowStatus(j)
-        status.textColor = JobLook.statusColor(j)
+        // a failure is already said by the header and the red mark: its time column says when, like an item's
+        let failed = j.state == .failed
+        status.stringValue = failed ? Loc.listDate(j.ended ?? j.created) : JobLook.rowStatus(j)
+        status.textColor = failed ? .secondaryLabelColor : JobLook.statusColor(j)
         status.font = JobLook.fraction(j) != nil ? Look.monoSub : Look.subFont
         let busy = j.state == .running
         aiWorking = busy && (j.type == .process || j.type == .route)
@@ -528,7 +532,7 @@ final class JobRow: NSView {
         mark.image = j.state == .failed ? Look.symbol("xmark.circle.fill", T("job.state.failed"), size: 13) : nil
         mark.contentTintColor = BrandColor.err
         needsLayout = true
-        setAccessibilityLabel("\(name), \(status.stringValue)")
+        setAccessibilityLabel("\(name), \(JobLook.rowStatus(j))")
     }
 
     private func updateWorking() { working.set(active: aiWorking && !selected) }
@@ -639,6 +643,10 @@ final class JobDetailView: NSView {
     private let controls = NSStackView()
     private let sub = NSTextField(labelWithString: "")
     private let error = NSTextField(wrappingLabelWithString: "")
+    /// A recording's failed run: its way forward and the recording's own buttons, all in sight (no ⋯)
+    private let recControls = NSStackView()
+    /// the recording this run organises (nil: not a recording's run)
+    private var rec: Recordings.Row?
     private let progress = NSView()
     private let bar = FlatProgressBar()
     private let doing = NSTextField(labelWithString: "")
@@ -710,11 +718,15 @@ final class JobDetailView: NSView {
         stack.spacing = 6
         // the title's line on the list's first line ("Running · 1"): one top under the toolbar for both columns
         stack.edgeInsets = NSEdgeInsets(top: 3, left: 24, bottom: 16, right: 24)
-        let full: [NSView] = [headerRow, sub, error, progress, stepsTitle, stepsCard, itemsTitle, itemsCard]
+        recControls.orientation = .horizontal
+        recControls.spacing = 8
+        recControls.alignment = .centerY
+        let full: [NSView] = [headerRow, sub, error, recControls, progress, stepsTitle, stepsCard, itemsTitle, itemsCard]
         for v in full { stack.addArrangedSubview(v) }
         stack.setCustomSpacing(1, after: headerRow)
         stack.setCustomSpacing(18, after: sub)
         stack.setCustomSpacing(18, after: error)
+        stack.setCustomSpacing(24, after: recControls)
         stack.setCustomSpacing(24, after: progress)
         stack.setCustomSpacing(8, after: stepsTitle)
         stack.setCustomSpacing(24, after: stepsCard)
@@ -760,9 +772,13 @@ final class JobDetailView: NSView {
 
     func show(_ j: Job, projectName: String?) {
         job = j
-        header.stringValue = JobLook.detailTitle(j)
+        // a recording's run is the recording's: "Recording · 3:12 · what was said first", its state word (未完成, never
+        // 失败), its buttons
+        rec = RecordingLook.row(of: j)
+        header.stringValue = rec.map(RecordingLook.detailTitle) ?? JobLook.detailTitle(j)
         header.toolTip = header.stringValue
         sub.stringValue = Self.subtitle(j, projectName: projectName)
+        if let r = rec, r.state.job == j.id { sub.stringValue = RecordingLook.stateText(r) + "  ·  " + sub.stringValue }
         sub.isHidden = sub.stringValue.isEmpty
         stack.setCustomSpacing(18, after: sub)
 
@@ -771,7 +787,7 @@ final class JobDetailView: NSView {
             error.stringValue = T("main.job.stopped")
             error.textColor = .secondaryLabelColor
             error.isHidden = false
-        } else if let why = JobLook.errorText(j) {
+        } else if let why = rec != nil ? RecordingLook.failureText(j) : JobLook.errorText(j) {
             error.stringValue = why
             error.textColor = BrandColor.err
             error.isHidden = false
@@ -822,6 +838,11 @@ final class JobDetailView: NSView {
 
     private func showControls(_ j: Job) {
         controls.arrangedSubviews.forEach { $0.removeFromSuperview() }
+        recControls.arrangedSubviews.forEach { $0.removeFromSuperview() }
+        recControls.isHidden = true
+        if let r = rec, j.state == .failed, !j.dismissed, r.state.job == j.id {
+            return showRecordingControls(j, r)
+        }
         let canRetry = (j.state == .failed || JobLook.stopped(j)) && j.type == .process && (j.session != nil || !j.items.isEmpty)
         var more: [(String, String)] = []
         if JobStop.canStop(j) {
@@ -837,8 +858,11 @@ final class JobDetailView: NSView {
             b.hPad = 12
             b.radius = 6
             controls.addArrangedSubview(b)
-            if j.state == .failed, !j.dismissed { more.append((T("main.job.dismiss"), "dismiss")) }
+            // a signed-out agent: the way to sign in, next to Try Again; Dismiss in sight, not behind ⋯
+            if j.state == .failed, j.error?.code == "auth" { controls.addArrangedSubview(plain(T("main.job.sign_in"), "agents")) }
+            if j.state == .failed, !j.dismissed { controls.addArrangedSubview(plain(T("main.job.dismiss"), "dismiss")) }
         } else if j.state == .failed, !j.dismissed {
+            if j.error?.code == "auth" { controls.addArrangedSubview(plain(T("main.job.sign_in"), "agents")) }
             controls.addArrangedSubview(plain(T("main.job.dismiss"), "dismiss"))
         } else if j.state == .done, !j.items.isEmpty {
             controls.addArrangedSubview(plain(TP("main.job.show_items", j.items.count), "items"))
@@ -854,6 +878,25 @@ final class JobDetailView: NSView {
             menu.addItem(i)
         }
         controls.addArrangedSubview(MenuButton(menu: menu, label: T("main.job.more")))
+    }
+
+    /// A recording's failed run, by what can be done now: an agent usable → Retry; none → Set Up an Agent… (and what to
+    /// say to one). Then Play Video, Show in Finder, Show Log, Dismiss — one primary, the rest plain, all in sight.
+    private func showRecordingControls(_ j: Job, _ r: Recordings.Row) {
+        let can = RecordingLook.agent != false
+        let primary = BrandButton(title: can ? T("action.retry") : T("home.recording.set_up_agent"), target: self, action: #selector(tap(_:)))
+        primary.identifier = .init(can ? "retry" : "setup")
+        primary.fontSize = 12
+        primary.hPad = 12
+        primary.radius = 6
+        var views: [NSView] = [primary]
+        if !can { views.append(plain(RecordingLook.label(.copyRequest), "copy_request")) }
+        if r.facts.video != nil { views.append(plain(T("main.rec.play"), "play")) }
+        views.append(plain(T("action.reveal_in_finder"), "reveal"))
+        if logURL(j) != nil { views.append(plain(T("main.job.show_log"), "log")) }
+        views.append(plain(T("main.job.dismiss"), "dismiss"))
+        for v in views { recControls.addArrangedSubview(v) }
+        recControls.isHidden = false
     }
 
     private func plain(_ title: String, _ action: String) -> NSButton {
@@ -932,7 +975,11 @@ final class JobDetailView: NSView {
         guard let j = job else { return }
         switch action {
         case "log": if let u = logURL(j) { NSWorkspace.shared.open(u) }
-        case "reveal": if let s = j.session { NSWorkspace.shared.activateFileViewerSelecting([s]) }
+        case "reveal":
+            if let r = rec { RecordingLook.run(.reveal, r) } else if let s = j.session { NSWorkspace.shared.activateFileViewerSelecting([s]) }
+        case "play": if let r = rec { RecordingLook.run(.play, r) }
+        case "setup": if let r = rec { RecordingLook.run(.setUpAgent, r) }
+        case "copy_request": if let r = rec { RecordingLook.run(.copyRequest, r) }
         default: onAction?(action)
         }
     }

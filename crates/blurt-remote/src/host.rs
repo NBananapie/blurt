@@ -18,14 +18,14 @@ pub mod mods {
     pub const FUNCTION: u8 = 16;
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Button {
     Left,
     Right,
     Middle,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ScrollPhase {
     Began,
     Changed,
@@ -35,7 +35,7 @@ pub enum ScrollPhase {
 }
 
 /// RemoteSystemMove: named moves of the OS, each mapped by the backend to its own shortcut or API.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SystemMove {
     /// all windows (Windows: Win+Tab; GNOME: the Activities overview)
     MissionControl,
@@ -49,10 +49,12 @@ pub enum SystemMove {
     ZoomOut,
     /// make the pointer easy to find (optional; may do nothing)
     FindCursor,
+    /// Ctrl+Alt+Del (Windows: the secure attention sequence, SendSAS, with the system service on; elsewhere nothing)
+    SecureAttention,
 }
 
 /// The pointer's look, when it changes: PNG with its hot spot, sizes in points.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct CursorShape {
     pub png: Vec<u8>,
     pub hot_x: f64,
@@ -100,12 +102,20 @@ pub trait Input: Send {
     fn pointer_desktop(&self) -> Option<(f64, f64)> {
         None
     }
+    /// The clipboard's text, for a viewer whose keys are captured (docs/design/remote-desktop-viewer.md §Clipboard): the server
+    /// asks twice a second and sends a change. None (the default): nothing, not text, or this backend can't read it.
+    /// (Added 2026-11-19.)
+    fn clipboard(&mut self) -> Option<String> {
+        None
+    }
+    /// Text from a viewer onto the clipboard, plain text only (at most 64 KiB). The default does nothing.
+    fn set_clipboard(&mut self, _text: &str) {}
 }
 
 /// One of the computer's displays (ToPhone.displays): its frame in points on the desktop (top-left origin, y down, as the OS's display
 /// settings arrange them). On Windows a monitor's frame is its physical rectangle ÷ its own scale; mixed DPI can leave small gaps or
 /// overlaps between them, which is fine: the server only asks which one a point is in.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct DisplayInfo {
     /// stable while it stays connected: the monitor's device name on Windows (\\.\DISPLAY2), the portal stream's id on Linux
     pub id: String,
@@ -126,7 +136,7 @@ impl DisplayInfo {
 }
 
 /// What the phone asked for, already clamped by the server (RemoteScreenRequest + the rate controller's current numbers).
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ScreenConfig {
     /// output size in pixels, even numbers; the source crop is scaled to this size whatever the crop
     pub width: u32,
@@ -161,7 +171,7 @@ impl ScreenConfig {
 }
 
 /// 0…1 of the display being shown (RemoteCrop).
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Crop {
     pub x: f32,
     pub y: f32,
@@ -174,7 +184,7 @@ impl Crop {
 }
 
 /// What's being shown, once the stream is up.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ScreenInfo {
     /// the display's size in points (ToPhone.screenView)
     pub width: f64,
@@ -266,6 +276,13 @@ pub trait Screen: Send {
         self.refresh()
     }
     fn stop(&mut self);
+    /// `stop` in two halves: what has to happen under the backend's lock (telling the capture to end), returned with the wait for it to
+    /// end, which the caller runs without the lock so input, keeping awake and the server's other work go on meanwhile (screen.rs,
+    /// `ScreenSession::stop`). The default stops here and leaves nothing to wait for.
+    fn begin_stop(&mut self) -> Option<Box<dyn FnOnce() + Send>> {
+        self.stop();
+        None
+    }
     /// Whether this stream's encoder makes recovery frames (`recovery_frame` other than a keyframe). Asked after `start`; true lets
     /// the server offer the phone "ltr" (docs/design/remote-realtime.md §2). False (the default): a frame lost for good costs a
     /// keyframe, as before.
@@ -301,6 +318,24 @@ pub trait Backend: Send {
     fn now(&self) -> f64;
     /// Keep the machine (and with `display`, the screen) awake while a phone is connected; false lets it sleep again.
     fn keep_awake(&mut self, on: bool, display: bool);
+    /// On mains power, or a machine with no battery: where 保持可连接 holds it awake. A laptop on battery sleeps as usual.
+    fn plugged_in(&self) -> bool {
+        true
+    }
+    /// A battery in this machine (a laptop): 保持可连接 holds only while plugged in, and Settings says so.
+    fn has_battery(&self) -> bool {
+        false
+    }
+    /// The screen is locked, as far as this backend can tell (Linux: GNOME's screensaver, whose lock ends screen sharing). None: it
+    /// can't tell, or the backend shows the lock screen itself. The server tells the viewer (`screenLocked`).
+    fn locked(&self) -> Option<bool> {
+        None
+    }
+    /// Windows with the system service on: hand its agent what the standby host needs at the login screen (`Host::sync_standby`).
+    fn save_standby(&mut self, _snapshot: &str) {}
+    /// 保持可连接: no idle sleep while devices can connect, nothing else (no screen kept on, no session held open). Apart from
+    /// keep_awake, which a session uses.
+    fn standby_awake(&mut self, _on: bool) {}
     /// Every display, in desktop points (ToPhone.displays). The server asks every 2 s while a phone is connected and tells the phone
     /// when it changed. Empty (the default): one display, whichever the backend shows; nothing is sent.
     fn displays(&self) -> Vec<DisplayInfo> {

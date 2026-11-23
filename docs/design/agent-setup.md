@@ -93,8 +93,9 @@ Inputs: `status`, and the user's answers — `--audio local|cloud` (may the voic
 
 ## 4. In the app
 
-- **Set Up with Agent…** beside *Add Cloud Model…* (Settings → Models → Cloud models) and beside *Add…* on onboarding's
-  cloud row, on every Mac (v1.0.10). The sheet gives an instruction to copy into any agent on the Mac
+- **Set Up with Agent…** beside *Add Cloud Model…* (Settings → Models → Cloud models) and in the chevron menu of
+  onboarding's *Add Key…* split button (cloud polish's row; beside *Add…* on the cloud row without macOS's recogniser),
+  on every Mac (v1.0.10). The sheet gives an instruction to copy into any agent on the Mac
   (`AgentSetupInstruction`: the guide and setup.py by absolute path) — Claude Code, Codex, Cursor, WorkBuddy, a
   conversation already open. Blurt detects and launches nothing. That agent has no token, so its first change makes
   Blurt ask Allow. When every curated service is in (the Add row is gone), the button keeps a row of its own ("Set Up
@@ -154,3 +155,77 @@ An isolated test build (`dev.blurt.recorder.layouttest`, scratch BLURT_HOME, key
 
 Still not verified: a logged-in Claude Code session end to end, `download` of a real model through the agent (the
 recogniser was installed), dark mode of the new surfaces, Gemini CLI / Kimi / OpenCode sandboxes.
+
+## 8. Finding and connecting agents (2026-11-18)
+
+Reports: on Windows, WorkBuddy (国内版) read 未安装 and Connect was hidden; 「获取 WorkBuddy…」 opened the international
+site; the Windows app had no SKILL.md to link; an agent's own runs found neither uv nor ffmpeg. What changed:
+
+- **The skill on Windows / Linux** — build.rs stages SKILL.md, scripts/, reference/, assets/ (not models/) into
+  `gen/skill` with `.version` = app version + a hash of the files; tauri.conf.json bundles it as `skill/`; skill.rs
+  copies it to `$BLURT_HOME/skill` at launch when the stamp differs (copy beside, swap in; the Mac's BundledSkill).
+  paths::scripts_dir prefers that copy, so the app and the agents run the same files, and Connect links agents to it,
+  never to the install folder. agents.py `SKILL_ROOT` must hold SKILL.md (else `$BLURT_HOME/skill`); install()
+  refuses to link a folder without one.
+- **Agent-started runs** — `_common.apply_app_env`: `$BLURT_HOME/bin` at the end of PATH (uv, ffmpeg, ffprobe), and
+  `$BLURT_HOME/run/env.json` (written by the app at launch: mirrors, a chosen data folder's caches) filled in where
+  the variable isn't set. SKILL.md §0 says where uv / ffmpeg are.
+- **Found** = the agent's own config folder exists (`home`: the signal that a skill / MCP written there is read) or
+  its app is found by an id that doesn't move: macOS bundle ids (Info.plist under /Applications…, then `mdfind`),
+  Windows program stems (Uninstall keys incl. WOW6432Node: DisplayIcon / InstallLocation; App Paths; Start Menu
+  shortcuts, their .lnk target parsed; Scoop shims; WinGet links), Linux .desktop ids (XDG, Flatpak, Snap). No CLI
+  is started for an app agent; the result is kept 10 min (`run/agents-apps.json`, Check Again looks again).
+- **Connected** = proof, not config: mcp_server.py notes `clientInfo.name` + time at initialize (and on the new
+  `hello` tool) in `run/mcp-clients.json`; agents.json `mcp_clients` maps names to agents; runs the app started
+  (an organising run: BLURT_RUN_ID) go in the entry's `app_at`, never over the user's own `at` (else Codex fell back
+  from connected to set up after every organising run), and don't count. States: 「已连接 · 15:42 使用过」 › 「已添加，
+  未使用」 (its skill folder / MCP file has blurt) › 「未连接」 (found) › 「未安装」; every row not installed offers
+  「仍要连接…」, which writes into its `home`. After Connect, an agent's `after` is the sheet's next step 「还差一步：…」.
+- **WorkBuddy** is two entries: 「WorkBuddy」 国内版 (`~/.workbuddy`, codebuddy.cn/work) and 「WorkBuddy AI」 国际版
+  (`~/.workbuddy-ai`, workbuddy.ai), each with `after`: 连接器 → blurt → 信任, then a new chat.
+- **Other Agent…** — `agents.py manual`: the skill folder (Copy / Open / Save as .zip), the `mcpServers` JSON and the
+  command + arguments (absolute paths, json.dumps), a prompt the agent follows, Test (a new client in
+  mcp-clients.json), Add to List (`agents.py custom` → record.agent_defs).
+- **One list for card drags** — agents.json `drop` (composer | terminal) + app ids per OS; record.agent_drop.<id> =
+  false switches one off; a program the user adds is a custom agent; v1.0.21's record.agent_apps moves over on the
+  next edit (agents.py migrate_agent_apps = card_drop.rs migrate = AgentDropList.migrate).
+
+Verified on this Mac (2026-11-18, apps installed): bundle ids and homes of Cursor (`~/.cursor`), Qoder (`~/.qoder`,
+`mcp.json` with `mcpServers`), QoderWork, Trae / Trae CN, Kimi Code, Antigravity, DoubaoWork, WorkBuddy 国内版
+(`com.tencent.workbuddy.mac`, `~/.workbuddy`), Windsurf (now Devin.app, same bundle id; `~/.codeium/windsurf`).
+From documentation: Kiro (`~/.kiro/settings/mcp.json`, `~/.kiro/skills`), Windsurf's `mcp_config.json`. Marked
+`unverified` in agents.json: WorkBuddy AI's app ids, every Windows program stem (from the Mac names), Linux ids,
+Antigravity's skill / MCP paths (sources disagree), Windsurf's and Trae CN's skill folders, ZCode. Needs a Windows VM:
+the registry / shortcut lookup on a real install of WorkBuddy (both editions) and Cursor, Connect into
+`%USERPROFILE%\.workbuddy`, the skill copy at launch from Program Files, card drags into WorkBuddy AI.
+
+## 9. Reporting back from a hand-off (2026-11-21, 1.1.0 dogfood)
+
+The dogfood's Codex run (`codex exec`, approval `never`) did the work, but both `mark_fixed` calls were refused ("MCP
+tool call requires approval, but approval policy is never"); the note offered its `items.py` fallback only "without
+the MCP", so the item sat at *Handed off* with a banner that said "Copied for your agent". What changed:
+
+- **Connect writes per-tool approval for the reporting tools only** — `[mcp_servers.blurt.tools.<t>] approval_mode =
+  "approve"` for `mark_fixed`, `get_item`, `search_items` in `$CODEX_HOME/config.toml` (agents.json `mcp.approve`).
+  Nothing that takes a key (`setup_connect`) is in the list; every other tool still asks. Connect's preview lists it
+  as its own row ("Allow reports without asking") with the line under Details. Checked against codex-cli 0.165:
+  the shape is accepted (`auto | prompt | writes | approve`); a tools table written *before* `[mcp_servers.blurt]`
+  exists makes Codex refuse its whole config ("invalid transport"), and `codex mcp add` rewrites the server's table
+  and drops the tools tables — so the approvals go in after the add, every Connect checks them again, and the file is
+  loaded with `codex mcp get blurt --json` afterwards (put back byte for byte if Codex can't load it).
+- **The note** asks for `fixing` at the start and gives the `items.py` commands for "the tool isn't there **or a call
+  fails**", with the item's uid filled in (one item) and `--agent <name>`; the pasted instruction says the same in one
+  line. A task's `expected` is written as **Done when** (完成标准), after the details; the bundle does the same.
+- **Who reports** — `mark_fixed` without `agent` takes the MCP client's `clientInfo.name` mapped through agents.json
+  (`codex-mcp-client` → codex); an agent's report never inherits the user's `"human"` from the hand-off, and the
+  user's own change after it is the user's, never "Done by Codex". An agent the doc can't name gets no "by …" part.
+- **The banner** says which it is: *Handed off to your agent* (Take Back · Mark as Done); after an hour with no word,
+  *Handed off 3 hr. ago · no word from your agent yet*; once the agent reports, *Codex is working on it · started 5
+  min. ago*. One name for the state everywhere: Handed off / 已交给 Agent.
+- **⌘Z** — the hand-off is its own undo step; undoing a state step changes only items still in the state it left
+  them in (`items.py state --undo --from-state S`), so an agent's report that came in since is kept (the toast names
+  the items left alone).
+
+Verified 2026-11-21: a real `codex exec --sandbox workspace-write` (approval never) on a scratch repo and scratch
+`CODEX_HOME`, Connect run by `agents.py install codex --mcp`: both `mark_fixed` calls completed, the item went
+handed_off → in_progress (agent codex) → to_verify with Codex's note, `work.agent = "codex"` from clientInfo.

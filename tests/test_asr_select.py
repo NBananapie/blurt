@@ -36,6 +36,11 @@ import transcribe as T  # noqa: E402
 
 SR = 16000
 
+# the fakes below (fake_installed, T.installed = …) stand for models Blurt downloaded; the tests of a model that is only
+# in the shared Hugging Face cache put the real rule back (AppleSpeechSelect.test_a_model_only_in_the_hf_cache_…)
+REAL_BLURT_DOWNLOADED = T.blurt_downloaded
+T.blurt_downloaded = lambda m: True
+
 
 def hw(os_="darwin", arch="arm64", ram=128.0, gpu=None, perf=6, eff=12, battery=False) -> dict:
     h = {"os": os_, "arch": arch, "chip": "test", "perf_cores": perf, "eff_cores": eff, "ram_gb": ram,
@@ -68,6 +73,18 @@ def config(cfg: dict):
             path.unlink(missing_ok=True)
         else:
             path.write_bytes(old)
+
+
+@contextlib.contextmanager
+def machine(hw: dict):
+    """The Mac the rules see for the block: select() and recommend() ask probe(), which looks at this machine once
+    and keeps the answer (on a CI runner with 7 GB none of the big models fit, and macOS's recogniser won everywhere)."""
+    real = T._HW
+    T._HW = hw
+    try:
+        yield
+    finally:
+        T._HW = real
 
 
 def fake_installed(*ids):
@@ -435,6 +452,59 @@ class Limits(unittest.TestCase):
 
 
 # ------------------------------------------------------------------ voice notes
+class QuietSpeech(unittest.TestCase):
+    """level_up: quiet audio is brought to a usual level before the VAD and the model; nothing is turned down, and the
+    backends that get the audio whole with no VAD deciding (a cloud service, macOS's recogniser) get it as recorded."""
+
+    def tone(self, peak, seconds=2.0):
+        t = np.arange(int(seconds * SR)) / SR
+        return (peak * np.sin(2 * np.pi * 220 * t)).astype(np.float32)
+
+    def test_quiet_audio_comes_up_and_loud_audio_is_left(self):
+        up = T.level_up(self.tone(0.02))
+        self.assertAlmostEqual(float(np.percentile(np.abs(up), 99.9)), T.LEVEL_PEAK, places=2)
+        self.assertEqual(up.dtype, np.float32)
+        for peak in (0.1, 0.4):                       # a usual take, a loud one: as recorded
+            usual = self.tone(peak)
+            self.assertIs(T.level_up(usual), usual)
+        self.assertEqual(len(T.level_up(np.zeros(0, np.float32))), 0)
+        silent = np.zeros(SR, np.float32)
+        self.assertIs(T.level_up(silent), silent)
+
+    def test_the_gain_has_a_ceiling_and_one_click_does_not_set_it(self):
+        dead = self.tone(0.0005)                      # a muted input's hiss: +30 dB at most, not up to a voice
+        self.assertAlmostEqual(float(np.abs(T.level_up(dead)).max()), 0.0005 * T.LEVEL_MAX_GAIN, places=4)
+        x = self.tone(0.02)
+        x[100] = 0.9                                  # one click in a quiet take
+        self.assertGreater(float(np.percentile(np.abs(T.level_up(x)), 99)), 0.2)
+
+    def test_the_vad_and_the_model_hear_the_levelled_audio(self):
+        heard = {}
+
+        class Loud(FakeBackend):
+            def transcribe(self, x):
+                heard["model"] = float(np.abs(x).max())
+                return [(0.0, len(x) / SR, "ok", "en")]
+
+        def vad(x, max_speech=25):
+            heard["vad"] = float(np.abs(x).max())
+            return [(0.0, len(x) / SR)]
+
+        old = T.vad_segments
+        T.vad_segments = vad
+        try:
+            T.transcribe_track(self.tone(0.02), Loud(), "fake", 1, quiet=True)
+            self.assertAlmostEqual(heard["vad"], T.LEVEL_PEAK, places=2)
+            self.assertAlmostEqual(heard["model"], T.LEVEL_PEAK, places=2)
+
+            class Whole(Loud):
+                no_vad = True
+            T.transcribe_track(self.tone(0.02), Whole(), "fake", 1, quiet=True)
+            self.assertAlmostEqual(heard["model"], 0.02, places=3)      # as recorded: nothing decides there is speech
+        finally:
+            T.vad_segments = old
+
+
 class Notes(unittest.TestCase):
     def setUp(self):
         self.patches = {"BACKENDS": T.BACKENDS, "vad_segments": T.vad_segments}
@@ -698,6 +768,14 @@ class AppleSpeechSelect(unittest.TestCase):
     """Nothing downloaded: macOS 26's SpeechTranscriber runs dictation, voice notes and recordings; a local model takes
     over as soon as one is installed; never for a language it doesn't speak."""
 
+    def setUp(self):
+        # a 128 GB Mac, whatever runs the test: select("note") reads the machine's memory through probe()
+        self.m = machine(hw())
+        self.m.__enter__()
+
+    def tearDown(self):
+        self.m.__exit__(None, None, None)
+
     def test_it_runs_when_nothing_is_downloaded(self):
         real = fake_installed("apple-speech")
         try:
@@ -743,8 +821,45 @@ class AppleSpeechSelect(unittest.TestCase):
             self.addCleanup(setattr, T, "BUNDLED_VAD", bundled)
         self.addCleanup(lambda: f.write_bytes(was) if was is not None else f.unlink(missing_ok=True))
 
+    def test_a_model_only_in_the_hf_cache_never_runs_unasked(self):
+        # dictation uses only models Blurt downloaded (the founder, 2026-11-21): a Whisper another tool left in the shared
+        # Hugging Face cache doesn't take over from macOS's recogniser — VAD in or not — until Blurt downloads it (its
+        # setup leaves the record), or the user picks it
+        self.vad(True)
+        real = fake_installed("apple-speech", "whisper-large-v3-turbo-mlx")
+        T.blurt_downloaded = REAL_BLURT_DOWNLOADED
+        repo = T.entry("whisper-large-v3-turbo-mlx")["install"]["hf"]
+        rec = T._hf_record(repo)
+        try:
+            with config({"asr": {"languages": ["zh", "en"]}}):
+                self.assertEqual(T.select("note")["id"], "apple-speech")
+                d = T.dictation_models(hw())
+                self.assertEqual(d["selected"], "apple-speech")
+                self.assertFalse({m["id"]: m for m in d["models"]}.get("whisper-large-v3-turbo-mlx", {}).get("installed", False))
+                rec.parent.mkdir(parents=True, exist_ok=True)
+                rec.write_text(json.dumps({"snapshot": "abc", "files": []}))     # a Blurt setup finished it
+                self.assertEqual(T.select("note")["id"], "whisper-large-v3-turbo-mlx")
+            rec.unlink()
+            # a download from before Blurt kept records, which Blurt dictated with: still the engine
+            hist = T.MODELS_DIR.parent / "dictation" / "history.jsonl"
+            hist.parent.mkdir(parents=True, exist_ok=True)
+            had = hist.read_bytes() if hist.exists() else None
+            try:
+                hist.write_text(json.dumps({"id": "x", "asr_model": "whisper-large-v3-turbo-mlx"}) + "\n")
+                with config({"asr": {"languages": ["zh", "en"]}}):
+                    self.assertEqual(T.select("note")["id"], "whisper-large-v3-turbo-mlx")
+            finally:
+                hist.write_bytes(had) if had is not None else hist.unlink()
+            with config({"asr": {"languages": ["zh", "en"]},
+                         "record": {"dictation": {"asr_model": "whisper-large-v3-turbo-mlx"}}}):
+                self.assertEqual(T.dictation_models(hw())["selected"], "whisper-large-v3-turbo-mlx")   # the user's pick
+        finally:
+            T.installed = real
+            T.blurt_downloaded = lambda m: True
+            rec.unlink(missing_ok=True)
+
     def test_model_files_without_the_vad_dont_beat_macos_speech(self):
-        # a Whisper in a shared Hugging Face cache, no silero_vad.onnx yet: the first Fn must listen, not ask for 1 MB
+        # a Whisper Blurt downloaded, no silero_vad.onnx yet: the first Fn must listen, not ask for 1 MB
         self.vad(False)
         real = fake_installed("apple-speech", "whisper-large-v3-turbo-mlx")
         try:
@@ -756,6 +871,40 @@ class AppleSpeechSelect(unittest.TestCase):
                 self.assertEqual(d["missing"], [])
                 self.vad(True)
                 self.assertEqual(T.select("note")["id"], "whisper-large-v3-turbo-mlx")   # the VAD is in: it takes over
+        finally:
+            T.installed = real
+
+    def test_a_whisper_in_the_shared_cache_is_never_picked_by_itself(self):
+        # someone else's whisper-large-v3-turbo in ~/.cache/huggingface: macOS's recogniser stays (the founder,
+        # 2026-11-21); its Download adopts the copy (the record), and then it runs
+        self.vad(True)
+        cache = Path(tempfile.mkdtemp(prefix="hf-"))
+        repo = T.entry("whisper-large-v3-turbo-mlx")["install"]["hf"]
+        snap = cache / ("models--" + repo.replace("/", "--")) / "snapshots" / "abc123"
+        snap.mkdir(parents=True)
+        (snap / "config.json").write_text("{}")
+        (snap / "weights.npz").write_bytes(b"w")
+        old = os.environ.get("HF_HUB_CACHE")
+        os.environ["HF_HUB_CACHE"] = str(cache)
+        self.addCleanup(lambda: os.environ.__setitem__("HF_HUB_CACHE", old) if old else os.environ.pop("HF_HUB_CACHE", None))
+        self.addCleanup(lambda: T._hf_record(repo).unlink(missing_ok=True))
+        real = T.installed
+        T.installed = lambda m: m["id"] == "apple-speech" or (m["id"] == "whisper-large-v3-turbo-mlx" and real(m))
+        T.blurt_downloaded = REAL_BLURT_DOWNLOADED          # the module's tests stub it; this one is about it
+        self.addCleanup(lambda: setattr(T, "blurt_downloaded", lambda m: True))
+        try:
+            m = T.entry("whisper-large-v3-turbo-mlx")
+            self.assertTrue(T.installed(m))
+            self.assertTrue(T.found_elsewhere(m))
+            with config({"asr": {"languages": ["zh", "en"]}}):
+                self.assertEqual(T.select("note")["id"], "apple-speech")
+                d = T.dictation_models(hw())
+                self.assertEqual(d["selected"], "apple-speech")
+                with config({"asr": {"languages": ["zh", "en"], "models": {"note": "whisper-large-v3-turbo-mlx"}}}):
+                    self.assertEqual(T.select("note")["id"], "whisper-large-v3-turbo-mlx")     # picked by hand: it runs
+                T.adopt_snapshot(m, T.model_path(m))
+                self.assertFalse(T.found_elsewhere(m))
+                self.assertEqual(T.select("note")["id"], "whisper-large-v3-turbo-mlx")         # downloaded through Blurt
         finally:
             T.installed = real
 

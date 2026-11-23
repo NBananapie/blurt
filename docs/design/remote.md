@@ -7,7 +7,7 @@ latency and data: [remote-realtime.md](remote-realtime.md). What follows was dec
 section says otherwise.
 
 The app is called Blurt on the iPhone too (it was Blurt Remote while in development; the code keeps `BlurtRemote`). Until it
-is on the App Store, people build it themselves: [apps/ios/README.md](../../apps/ios/README.md). Settings → Phone links there (renamed from iPhone on 2026-11-09, since Android phones pair with a Mac too).
+is on the App Store, people build it themselves: [apps/ios/README.md](../../apps/ios/README.md). Settings → Remote Control links there (renamed from iPhone on 2026-11-09, since Android phones pair with a Mac too; then 手机和电脑 / Phones and Computers, and on 2026-11-20 远程控制 / Remote Control, where the Mac lists every device on its page).
 
 2026-11-07. Status: used on an iPhone 16 at home. The screen features and everything away from home are tested on the simulator only.
 
@@ -161,6 +161,26 @@ as it passes, so what will happen shows before it's let go, and into the dock it
 icon, text or small line, or what it does; minus to remove, plus to add. Sections can be renamed, added and removed. The picker has the whole
 keyboard and about 90 actions with search, plus New Shortcut (tap modifiers, tap a key, optional hold-and-slide) and Text.
 
+**The keys round of 2026-11-18.** The founder, on an iPhone: in landscape with the keys put away there is a space bar by the thumb and no ⌫.
+Six user sketches (a terminal developer, a Chinese writer dictating, a lecturer at a projector, an iPad sofa reader, a Windows Excel analyst,
+a designer) on the landscape column, the dock and 常用. Four of six (and the founder) wanted ⌫ there: by voice a slip is mended with ⌫, and
+nobody presses space when dictation writes the spaces. The reader (play/pause) and the lecturer (next slide) wanted space; it's still in the
+keys, and the arrow key turns slides. Decided:
+- **Landscape column**: keys · ⌘Tab · esc · arrow key · ⌫ · ↩ · talk. ⌫ took space's place, so the column is no longer and the keys no smaller
+  (an eighth key would have made them 35 pt). esc and ↩ never side by side (one stops an agent, the other sends a half-written prompt); ⌫ not
+  against the talk key. The three are found in the dock by what they are (`Deck.thumbSlots`), so a rearranged dock keeps them by the thumb.
+- **Dock**: ⌃ ⌥ ⌘ ⇧ ⇥ space esc ⌫ ↩, then talk: ↩ by the talk key, where a phone's keyboard has return, and the same esc ⌫ ↩ order in portrait,
+  the landscape column and the iPad's right half (space esc ⌫ ↩ talk there; the split stays five and four).
+- **常用's last row**: Snap · Copy Text · Translate · Cards · ⌘R · ⇧Tab. ⇧Tab is a field back and Claude Code's next mode, two taps a time
+  before; reload three of six asked for. Record and Voice Note moved to 更多: hardly anyone reached for them from the first page. The other three
+  rows stay (on Windows, Snip leaves 更多 for the picker to keep it four rows; Blurt's Snap does the same): ⌘K, ⌃C and ⌘` are dead keys to the writer, designer and reader and daily ones to the developer, and no one set suits all.
+- **Pages to start from** (Edit Keys → … → Add Section): Writing (⇧⌘V, ⌥⌫, ⌘S, ⌘B, ⌘I, ⌘U), Design (⌘D, ⌘G, ⇧⌘G, ⌘S, ⇧1, ⇧0), Presenting
+  (⌥⌘P or F5 and ⇧F5, PgUp, PgDn, B, Home, End, zoom in, out, actual size, Win+P on Windows), Spreadsheet (F2, ⌦, save, sheet back and on,
+  fill). Each computer's own keys. What the lecturer needs is a dozen keys they would never add one by one.
+- Untouched decks take the new dock and 常用 (`Deck.modernise`); a dock or page its owner changed stays as it is.
+Left for later: on an iPad with the pages put away, back / close tab / next tab are out of reach; space in full screen for a video; the arrow
+key as two big ← → in landscape for slides. Not checked on a phone in the hand.
+
 ## Trackpad
 
 Raw touches into `PadEngine`, a pure state machine with tests (no gesture recognisers: they add delay). Tap click; tap, tap
@@ -169,6 +189,49 @@ click; hold then drag is a drag, the plain press-and-drag every mouse has (the p
 sensing, so a hard press is just this hold). That's how a screenshot area gets selected. One thumb scrolls along the edge of the pad next to it. Two
 fingers scroll / tap right click / pinch zoom; three fingers change
 desktop (left, right), all windows (up), app windows (down). A touch that stops a coast never clicks. A resting thumb never clicks (tap under 220 ms).
+
+**Pinch for the computer's zoom (⌘+ / ⌘−), sized by where the fingers started (2026-11-17).** A MacBook + iPhone user: pinching in zoomed out, spreading
+apart to zoom in "is very hard to trigger". Nothing treated the two directions differently; the distances were fixed, and the two gestures don't start
+alike. A pinch-in starts with the fingers wide, a spread with them close and often with the thumb held still:
+
+- A pinch was recognised after 25 pt of change and then stepped every 36 pt, counted from where it was recognised: 61 pt before the first step. From
+  250 pt apart that is a quarter of the way in; from 60 pt apart it is doubling the spread, and 60 → 85 did nothing at all.
+- Two fingers were a scroll as soon as their middle had moved 6 pt. With one finger still, the middle moves half as far as the fingers come apart, so a
+  spread hit 6 pt (at 12 pt of spread) long before 25 pt: it became a scroll, for good — and lifted with a fling, which swallowed the next try for 2 s.
+
+Now (`PadEngine.pinchLock`, `pinchStride`; the same in Kotlin): recognised after a fifth of the starting spread (10–25 pt), a step for every 30% wider
+(18–36 pt) or the same step back, counted from the start. Two fingers are a scroll only when their middle has moved further than they have come
+apart, and a scroll whose fingers come apart further than it has travelled turns into the pinch it was. The tests feed whole gestures in 12 ms moves:
+thumb still and finger out, 60 ↔ 150 pt both ways (as many steps each way), 60 → 85 (one step), a spread after 8 pt of hand drift, a 300 pt scroll
+with 30 pt of finger drift (no zoom), a wobbly two-finger tap (still a right click). On the old engine four of them fail, the first as a scroll.
+Not checked on a phone in the hand here: the tests are the engine's, the reporter's fingers are theirs.
+
+**One finger, two fingers, and the two zooms (2026-11-18).** An iPad user in Touch Mode: Settings promised one-finger scrolling and it never
+worked; two fingers scrolled fine; and they wanted the computer's zoom with the picture showing as well as the picture's. The row said
+「单指沿边缘滑动 → 滚动」, read as "one finger scrolls", while it is a 26 pt strip by the thumb whose mark hid whenever the picture showed. Five
+user sketches (an iPad reader, an iPhone developer at a big screen, a lecturer at a projector, a low-vision armchair reader, a designer on a
+13" iPad) split on one finger scrolling the picture: kept as it is, since in Touch Mode a slide of one finger is the only way to move the
+pointer without a click, which is what hover needs (menus and buttons that appear under the pointer, link previews, a hidden Dock). Decided
+with the founder:
+- **The edge stays on over the picture** and its mark shows when it matters: as the picture comes on (1.5 s, then it fades) and while one finger
+  scrolls there. Over the picture a standing line would hide a strip of it. What it takes away is only a quick vertical slide that starts in the
+  strip, which as a pointer move works as well from anywhere else (the pointer moves relatively), and a sideways slide from it is still the pointer.
+- **The gesture list says what is true**: two fingers first, then 「单指沿拇指一侧边缘上下滑 → 在光标处滚动」. The first time the picture comes on, a
+  line over it says two fingers scroll and ⌘ with a pinch zooms the Mac.
+- **⌘ (Ctrl on Windows and Linux) held with a pinch zooms the computer**, picture or not, as ⌘ or Ctrl with a wheel does on the computer;
+  a plain pinch over the picture still zooms the picture. Held means the dock's modifier (tapped once it's spent by the zoom, twice it's locked)
+  or a keyboard on the iPad. No setting: an either-or setting would have taken the picture's zoom away, and it is what small targets need
+  (⌘+ doesn't enlarge a menu bar). The reporter's own idea, the Find Pointer button's light as the switch, was turned down by all five: it is a
+  button that acts and is done, and a light on it reads as nothing. A zoom about the fingers like a real trackpad's isn't possible from
+  outside on macOS (no public way to post a magnify gesture); ⌘+ and ⌘− are what's sent.
+- **Full Screen** at the foot of the display map (holding the screen button now opens the map with one display too, as just that row): the
+  picture takes the whole screen, and only a see-through talk key by the thumb and an "Exit Full Screen" pill stay over it. Remembered; it
+  applies only while the picture shows, never with the phone's keyboard up or across a fold in use. Going in lets go of dock modifiers, so
+  nothing stays held unseen; there, only a keyboard's ⌘ or Ctrl gives the computer's zoom. For reading on an iPad what was left open on the
+  computer; on a phone in portrait it gains little.
+`PadEngine` (`computerZoomHeld`, `.edgeScroll`), `PadViewController` (`markEdge`, `tipOnce`, `setFullScreen`), `DisplayMap`; the same in Kotlin.
+Checked: the iOS (144) and Android (168) tests, including a full-screen layout test, and the iPhone and iPad simulators (map, full screen
+portrait and landscape, the tip). Not checked: a hand on a real iPad, Android on a device or emulator, the relay.
 
 Pointer gain rises smoothly from 1× for a slow finger to 5.5× for a fast one, because the glass is a tenth of a trackpad and
 the target may be 4K; reviews of other apps single out steep curves and bad slow-speed precision. Scrolling is
@@ -208,11 +271,57 @@ Control and audio use TCP; pointer and scroll use UDP once a probe gets through,
 | ⌃↑ posted plain / with the keyboard's fn + numpad flags | nothing / Mission Control opens (arrows need those flags for macOS's shortcuts) |
 
 On a Mac with no phone paired, nothing runs: no listener or Bonjour ad until Add Phone… shows the code (opening
-Settings → Phone alone doesn't, so it never brings up macOS's Local Network prompt), and the session watch timer only runs
+Settings → Remote Control alone doesn't, so it never brings up macOS's Local Network prompt), and the session watch timer only runs
 while a phone is connected.
 
 If a session goes quiet for 2 s, the Mac lets go of everything held, including the dictation key. A background phone sends
 `releaseAll` first.
+
+### What the pad says (2026-11-16)
+
+The founder, using it from the sofa: when the connection dropped, was coming back or hadn't come up, the words saying so were too small to
+read. They were: "Connecting to *name*…" at 12 pt, white 42 %, in the pad's top corner (the same line that names the computer when all is
+well), and "Can't reach *name*. Check…" at 15 pt regular, white 66 %, with no mark and nothing to tap. Now:
+
+- **Connected and working, the pad says nothing**: the computer's name stays where it was, small (12 pt, "*name* · Internet" over a relay).
+- **Anything else is one card in the middle of the pad**, where the thumb and the eye already are: a mark, a strong line that names the
+  state (17 pt semibold; medium on Android), at most one line with the one thing to do (15 pt), at most one button for it. A slab like the
+  keys (`slab` on the pad's glass, a hairline), so it reads over the computer's picture too. Contrast on the slab: the strong line 13 : 1,
+  the second line 10 : 1, the amber mark 8 : 1 (`attn`, docs/design/system.md), always with its triangle, never colour alone. The app is
+  dark only.
+- The words follow the system's text size (Dynamic Type; Android's font scale) up to about one and a half times, where the card still
+  fits a phone's pad; longer words wrap, they are never shrunk or cut. Only the card's buttons take touches: the pad under the words is
+  still the pad.
+
+| State | Mark | Strong line | Second line | Button |
+|---|---|---|---|---|
+| Connecting (app opened, come back to, another computer chosen) | spinner | Connecting to *name*… 正在连接 *name*… | | |
+| A session went while in use | spinner | Reconnecting to *name*… 正在重新连接 *name*… | | |
+| Nothing answers for 8 s, no relay | amber triangle | Can't reach *name* 连不上 *name* | Check that Blurt is running and both are on the same network. To connect from anywhere, set a relay in Blurt's Settings → Remote Control on the computer. 确认 Blurt 在运行，手机和电脑连着同一个网络。不在同一网络时，先在电脑的 设置 → 远程控制 里设置中转。 (the same network is only needed without a relay, so the line names the relay, 中转, as the way to connect from anywhere; a pairing that can't reach the computer says the same, in the same order) | Retry 重试; Try Another Computer below it when there is one |
+| The same, the computer has a relay | amber triangle | Can't reach *name* | Check that the computer isn't asleep and Blurt is running. 确认电脑没有进入睡眠，Blurt 在运行。 | the same |
+| The computer has forgotten this phone | amber triangle | Needs pairing again 需要重新配对 | *name* no longer knows this iPhone. | Scan Code |
+| Another phone took it | phone | Another phone is connected 另一台设备已连接 | Touch to take over. 轻点以接管。 | (a touch anywhere) |
+| No computer yet | code | Pair with your computer 与电脑配对 | On your computer, open Blurt's Settings and choose Phone. | Scan Code |
+| The computer is asking its owner | spinner | Waiting for your computer 等待电脑确认 | Allow this iPhone in Blurt's Settings… Check that it shows *digits*. | |
+| A pairing didn't take (8 s) | amber triangle | Pairing didn't work 配对没有成功 | why, in Link's sentence | what the state under it has |
+| Connected, can't control | amber triangle | Can't control *name* 无法控制 *name* | what to allow, per kind of computer | |
+| Connected, the screen can't be shown | amber triangle | Can't show the screen 无法显示屏幕 | permission, or off in Settings | |
+
+Which lines a state gets is one pure table on each phone, with the same tests: `Model/LinkStatus.swift` (`StatusBanner.of`) and Android's
+`core/LinkStatus.kt`. The card is `Pad/StatusCard.swift` and `pad/StatusCard.kt`. Retry (`Link.tryAgain`) starts the same attempts over at
+once and the card says "connecting" again: Link was already trying every 3 s, the button is for the moment the user has just woken the
+computer. Nothing on the wire changed.
+
+A drop is told apart from a first connection by following the states (`StatusFollower`): only a session that went while the app was in
+front is one. Then the thumb feels it go (the "let go" tap) and come back (the "took hold" tap), VoiceOver and TalkBack say what the card
+says when it changes, and "Connected to *name*" when it's back. Opening the app or choosing another computer taps nothing.
+
+Settings → Computers: the computer in hand, when it isn't connected, says so at 15 pt medium with the same mark (a spinner, the amber
+triangle), not as a 13 pt caption.
+
+Seen on the iPhone 17 simulator and the `blurt_phone` emulator against the fake host (started, stopped, started again), English and
+Chinese, portrait and landscape, and at an accessibility text size: promo/cases/capabilities-2026-11-16/phone-status. Not on a real phone
+yet, and not with VoiceOver or TalkBack listening.
 
 ## Screen
 
@@ -400,6 +509,11 @@ each display chosen, a slide, back to following, strokes across and back) and lo
 
 ## Away from home
 
+Since 2026-11-19: with no relay of the owner's own, the phone and the computer can meet at Blurt's **go-between**
+(`wss://meet.blurt.work`, free, best effort, on by default in Settings → Remote Control → Away from home) and move the whole session onto the
+direct UDP path; and a host's Tailscale or ZeroTier addresses are offered like local ones. Which path wins, the wire, the stream over UDP
+and what each end says: [remote-go-between.md](remote-go-between.md). What follows is the owner's own relay, unchanged.
+
 Three routes, tried together, best one kept:
 
 | Route | When | Carries | Feel |
@@ -408,11 +522,15 @@ Three routes, tried together, best one kept:
 | Direct | Away; a path opens to the Mac | Pointer, video (UDP); control stays on the relay | Close to local, depends on the networks |
 | Relay | Away; once the Mac has a relay address | Everything, stream of sealed frames | Depends on how near the relay is |
 
-- **Relay:** Blurt doesn't run one: it's an open-source project, and a shared relay would be a cost and a service to keep up (founder, 2026-11-07).
+- **Relay:** Blurt doesn't run one that carries sessions: it's an open-source project, and a shared relay would be a cost and a service to
+  keep up (founder, 2026-11-07). The go-between only introduces the two ends and stays quiet once they talk directly (remote-go-between.md).
   Each owner runs their own, a Cloudflare Worker with one hibernating Durable Object per paired phone or one Node process on a server
-  (tools/remote-relay, same protocol), and pastes its address into Settings → Phone → Relay Address. Copy Instructions there gives a prompt
+  (tools/remote-relay, same protocol), and pastes its address into Settings → Remote Control → Relay Address. Copy Instructions there gives a prompt
   for Claude Code or Codex that does the setup. The address is in the pairing code and reaches the phone again inside each sealed session, so the phone has nothing to configure.
-  `ws://` works too: what passes is sealed either way, and it needs no domain. The room is an HMAC of the pair's key. The relay has no key.
+  `ws://` works too and needs no domain. The frames are sealed either way, so nobody on the network reads or forges them, but over `ws://`
+  the address (the relay's secret), the room and the hello (the phone's device id) travel in the clear: whoever sees them can use the
+  relay as a pipe, keep replacing the phone in its room (the relay closes the older socket), and recognise the pair on other networks,
+  until the secret changes. `wss://` is the default; `ws://` is for a network the owner trusts. The room is an HMAC of the pair's key. The relay has no key.
 - **Several Macs, one relay:** a phone keeps a list of Macs, each with its own key and so its own room: one address serves them all. Pair each Mac once
   by its code, from any network if that Mac has a relay. A Mac with no relay takes the one a phone already uses for its other Macs, unless its owner
   cleared the field, and Settings says it came from the phone. A code used over the relay needs a yes on the Mac, in Settings: otherwise a photo of the

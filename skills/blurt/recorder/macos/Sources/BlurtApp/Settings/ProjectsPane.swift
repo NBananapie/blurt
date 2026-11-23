@@ -1,4 +1,5 @@
-// Settings → Projects (Work): the folders opened in Blurt, managed like macOS's Login Items list.
+// Settings → Projects (Features, after Recording & Items: projects are where items are filed, so the pane is there only
+// while the Recording capability is on): the folders opened in Blurt, managed like macOS's Login Items list.
 //   Projects: a heading with Add Folder… at its right end, then one box, a project per row — its folder glyph in the
 //   project's colour (ProjectLook, as in the main window's sidebar) in the page's icon gutter, its name, and under it its
 //   folder, short ("~/…/proj/atlas-web"; the whole path, and the key its item IDs start with, in the tooltip). Nothing
@@ -7,7 +8,8 @@
 //   Finder. Rename (the menus, or Return on the selected row) turns the name into a field in place: Return or a click
 //   away keeps it, Esc puts it back; ⌘Z undoes it, as the main window's rename does. A folder that is gone says so
 //   in attention ink. Unassigned's folder is in the heading's ⋯.
-//   Snaps and voice notes: where new ones go — one pop-up row (a project, or Unassigned).
+//   Snaps and voice notes: where new ones go — one pop-up row (a project, or Unassigned); only while the Cards
+//   capability is on (SettingsCatalog.rowShown: with it off there are no snaps or voice notes to file).
 //   Removing is at once — the folder and its items stay — with Undo (the island's button and ⌘Z on this window, like
 //   the main window's Remove). Projects are in the sidebar's order (the user's own). Errors are said in a sentence;
 //   what the script said goes to the log.
@@ -128,20 +130,18 @@ final class ProjectsModel: ObservableObject {
     func reveal(_ p: Project) { NSWorkspace.shared.activateFileViewerSelecting([p.path]) }
     func revealUnassigned() { NSWorkspace.shared.open(ProjectStore.shared.inbox.store) }
 
-    /// "~/…/proj/atlas-web": the home as ~, and past the first part only the last two folders (a long path would
-    /// outweigh the name; the whole one is in the tooltip).
+    /// "in ~/projects": where the folder is, as Finder would say it (the home as ~; a long location by its folder's
+    /// name) — not a half-elided path ("/…/projects/api": dogfood 2026-11-21). The whole path is the row's tooltip.
     static func shortPath(_ u: URL) -> String {
-        let t = (u.path as NSString).abbreviatingWithTildeInPath
-        let parts = t.split(separator: "/", omittingEmptySubsequences: true).map(String.init)
-        let home = t.hasPrefix("~")
-        let shown = home ? parts.dropFirst() : parts[...]
-        guard shown.count > 3 else { return t }
-        return (home ? "~/…/" : "/…/") + shown.suffix(2).joined(separator: "/")
+        let parent = u.deletingLastPathComponent()
+        let t = (parent.path as NSString).abbreviatingWithTildeInPath
+        return T("settings.projects.in", t.count <= 36 ? t : FileManager.default.displayName(atPath: parent.path))
     }
 }
 
 struct ProjectsPane: View {
     @StateObject var m = ProjectsModel()
+    @ObservedObject private var features = SettingsFeatures.shared
     @State private var hovered: String?
     /// the project whose name is a field now, and what is typed in it
     @State private var editing: String?
@@ -181,12 +181,14 @@ struct ProjectsPane: View {
                 }
             })
 
-            SettingsGroup("projects.capture", title: T("settings.projects.capture_heading")) {
-                SettingRow("projects.capture_into", title: T("settings.projects.capture_row")) {
-                    ChoicePopup(label: T("settings.general.capture_into"),
-                                choices: m.projects.map { ($0.id, $0.name) } + [("inbox", T("project.inbox"))],
-                                selection: Binding(get: { m.current }, set: { m.setCurrent($0) }),
-                                dividers: m.projects.isEmpty ? [] : [m.projects.count])
+            if SettingsCatalog.rowShown("projects.capture_into", off: features.off) {
+                SettingsGroup("projects.capture", title: T("settings.projects.capture_heading")) {
+                    SettingRow("projects.capture_into", title: T("settings.projects.capture_row")) {
+                        ChoicePopup(label: T("settings.general.capture_into"),
+                                    choices: m.projects.map { ($0.id, $0.name) } + [("inbox", T("project.inbox"))],
+                                    selection: Binding(get: { m.current }, set: { m.setCurrent($0) }),
+                                    dividers: m.projects.isEmpty ? [] : [m.projects.count])
+                    }
                 }
             }
 
@@ -206,8 +208,10 @@ struct ProjectsPane: View {
         return SettingsLine(padding: 7) {
             HStack(spacing: 14) {
                 HStack(spacing: SettingsMetrics.iconGap) {
-                    Image(systemName: "folder.fill").font(.system(size: 14))
-                        .foregroundStyle(Color(nsColor: ProjectLook.color(p)).opacity(missing ? 0.4 : 1))
+                    // the project's one mark (the main window's sidebar, the island): its line folder with its colour
+                    // wash, or the missing folder — never a solid Finder folder (docs/design/system.md §3)
+                    Image(nsImage: (missing ? IslandGlyph.missing.image(size: 16, color: .secondaryLabelColor)
+                                    : IslandGlyph.project(ProjectLook.color(p)).image(size: 16, color: .labelColor)) ?? NSImage())
                         .frame(width: SettingsMetrics.iconSlot).accessibilityHidden(true)
                     VStack(alignment: .leading, spacing: 1) {
                         if editing == p.id {

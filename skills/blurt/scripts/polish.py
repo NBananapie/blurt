@@ -54,8 +54,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 import dictation_vocab as vocab  # noqa: E402
+from _common import uv_bin  # noqa: E402
 from _common import (BLURT_HOME, MODELS_DIR, SERVE_IDLE, global_config, landed_in, load_json, progress_line,  # noqa: E402
-                     save_config_if_readable, save_json, server_exit, serve_exit_reason, serve_said, use_system_certs)
+                     save_config_if_readable, save_json, server_exit, serve_exit_reason, serve_said, disk_full,
+                     use_system_certs)
 from _common import (begin_download, download_lock, download_path, end_download, fetch, folder_complete,  # noqa: E402
                      safetensors_complete, watch_parent)
 
@@ -242,7 +244,7 @@ def _cloud_verdict(core_u: list[str], out_u: list[str], n_raw: int, n_core: int,
     cjk = re.compile(rf"[{_CJK}]")
     share = lambda us: sum(1 for u in us if cjk.match(u)) / max(1, len(us))  # noqa: E731
     if core_u and out_u and abs(share(core_u) - share(out_u)) > CLOUD_SCRIPT_SHIFT:
-        return "translated"
+        return "script_swap"
     flat, ratio = STRUCT_SHRINK
     numbered = STRUCT_ITEM * list_lines(out) if mode == "structured" else 0
     if n_core - n_out > max(flat, ratio * n_core) + numbered:
@@ -317,7 +319,7 @@ def guard(raw: str, out: str, allowed: set[str] | None = None, terms: list[str] 
         # turned into the other script is refused there: the local model isn't trusted with it)
         if n_core <= TRANSLATED_SPAN or _swapped_script(core_u, out_u, set(lost_latin), set(novel_cjk), set(lost_cjk),
                                                          set(novel_latin)):
-            return verdict("translated")
+            return verdict("script_swap")
     flat, ratio = STRUCT_SHRINK if mode == "structured" else (SHRINK_SLACK, SHRINK_RATIO)
     numbered = STRUCT_ITEM * list_lines(out) if mode == "structured" else 0
     if n_core - n_out > max(flat, ratio * n_core) + numbered:
@@ -1162,7 +1164,7 @@ def ensure_mlx(stdin: str | None = None) -> None:
     if not is_mlx():
         raise Fail("polish needs Apple Silicon (MLX) or x64 Windows/Linux (GGUF)", "unsupported", 4)
     import shutil
-    uv = shutil.which("uv") or str(BLURT_HOME / "bin" / "uv")
+    uv = uv_bin() or str(BLURT_HOME / "bin" / "uv")
     if os.environ.get("BLURT_POLISH_REEXEC") or not Path(uv).exists() or not sys.argv[0].endswith(".py"):
         raise Fail(f"mlx-lm is not installed (run with: uv run --with mlx-lm {Path(sys.argv[0]).name} …)", "deps", 4)
     os.environ["BLURT_POLISH_REEXEC"] = "1"
@@ -1836,6 +1838,17 @@ class Engine:
 TRANSLATE_TARGETS = {"en": "English", "zh": "Simplified Chinese", "zh-Hant": "Traditional Chinese", "ja": "Japanese",
                      "ko": "Korean", "fr": "French", "de": "German", "es": "Spanish", "pt": "Portuguese",
                      "it": "Italian", "ru": "Russian"}
+# Each language in its own words. A one-language request names it both ways and says "the whole answer, even a single
+# word" (2026-11-16): asked "into Japanese" for short Chinese UI words (翻译, 显示, 粘贴), the local Gemma 4 E2B wrote
+# English for 5 of 16; with this, 16 of 16 were Japanese, and the zh / en / ko cases came out as before.
+TRANSLATE_ENDONYMS = {"zh": "简体中文", "zh-Hant": "繁體中文", "ja": "日本語", "ko": "한국어", "fr": "français",
+                      "de": "Deutsch", "es": "español", "pt": "português", "it": "italiano", "ru": "русский"}
+
+
+def _named(code: str) -> str:
+    """"Japanese (日本語)"; English and unknown codes as they are."""
+    name = TRANSLATE_TARGETS.get(code, code)
+    return f"{name} ({TRANSLATE_ENDONYMS[code]})" if code in TRANSLATE_ENDONYMS else name
 # A target is "auto:H|O" (2026-10-30, global-first: H the user's own language, O the other one — text in H goes into O,
 # anything else into H; the model picks the direction), "auto" (the same with Chinese and English: the app before
 # that, still understood), a language ("ja"), "X|keep" (a fixed language, 2026-10-30: into X, and a text already in X
@@ -1862,10 +1875,12 @@ def translate_system(target: str = "auto", pair: tuple[str, str] = ("zh", "en"),
     a, b = (TRANSLATE_TARGETS.get(x, x) for x in (auto or pair))
     into, _, also = target.partition("|")
     x, y = TRANSLATE_TARGETS.get(into, into), TRANSLATE_TARGETS.get(also, also)
+    only = f" Write the whole answer in {x}, never in another language, even for a single word."
     rule = (f"If the text is mostly {a}, translate it into {b}; otherwise translate it into {a}." if auto
-            else f"Translate it into {x}; if it is already in {x}, reply with it exactly as it is." if also == "keep"
+            else f"Translate it into {_named(into)}; if it is already in {x}, reply with it exactly as it is. Otherwise"
+                 f" write the whole answer in {x}, never in another language, even for a single word." if also == "keep"
             else f"Translate it into {x}; if it is already in {x}, translate it into {y}." if also
-            else f"Translate it into {x}.")
+            else f"Translate it into {_named(into)}." + only)
     return ("You translate text the user copied from their screen or said. " + rule + " Reply with the translation "
             "only: no preface, no notes, no quotes, no Markdown the text didn't have. Keep its layout: the same line "
             "breaks (one line of the text is one line of the translation, never joined), list markers, tabs and "
@@ -2589,11 +2604,15 @@ def main():
          "eval": cmd_eval, "translate": cmd_translate}[a.cmd](a)
     except Fail as e:
         print(f"ERROR: {e}", file=sys.stderr)
-        emit({"ok": False, "error": str(e), "code": e.code})
+        emit({"ok": False, "error": str(e), "code": "disk_full" if disk_full(e) else e.code})
         if a.cmd == "serve":
             server_exit(e.exit_code)
         sys.exit(e.exit_code)
-    except Exception:  # noqa: BLE001 — a server never goes through the interpreter's teardown (server_exit)
+    except Exception as e:  # noqa: BLE001 — a server never goes through the interpreter's teardown (server_exit)
+        if a.cmd == "setup" and disk_full(e):
+            print(f"ERROR: {e}", file=sys.stderr)
+            emit({"ok": False, "error": str(e)[:300], "code": "disk_full"})
+            sys.exit(1)
         if a.cmd != "serve":
             raise
         import traceback

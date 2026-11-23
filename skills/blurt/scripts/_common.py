@@ -83,26 +83,101 @@ def use_system_certs() -> None:
         pass
 
 
+def disk_full(e: BaseException | None) -> bool:
+    """The disk filled up somewhere in this failure (ENOSPC, also when a download wrapped it into its own error): a
+    setup says {"code": "disk_full"}, and the app says how much is needed and free, not "network"."""
+    import errno
+    seen = set()
+    while e is not None and id(e) not in seen:
+        seen.add(id(e))
+        if isinstance(e, OSError) and e.errno in (errno.ENOSPC, errno.EDQUOT):
+            return True
+        if "No space left on device" in str(e) or "[Errno 28]" in str(e):
+            return True
+        e = e.__cause__ or e.__context__
+    return False
+
+
 def die(msg: str, code: int = 1) -> None:
     print(f"ERROR: {msg}", file=sys.stderr)
     sys.exit(code)
 
 
+def app_bin_dir() -> Path:
+    """$BLURT_HOME/bin: where the Windows / Linux app installs uv, ffmpeg and ffprobe (setup.rs). It is on the PATH of
+    what the app starts, and on nobody else's — an agent the user runs never has it."""
+    return blurt_home() / "bin"
+
+
+def _exe(name: str) -> str:
+    return name + ".exe" if IS_WIN and not name.lower().endswith(".exe") else name
+
+
+def find_tool(name: str) -> str | None:
+    """A tool on PATH, else the app's copy in $BLURT_HOME/bin."""
+    found = shutil.which(name)
+    if found:
+        return found
+    p = app_bin_dir() / _exe(name)
+    return str(p) if p.is_file() else None
+
+
+def uv_bin() -> str | None:
+    """uv: PATH, else the one running us ($UV, set by `uv run`), else the app's ($BLURT_HOME/bin) — the Windows app's
+    uv is on nobody's PATH."""
+    for c in (shutil.which("uv"), os.environ.get("UV"), str(app_bin_dir() / _exe("uv"))):
+        if c and Path(c).is_file():
+            return c
+    return None
+
+
+def app_env_file() -> Path:
+    """What the Windows / Linux app gives the scripts it starts (setup.rs write_agent_env): the PyPI / Python / Hugging
+    Face mirrors where they are on, the uv and Hugging Face caches of a chosen data folder. A script an agent started
+    on its own reads it here, so its children (uv, downloads) behave as the app's runs do."""
+    return blurt_home() / "run" / "env.json"
+
+
+def apply_app_env(environ=None) -> dict:
+    """Fill in what the app would have set (app_env_file; a variable already set wins) and put $BLURT_HOME/bin at the
+    end of PATH, so ffmpeg / ffprobe / uv are found the same way under an agent as under the app. → what was added."""
+    environ = os.environ if environ is None else environ
+    added: dict = {}
+    if not IS_MAC:
+        try:
+            d = json.loads(app_env_file().read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            d = {}
+        env = d.get("env") if isinstance(d, dict) else None
+        for k, v in (env or {}).items():
+            if isinstance(k, str) and isinstance(v, str) and v and not environ.get(k):
+                environ[k] = v
+                added[k] = v
+    b = str(app_bin_dir())
+    parts = (environ.get("PATH") or "").split(os.pathsep)
+    if Path(b).is_dir() and b not in parts:
+        environ["PATH"] = os.pathsep.join([p for p in parts if p] + [b])
+        added["PATH"] = b
+    return added
+
+
+apply_app_env()
+
+
 def ffmpeg_bin(name: str = "ffmpeg") -> str:
-    path = shutil.which(name)
+    path = find_tool(name)
     if path:
         return path
-    exe = f"{name}.exe" if IS_WIN else name
-    cands = [blurt_home() / "bin" / exe]
     if IS_WIN and os.environ.get("LOCALAPPDATA"):
+        exe = _exe(name)
         la = Path(os.environ["LOCALAPPDATA"])
-        cands.append(la / "Microsoft" / "WinGet" / "Links" / exe)
+        cands = [la / "Microsoft" / "WinGet" / "Links" / exe]
         pkgs = la / "Microsoft" / "WinGet" / "Packages"
         if pkgs.is_dir():
             cands.extend(pkgs.glob(f"*FFmpeg*/**/bin/{exe}"))
-    found = next((str(p) for p in cands if p.is_file()), None)
-    if found:
-        return found
+        found = next((str(p) for p in cands if p.is_file()), None)
+        if found:
+            return found
     hint = "brew install ffmpeg" if IS_MAC else "winget install Gyan.FFmpeg" if IS_WIN else "sudo apt install ffmpeg"
     die(f"{name} not found on PATH. Install it first: {hint}")
     return name
@@ -806,7 +881,7 @@ def check_item_fields(sets: dict, unsets=(), where: str = "") -> None:
 STATES = ("new", "todo", "handed_off", "in_progress", "to_verify", "done", "wontfix", "discarded")
 INBOX_STATES = ("new", "to_verify")                         # "needs you": every inbox count in every app
 OPEN_STATES = ("new", "todo", "handed_off", "in_progress")  # MCP open_items, the backlog
-ACTIVE_STATES = ("handed_off", "in_progress", "to_verify")
+ACTIVE_STATES = ("todo", "handed_off", "in_progress")
 CLOSED_STATES = ("done", "wontfix")
 WORK_KEYS = ("to", "agent", "job", "handoff", "claim", "note", "commit", "pr", "at", "by")  # `work`: hand-off details
 WORK_BY = ("user", "agent", "app")

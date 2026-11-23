@@ -4,15 +4,16 @@
 // (places, projects, + Open Folder…, the Settings gear), the list (its heading with the order, the filter, + New and
 // the search field; the running jobs; the grouped rows) and the detail (the item in the review component, several
 // items' summary, a job, or nothing). Every write goes through the CLIs; each undoable one is on the window's undo
-// stack (Ctrl+Z, the toast's Undo). Settings takes the list and detail columns when opened; the Dictation page takes
-// both, as on the Mac.
+// stack (Ctrl+Z, the toast's Undo). Settings takes the list and detail columns when opened; so do the pages — Home,
+// Dictation, Cards, Phone —, as on the Mac. Everything follows the capability switches (docs/design/capabilities.md):
+// an off capability has no place in the sidebar, the palette, the toolbar or the keys; the first open lands on Home.
 
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { Icon } from '@blurt/icons';
 import { applyPlatform, applyTheme, menuCase, targetOf, type Action, type State } from '@blurt/ui';
 import { KindIcon, StatusRing } from '@blurt/ui/react';
 import { getCurrentWindow } from '@tauri-apps/api/window';
-import { api, inTauri, invoke, listen, type AppStatus, type HotkeyRow, type ItemRow, type Job, type Onboarding, type ProjectList, type ProjectRow, type Summary } from './api';
+import { api, builds, inTauri, invoke, listen, type AppStatus, type AttachResult, type HotkeyRow, type ItemRow, type Job, type Onboarding, type ProjectList, type ProjectRow, type Summary } from './api';
 import { codeUrl, hostFor, type HostCallbacks } from './host';
 import type { ReviewHandle } from './review';
 import { errText, i18n, plural, setLang, t } from './i18n';
@@ -29,11 +30,13 @@ import {
   group,
   grouping as groupingOf,
   handOffBlock,
+  isPage,
   isProject,
   LIVE_STATES,
   NO_FILTER,
   needsYouParts,
   orderedProjects,
+  reorderedProjects,
   placeQuery,
   showsState,
   SORT_KEYS,
@@ -50,11 +53,14 @@ import { Tooltip } from './components/Tooltip';
 import { FilterGlyph, MissingFolderGlyph, PinGlyph, ProgressGlyph, ProjectGlyph, ScopeGlyph, SidebarGlyph, UnassignedGlyph } from './components/glyphs';
 import { ItemBanner, bannerTitle } from './components/ItemBanner';
 import { ItemList, stateText } from './components/ItemList';
-import { JobDetail } from './components/JobDetail';
+import { JobDetail, RecordingDetail, type RecDetail } from './components/JobDetail';
+import { recLength, RecordingsSection, useAgentReady, useRecordingInfos, type RecHandlers } from './components/Recordings';
+import { emptyStateShown, placeJobList, placeRecordings, recordings, samePath, type Recording } from './recordings';
 import { CapturesBanner, FilterBar, JobsSection, ListHeading, MissingFolderBanner, SearchField, SuggestionsBanner } from './components/ListHeading';
 import { tidy, useMenu, type MenuEntry, type MenuItem } from './components/Menu';
 import { MovePopover } from './components/MovePopover';
 import { NewItemSheet, prefillFromText, type Prefill } from './components/NewItemSheet';
+import { CARDS_MIME, DragState, attachedAfter, detailTakes, dragKind, droppedText, dropLabel, parseCards, pasteTarget, pathsByName, sortEntries, titleFromFiles, type CardRef, type DragKind, type DropEntry, type PasteTo, type Zone } from './drops';
 import { Palette, type PaletteEntry } from './components/Palette';
 import { ProjectSettingsSheet } from './components/ProjectSettingsSheet';
 import { PhoneAsk } from './settings/PhonePane';
@@ -64,9 +70,17 @@ import { goSettingsPane, SettingsView } from './components/SettingsView';
 import { DictationView } from './components/DictationView';
 import { Shortcuts } from './components/Shortcuts';
 import { AgentSetupAsk } from './components/AgentSetupAsk';
-import { Sidebar } from './components/Sidebar';
+import { Sidebar, webview } from './components/Sidebar';
 import { Welcome } from './components/Welcome';
+import { HomePage } from './components/HomePage';
+import { CardsPage } from './components/CardsPage';
+import { PhonePage } from './components/PhonePage';
+import { ScreenTextPage } from './components/ScreenTextPage';
+import { useOff } from './components/useCapabilities';
+import { useRemoteStatus } from './settings/phone';
+import { phoneNeedsAttention, placeShown } from './capabilities';
 import './components/main-window.css';
+import { revealLabel } from './reveal';
 
 const LIMIT = 20_000;
 const KINDS = ['issue', 'idea', 'note', 'task'] as const;
@@ -83,6 +97,8 @@ interface Saved {
   detail?: boolean;
   sideW?: number;
   listW?: number;
+  /** Home has been shown once: the first open (an upgrade's too) lands there, later ones where the window was left */
+  homeSeen?: boolean;
 }
 const loadSaved = (): Saved => {
   try {
@@ -93,7 +109,7 @@ const loadSaved = (): Saved => {
 };
 
 type Screen = { kind: 'main' } | { kind: 'settings' };
-type Detail = { kind: 'session'; dir: string; project: string | null } | { kind: 'job'; id: string } | null;
+type Detail = { kind: 'session'; dir: string; project: string | null } | { kind: 'job'; id: string } | { kind: 'recording'; dir: string } | null;
 interface Toast {
   msg: string;
   undo?: () => void;
@@ -110,7 +126,7 @@ function startPlace(sv: string | null | undefined): { place?: Place; screen?: Sc
   if (sv.startsWith('review:')) return { session: sv.slice(7) };
   if (sv.startsWith('project:')) return { place: sv as Place };
   if (sv === 'settings') return { screen: { kind: 'settings' } };
-  if (['inbox', 'all', 'dictation', 'progress', 'unassigned'].includes(sv)) return { place: sv as Place };
+  if (['home', 'cards', 'screen_text', 'phone', 'inbox', 'all', 'dictation', 'progress', 'unassigned'].includes(sv)) return { place: sv as Place };
   if (sv === 'items') return { place: 'all' };
   return {};
 }
@@ -130,7 +146,15 @@ export default function App() {
   const [projects, setProjects] = useState<ProjectList | null>(null);
   const [summary, setSummary] = useState<Summary | null>(null);
   const [jobs, setJobs] = useState<Job[]>([]);
-  const [place, setPlace] = useState<Place>(saved.place ?? 'inbox');
+  /** agent id → its name (agents.json): "Codex is working on it" */
+  const [agentNames, setAgentNames] = useState<Record<string, string>>({});
+  useEffect(() => {
+    api.agentsRegistry().then((r) => setAgentNames(Object.fromEntries(r.agents.map((a) => [a.id, a.name]))), () => {});
+  }, []);
+  const [place, setPlace] = useState<Place>(saved.homeSeen ? saved.place ?? 'home' : 'home');
+  const { off, known: offKnown } = useOff();
+  const recordingOn = !off.has('recording');
+  const remote = useRemoteStatus();
   const [cardsWaiting, setCardsWaiting] = useState(0);
   const [screen, setScreen] = useState<Screen>({ kind: 'main' });
   const [filters, setFilters] = useState<Record<string, PlaceFilter>>(saved.filters ?? {});
@@ -192,6 +216,16 @@ export default function App() {
   /** rows drag out as Windows' own file drag (mainwin.rs), and the rows of the drag under way */
   const [nativeDrag, setNativeDrag] = useState(false);
   const dragging = useRef<string[] | null>(null);
+  /** something from outside (files, text) or the island's cards dragged over the window: where, and what it is
+      (drag-drop.md §4); the label next to the pointer moves with it without a render (`dropTip`) */
+  const [drop, setDrop] = useState<{ zone: Zone; what: DragKind; where: 'list' | 'side' | 'detail' } | null>(null);
+  const dropTip = useRef<HTMLDivElement>(null);
+  const dropAt = useRef({ x: 0, y: 0 });
+  /** the drag under way: the island cards it is (Rust's answer, asked once per drag: cards_dragging), whether it
+      began in this window — all reset when it is over (DragState) */
+  const dragState = useRef(new DragState());
+  /** drops waiting for their files' paths (folder_drop.rs answers `mainwin://files-dropped` with the token) */
+  const pathWaits = useRef(new Map<string, (files: { path: string; dir: boolean }[] | null) => void>());
   const toastTimer = useRef<ReturnType<typeof setTimeout>>(undefined);
   const undo = useRef<UndoStep[]>([]);
   const redo = useRef<UndoStep[]>([]);
@@ -229,6 +263,7 @@ export default function App() {
     windowUndo: (redo: boolean) => void;
     undone: (uid: string) => void;
     openFolders: (paths: string[]) => Promise<void>;
+    addedFiles: (uid: string, r: AttachResult) => void;
   }>(null!);
   /** the review page on show (ReviewPane's handle): the window's undo calls its steps back, the list's writes poll it */
   const page = useRef<ReviewHandle | null>(null);
@@ -266,6 +301,11 @@ export default function App() {
       listen<{ count: number }>('cards://changed', (p) => setCardsWaiting(p.count)),
       listen<HotkeyRow[]>('hotkeys://changed', (rows) => setHotkeys(rows)),
       listen<{ paths: string[] }>('mainwin://folders-dropped', (p) => void live.current.openFolders(p.paths)),
+      listen<{ token: string; files: { path: string; dir: boolean }[] }>('mainwin://files-dropped', (p) => {
+        const w = pathWaits.current.get(p.token);
+        pathWaits.current.delete(p.token);
+        w?.(p.files);
+      }),
       listen('index://changed', refresh),
       listen('projects://changed', refresh),
       listen('mainwin://dragout', () => setTimeout(() => (dragging.current = null), 300)),
@@ -275,7 +315,8 @@ export default function App() {
         if (p.ev === 'error' && p.code) showToast(t(`error.${p.code}`) === `error.${p.code}` ? t('error.unknown') : t(`error.${p.code}`));
       }),
       listen<{ view?: string; item?: string; session?: string; job?: string | null; project?: string }>('nav', (p) => {
-        if (p.view === 'inbox' || p.view === 'dictation') live.current.go(p.view);
+        if (p.view !== 'welcome') setWelcome(null); // the tray, a toast or a link asked for a place: the setup assistant would hide it (#93)
+        if (p.view === 'inbox' || p.view === 'dictation' || p.view === 'home' || p.view === 'cards' || p.view === 'screen_text' || p.view === 'phone') live.current.go(p.view);
         else if (p.view === 'settings') setScreen({ kind: 'settings' }); // the tray's Settings… (the pane: SettingsView)
         else if (p.view === 'welcome') api.onboarding().then((o) => setWelcome({ onb: o, firstRun: o.needed }), () => {}); // blurt://onboarding
         else if (p.job) live.current.openJob(p.job);
@@ -308,7 +349,7 @@ export default function App() {
   useEffect(() => {
     const h = setTimeout(() => {
       try {
-        const s: Saved = { place, sort, ascending, filters, selected: [...selected].slice(0, 200), sidebar: sideHidden, detail: detailHidden, sideW, listW };
+        const s: Saved = { place, sort, ascending, filters, selected: [...selected].slice(0, 200), sidebar: sideHidden, detail: detailHidden, sideW, listW, homeSeen: true };
         localStorage.setItem(STORE, JSON.stringify(s));
       } catch {
         /* a private window: nothing kept */
@@ -331,7 +372,7 @@ export default function App() {
   const kindsOn = filter.kinds.length > 0 || (showsState(place) && !!filter.state);
   const filtered = kindsOn || searching;
   useEffect(() => {
-    if (place === 'dictation') return;
+    if (isPage(place)) return;
     let alive = true;
     api.items(query).then(
       (r) => {
@@ -350,7 +391,7 @@ export default function App() {
     return () => {
       alive = false;
     };
-  }, [query, tick, place === 'dictation']);
+  }, [query, tick, isPage(place)]);
 
   const how = groupingOf(place, searching);
   const grouped = useMemo(() => {
@@ -360,10 +401,16 @@ export default function App() {
   const rows = grouped.rows;
   const order = useMemo(() => rows.map((r) => r.uid), [rows]);
   const selectedRows = useMemo(() => rows.filter((r) => selected.has(r.uid)), [rows, selected]);
-  const placeEmpty = loaded && !missing && rows.length === 0 && !filtered;
+  // the recordings: Home lists them all; an items' place, at the top, those with no items to be found by
+  // (recordings.ts) — while searching or filtering, only items
+  const recInfos = useRecordingInfos(recordingOn, tick);
+  const recs = useMemo(() => recordings(recInfos, jobs), [recInfos, jobs]);
+  const agentReady = useAgentReady(recordingOn);
+  const placeRecs = useMemo(() => (filtered || isPage(place) ? [] : placeRecordings(recs, place)), [recs, place, filtered]);
+  const placeEmpty = loaded && !missing && emptyStateShown(rows.length, placeRecs.length) && !filtered;
   const emptyWorld = !!summary && !summary.missing && summary.items === 0 && (summary.discarded ?? 0) === 0;
   const quietDetail = emptyWorld || missing || rows.length === 0;
-  const fold = place !== 'dictation' && !detail && (placeEmpty || missing);
+  const fold = !isPage(place) && !detail && (placeEmpty || missing);
 
   // the selection follows the rows: kept by uid; one that left the list hands its place to the next row (Mail)
   const lastIndex = useRef(0);
@@ -426,9 +473,14 @@ export default function App() {
       lastIndex.current = 0;
       setPlace(p);
     }
-    if (p !== 'dictation' && opts?.focusList !== false)
+    if (!isPage(p) && opts?.focusList !== false)
       requestAnimationFrame(() => !document.activeElement?.closest('.mw-rename') && listRef.current?.focus({ preventScroll: true }));
   };
+
+  // the place on show belongs to a capability just turned off (here, in Settings, by hand in config.json): Home
+  useEffect(() => {
+    if (offKnown && !placeShown(place, off)) go('home', { focusList: false });
+  }, [off, offKnown, place]);
 
   /** An item from a link, a notification, a job or the palette: the place on show if it lists it, else its project —
       with the search and the kinds cleared, Discarded where it is discarded. */
@@ -573,6 +625,12 @@ export default function App() {
       } else if (s.kind === 'page') {
         // a step of the page on show (a page since replaced took its steps with it)
         page.current?.undo();
+      } else if (s.kind === 'attach') {
+        await api.attachItem(s.uid, [], [], null, s.before ?? {});
+        if (s.cards?.length) await api.cardsPutBack(s.cards);
+        page.current?.pollNow();
+        // the cards hang again: taking them anew is a new drag, not a Redo
+        if (s.cards?.length) return refresh();
       }
       redo.current.push(s);
       refresh();
@@ -598,6 +656,10 @@ export default function App() {
         await removeProject(s.id, true);
       } else if (s.kind === 'page') {
         page.current?.redo();
+        undo.current.push(s);
+      } else if (s.kind === 'attach') {
+        await api.attachItem(s.uid, [], [], null, s.after ?? {});
+        page.current?.pollNow();
         undo.current.push(s);
       }
       redo.current = keep;
@@ -654,7 +716,7 @@ export default function App() {
       const r = await api.exportBundle(its.map((i) => i.uid), bundleName(one ? its[0].project_name : null, its.length, zh), zh ? 'zh' : 'en');
       if (r) {
         const path = r.path ?? '';
-        showToast(t('main.bundle.saved', { a: path.split(/[\\/]/).pop() ?? path }), { action: { label: revealLabel, run: () => api.reveal(path).catch(fail) } });
+        showToast(t('main.bundle.saved', { a: path.split(/[\\/]/).pop() ?? path }), { action: { label: revealLabel(), run: () => api.reveal(path).catch(fail) } });
       }
     } catch (e) {
       const code = String(e).match(/\[([a-z_]+)\]\s*$/)?.[1];
@@ -677,12 +739,241 @@ export default function App() {
     }
   };
 
-  /** Pictures (or text) pasted into the list or dropped on it: New Item holding them (BA-52). */
-  const newItemFrom = async (files: File[], text: string) => {
-    const pics = files.filter((f) => f.type.startsWith('image/'));
-    const images = (await Promise.all(pics.map((f) => api.saveTempImage(f).catch(() => null)))).filter((p): p is string => !!p);
-    if (!images.length && !text.trim()) return;
-    setNewItem({ ...(images.length ? { title: '', details: '' } : prefillFromText(text)), images });
+  /** Ctrl+V (drag-drop.md §0.6): in the list, the sidebar or nowhere in particular → New Item, filled with the
+      clipboard's files, pictures or text, in the place on show (Enter creates); on the detail with files or a picture
+      on the clipboard → added to the item on show (undoable); text there is the page's own paste. Rust reads the
+      clipboard (clipboard_things: paths, a document's copy told from a picture, Blurt's own copies never pasted back
+      as files); without it (a browser, an error) the page's own clipboard data is used. `sync`: what the paste event
+      carried — gone once it is over. */
+  const pasteInto = async (to: PasteTo, item: Extract<Zone, { kind: 'item' }> | null, sync: { files: File[]; text: string; field: HTMLElement | null }) => {
+    const got = await api.clipboardThings().catch(() => null);
+    let images = got?.images ?? [];
+    const files = got?.files ?? [];
+    let text = got?.text ?? '';
+    if (!got || (!got.ours && !images.length && !files.length && !text)) {
+      const pics = sync.files.filter((f) => f.type.startsWith('image/'));
+      images = (await Promise.all(pics.map((f) => api.saveTempImage(f).catch(() => null)))).filter((p): p is string => !!p);
+      text = images.length ? '' : sync.text;
+    }
+    dragLog({ event: 'main_paste', to, images: images.length, files: files.length, has_text: !!text.trim(), rich: !!got?.rich, ours: !!got?.ours });
+    if (to === 'item' && item) {
+      if (images.length || files.length) return void addTo(item, images, files, null);
+      // only text (a document's copy whose picture was left out): into the field the paste was for
+      const f = sync.field as HTMLInputElement | HTMLTextAreaElement | null;
+      if (text && f?.isConnected) {
+        f.focus();
+        document.execCommand('insertText', false, text);
+      }
+      return;
+    }
+    if (!images.length && !files.length && !text.trim()) return;
+    const words = !images.length && !files.length ? prefillFromText(text) : null;
+    setNewItem({ title: words?.title ?? (images.length ? '' : titleFromFiles(files)), details: words?.details ?? '', images, files, target: listTarget });
+  };
+
+  // ---------------------------------------------------------------- drops (docs/design/drag-drop.md §4)
+  /** where New Item puts what it makes, and where the list's own drops go: the project on show; Unassigned for the
+      Inbox and Unassigned; else the current project */
+  const listTarget = isProject(place) ? place.slice(8) : place === 'inbox' || place === 'unassigned' ? 'inbox' : current ?? 'inbox';
+  const endDrag = () => {
+    setDrop(null);
+    lastOver.current = '';
+    dragState.current.end();
+  };
+  useEffect(() => {
+    // the drag left the window or ended anywhere: nothing is over us any more
+    const leave = (e: DragEvent) => !e.relatedTarget && endDrag();
+    const started = (e: DragEvent) => dragState.current.started(e.defaultPrevented);
+    const ended = () => {
+      dragState.current.innerEnded();
+      endDrag();
+    };
+    // a new press: whatever drag began here is long over (a dragend WebView2 never sent)
+    const pressed = () => dragState.current.innerEnded();
+    // Files, a link or a picture let go where nothing here takes it would make the window navigate to it (WebView2,
+    // WebKitGTK): refused instead — "no drop" under the pointer, nothing happens. Text into a field stays the field's.
+    const guard = (e: DragEvent) => {
+      if (e.defaultPrevented || !e.dataTransfer) return;
+      const types = [...e.dataTransfer.types];
+      if (!types.includes('Files') && !types.includes('text/uri-list')) return;
+      if (!types.includes('Files') && inField(e.target)) return;
+      e.preventDefault();
+      if (e.type === 'dragover') e.dataTransfer.dropEffect = 'none';
+    };
+    window.addEventListener('dragleave', leave);
+    window.addEventListener('drop', endDrag);
+    window.addEventListener('dragend', ended);
+    window.addEventListener('dragstart', started);
+    window.addEventListener('pointerdown', pressed, true);
+    window.addEventListener('dragover', guard);
+    window.addEventListener('drop', guard);
+    return () => {
+      window.removeEventListener('dragleave', leave);
+      window.removeEventListener('drop', endDrag);
+      window.removeEventListener('dragend', ended);
+      window.removeEventListener('dragstart', started);
+      window.removeEventListener('pointerdown', pressed, true);
+      window.removeEventListener('dragover', guard);
+      window.removeEventListener('drop', guard);
+    };
+  }, []);
+  /** What is being dragged over us; a drag of files may be the island's cards (Windows' own drag of them carries
+      files): Rust is asked once, and says so for the dragovers after. */
+  const dragWhat = (e: React.DragEvent): DragKind => {
+    const types = e.dataTransfer.types;
+    const d = dragState.current;
+    if (types.includes('Files') && !types.includes(CARDS_MIME) && !dragging.current && !d.inner) {
+      const token = d.ask();
+      if (token !== null) api.cardsDragging().then((c) => d.answer(token, c), () => {});
+    }
+    return dragKind(types, { rows: !!dragging.current, cards: !!d.cards?.length, inner: d.inner });
+  };
+  /** the zone last said in the drag log (one line a zone, not one a dragover) */
+  const lastOver = useRef('');
+  const zoneKey = (z: Zone) => (z.kind === 'item' ? `i:${z.uid}` : z.kind === 'project' ? `p:${z.project}` : z.kind === 'new' ? `n:${z.project}` : 'none');
+  /** The zone under the pointer, and the label next to it. */
+  const dragOverZone = (e: React.DragEvent, zone: Zone, what: DragKind, where: 'list' | 'side' | 'detail') => {
+    dropAt.current = { x: e.clientX, y: e.clientY };
+    if (dropTip.current) dropTip.current.style.transform = `translate(${e.clientX + 14}px, ${e.clientY + 18}px)`;
+    const k = `${where}:${zoneKey(zone)}:${what}`;
+    if (k !== lastOver.current) {
+      lastOver.current = k;
+      dragLog({ event: where === 'detail' ? 'detail_drop_over' : 'main_drop_over', zone: zone.kind, where, what, types: [...e.dataTransfer.types].slice(0, 6) });
+    }
+    setDrop((d) => (d && d.what === what && d.where === where && zoneKey(d.zone) === zoneKey(zone) ? d : { zone, what, where }));
+  };
+  const dragLog = (ev: Record<string, unknown>) => void api.dragLog(ev).catch(() => {});
+  /** The detail's zone: the item on show (a drop or a paste adds to it); none while it shows a batch, a job, several
+      items or nothing. */
+  const detailZone = (): Extract<Zone, { kind: 'item' }> | null =>
+    current1 && !detail && screen.kind === 'main' && !isPage(place)
+      ? { kind: 'item', uid: current1.uid, title: current1.title || current1.item_id || t('main.item.untitled') }
+      : null;
+  /** The list's zones: an item's row adds to it; anything else in the list (the band, the empty area, an empty
+      list) is a new item in the place on show. */
+  const listZone = (el: HTMLElement): Zone => {
+    const uid = el.closest<HTMLElement>('.mw-row[data-uid]')?.dataset.uid;
+    const r = uid ? rows.find((x) => x.uid === uid) : null;
+    if (r) return { kind: 'item', uid: r.uid, title: r.title || r.item_id || t('main.item.untitled') };
+    return { kind: 'new', project: listTarget };
+  };
+  /** Each dropped file's path: WebView2 knows it (folder_drop.rs, Windows); null elsewhere or when it doesn't answer. */
+  const hostPaths = (files: FileList): Promise<{ path: string; dir: boolean }[] | null> | null => {
+    const wv = webview();
+    if (!wv?.postMessageWithAdditionalObjects || !files.length) return null;
+    const token = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const got = new Promise<{ path: string; dir: boolean }[] | null>((res) => {
+      pathWaits.current.set(token, res);
+      setTimeout(() => pathWaits.current.delete(token) && res(null), 4000);
+    });
+    wv.postMessageWithAdditionalObjects(`blurt-drop-files:${token}`, files);
+    return got;
+  };
+  /** A drop on `zone`. The DataTransfer is only readable during the event: everything is taken from it now. */
+  const dropOn = (e: React.DragEvent, zone: Zone, what: DragKind) => {
+    const dt = e.dataTransfer;
+    // the cards: as the drag names them (card_drop.rs CARDS_MIME), else as Rust said when the drag came in
+    const named = what === 'cards' ? parseCards(dt.getData(CARDS_MIME)) : [];
+    const cards = named.length ? named : (dragState.current.cards ?? []);
+    endDrag();
+    dragLog({ event: zone.kind === 'item' && drop?.where === 'detail' ? 'detail_drop' : 'main_drop', zone: zone.kind, what, files: dt.files.length, cards: cards.length });
+    if (what === 'cards') return void dropCards(cards, zone);
+    const files = [...dt.files];
+    void dropThings({ files, plain: dt.getData('text/plain'), uris: dt.getData('text/uri-list'), paths: hostPaths(dt.files) }, zone);
+  };
+  /** "Added to “title” · 2 pictures · 1 file · text" */
+  const addedText = (title: string, pics: number, files: number, text: boolean) =>
+    [t('main.drop.added', { a: title }), pics ? plural('main.drop.n_pictures', pics) : '', files ? plural('main.drop.n_files', files) : '', text ? t('main.drop.text') : '']
+      .filter(Boolean)
+      .join(' · ');
+  /** Files, pictures, text from another app: added to an item (Undo restores what it had), or New Item holding them. */
+  const dropThings = async (d: { files: File[]; plain: string; uris: string; paths: Promise<{ path: string; dir: boolean }[] | null> | null }, zone: Zone) => {
+    let entries: DropEntry[] = d.files.map((f) => ({ name: f.name, type: f.type, path: '' }));
+    const got = d.paths ? await d.paths : null;
+    if (got) entries = entries.map((x, i) => ({ ...x, path: got[i]?.path ?? '', dir: !!got[i]?.dir }));
+    else if (d.files.length && d.uris) {
+      // Linux: a file manager's drag names its files in text/uri-list; Rust says which are folders (and lets the
+      // thumbnails load)
+      const known = await api.dropPaths(pathsByName(d.files.map((f) => f.name), d.uris)).catch(() => null);
+      if (known) entries = entries.map((x, i) => ({ ...x, path: known[i]?.path ?? '', dir: !!known[i]?.dir }));
+    }
+    const s = sortEntries(entries);
+    const read = await Promise.all(s.bytes.map((i) => api.saveTempImage(d.files[i]).catch(() => null)));
+    const images = [...s.images, ...read.filter((p): p is string => !!p)];
+    const text = d.files.length ? '' : droppedText(d.plain, d.uris);
+    if (s.folders.length) {
+      // folders open as projects — on the sidebar; anywhere else, where to take them
+      if (zone.kind === 'project') void openFolders(s.folders);
+      else showToast(t('main.drop.folders'));
+    }
+    if (!images.length && !s.files.length && !text) {
+      if (s.skipped.length) showToast(plural('main.drop.skipped', s.skipped.length));
+      return;
+    }
+    if (zone.kind === 'item') return void addTo(zone, images, s.files, text || null, s.skipped.length);
+    const target = zone.kind === 'project' || zone.kind === 'new' ? zone.project : listTarget;
+    const words = text ? prefillFromText(text) : null;
+    setNewItem({ title: words?.title ?? (images.length ? '' : titleFromFiles(s.files)), details: words?.details ?? '', images, files: s.files, target });
+    if (s.skipped.length) showToast(plural('main.drop.skipped', s.skipped.length));
+  };
+  /** Pictures, files, text added to an item (a drop on its row or the detail, a paste, Add Image or File…): the
+      detail shows them at once, the toast says what with its Undo, and Ctrl+Z takes it back (attach --restore). */
+  const addTo = async (zone: Extract<Zone, { kind: 'item' }>, images: string[], files: string[], text: string | null, skipped = 0) => {
+    try {
+      added(zone, await api.attachItem(zone.uid, images, files, text), undefined, skipped);
+    } catch (e) {
+      fail(e);
+    }
+  };
+  /** An attach done (`r`: items.py's {before, added}): the step on the window's undo stack, the toast, the page polled. */
+  const added = (zone: Extract<Zone, { kind: 'item' }>, r: AttachResult | null, cards?: CardRef[], skipped = 0) => {
+    const a = r?.added ?? {};
+    const name = t('main.drop.undo_name');
+    pushUndo({ kind: 'attach', name, uid: zone.uid, before: r?.before ?? {}, after: attachedAfter(r?.before, a), ...(cards?.length ? { cards } : {}) });
+    refresh();
+    page.current?.pollNow();
+    const pics = a.frames?.length ?? 0;
+    const files = a.attachments?.length ?? 0;
+    dragLog({ event: 'item_drop_add', images: pics, files, has_text: !!a.details, cards: cards?.length ?? 0 });
+    const msg = [addedText(zone.title, pics, files, !!a.details), skipped ? plural('main.drop.skipped', skipped) : ''].filter(Boolean).join(' · ');
+    showToast(msg, { mark: 'ok', undo: undoToast(name) });
+  };
+  /** The island's cards dropped here: on an item, added to it (their pictures as frames, their notes after the
+      details; Undo restores the item and hangs the cards again); anywhere else, filed into that project. */
+  const dropCards = async (cards: CardRef[], zone: Zone) => {
+    if (!cards.length) return;
+    if (zone.kind === 'item') {
+      try {
+        const r = await api.cardsAttach(cards, zone.uid);
+        added(zone, r, cards);
+      } catch (e) {
+        fail(e);
+      }
+      return;
+    }
+    const project = zone.kind === 'project' || zone.kind === 'new' ? zone.project : listTarget;
+    try {
+      await api.cardsFile(cards, project);
+      showToast(plural('main.drop.filed', cards.length, { a: projectName(project) }), { mark: 'ok' });
+    } catch (e) {
+      fail(e);
+    }
+  };
+  /** A sidebar row (a project, Unassigned) under something dragged from outside or the island's cards: New Item
+      there, or the cards filed there. `phase` "over": whether the row takes it (Sidebar lights it). */
+  const sidebarDrop = (e: React.DragEvent, project: string, phase: 'over' | 'drop' | 'leave'): boolean => {
+    if (phase === 'leave') {
+      setDrop((d) => (d?.zone.kind === 'project' && d.zone.project === project ? null : d));
+      return true;
+    }
+    const what = dragWhat(e);
+    if (what === 'rows' || what === 'none') return false;
+    const zone: Zone = { kind: 'project', project, name: projectName(project) };
+    if (phase === 'over') {
+      e.dataTransfer.dropEffect = 'copy';
+      dragOverZone(e, zone, what, 'side');
+    } else dropOn(e, zone, what);
+    return true;
   };
 
   /** M: the Move popover under the selection (or the button that asked). */
@@ -759,7 +1050,6 @@ export default function App() {
 
   // ---------------------------------------------------------------- menus (one builder each, as on the Mac)
   const mac = status?.platform === 'mac';
-  const revealLabel = status?.platform === 'gnome' ? t('mw.reveal.files') : t('mw.reveal');
   const editorName = ({ vscode: 'VS Code', cursor: 'Cursor', zed: 'Zed' } as Record<string, string>)[editor] ?? 'VS Code';
   const stateTarget = (a: Action, items: ItemRow[]): State => (a === 'restore' ? 'new' : targetOf(a, validFor(a, items)[0] ?? items[0]) ?? 'todo');
   const stateEntry = (a: Action, items: ItemRow[]): MenuEntry => {
@@ -822,7 +1112,7 @@ export default function App() {
       { kind: 'separator' },
       // a picture opens for one item; several selected, it would only open the first one's
       items.filter((i) => i.primary_frame).length <= 1 && { label: t('mw.open_picture'), icon: <Icon name="eye" size={14} />, keys: t('main.keys.space'), disabled: !items.some((i) => i.primary_frame), run: () => openPicture(items) },
-      { label: revealLabel, icon: <Icon name="reveal" size={14} />, keys: 'Ctrl+Shift+R', run: () => revealItems(items) },
+      { label: revealLabel(), icon: <Icon name="reveal" size={14} />, keys: 'Ctrl+Shift+R', run: () => revealItems(items) },
       one && { label: t('main.menu.open_in', { a: editorName }), icon: <Icon name="code" size={14} />, run: () => api.openUrl(codeUrl('', items[0].path, editor)).catch(fail) },
       one && !!items[0].session_dir && { label: t('main.menu.review_batch'), icon: <Icon name="film" size={14} />, run: () => setDetail({ kind: 'session', dir: items[0].session_dir!, project: items[0].project_id }) },
     ]);
@@ -869,7 +1159,7 @@ export default function App() {
       { label: t('main.project.rename'), icon: <Icon name="pencil" size={14} />, keys: 'F2', run: () => setRenamingProject(p.id) },
       { label: t('main.project.settings'), icon: <Icon name="sliders" size={14} />, keys: 'Ctrl+I', run: () => setSettingsFor(p) },
       { kind: 'separator' },
-      { label: revealLabel, icon: <Icon name="reveal" size={14} />, run: () => api.reveal(p.path).catch(fail) },
+      { label: revealLabel(), icon: <Icon name="reveal" size={14} />, run: () => api.reveal(p.path).catch(fail) },
       { label: t('main.menu.open_in', { a: editorName }), icon: <Icon name="code" size={14} />, run: () => api.openUrl(`${editor === 'zed' ? 'zed' : editor === 'cursor' ? 'cursor' : 'vscode'}://file/${p.path.replace(/\\/g, '/').replace(/^\/+/, '')}`).catch(fail) },
       { label: t('action.copy_path'), icon: <Icon name="copy" size={14} />, run: () => copyLines([p.path], t('mw.copied.path')) },
       { kind: 'separator' },
@@ -925,14 +1215,15 @@ export default function App() {
     }, () => {});
   };
   const moreMenu = (): MenuEntry[] => tidy([
-    { label: t('main.new_item.menu'), icon: <Icon name="plus" size={14} />, keys: 'Ctrl+N', disabled: place === 'dictation', run: () => setNewItem(true) },
-    { label: t('project.open_folder'), icon: <Icon name="folder-plus" size={14} />, keys: 'Ctrl+O', run: openFolder },
-    registered.length > 0 && { label: t('menu.open_recent'), icon: <Icon name="folder" size={14} />, submenu: registered.slice(0, 10).map((p): MenuEntry => ({ label: p.name, icon: <ProjectGlyph id={p.id} size={14} />, tip: p.path, run: () => go(`project:${p.id}`) })) },
-    { label: t('menu.rescan'), icon: <Icon name="refresh" size={14} />, run: () => api.rescan().catch(fail) },
+    // items and projects are Recording & Items': with it off, none of these
+    recordingOn && { label: t('main.new_item.menu'), icon: <Icon name="plus" size={14} />, keys: 'Ctrl+N', disabled: isPage(place), run: () => setNewItem(true) },
+    recordingOn && { label: t('project.open_folder'), icon: <Icon name="folder-plus" size={14} />, keys: 'Ctrl+O', run: openFolder },
+    recordingOn && registered.length > 0 && { label: t('menu.open_recent'), icon: <Icon name="folder" size={14} />, submenu: registered.slice(0, 10).map((p): MenuEntry => ({ label: p.name, icon: <ProjectGlyph id={p.id} size={14} />, tip: p.path, run: () => go(`project:${p.id}`) })) },
+    recordingOn && { label: t('menu.rescan'), icon: <Icon name="refresh" size={14} />, run: () => api.rescan().catch(fail) },
     { kind: 'separator' },
     // the Mac's View menu words: what the item does now, not "Show or Hide"
     { label: t(sideOff ? 'menu.show_sidebar' : 'menu.hide_sidebar'), icon: <SidebarGlyph size={14} />, keys: 'Ctrl+Shift+S', run: toggleSide },
-    { label: t(detailHidden ? 'menu.show_detail' : 'menu.hide_detail'), icon: <SidebarGlyph right size={14} />, keys: 'Ctrl+Alt+I', disabled: place === 'dictation', run: () => setDetailHidden((h) => !h) },
+    { label: t(detailHidden ? 'menu.show_detail' : 'menu.hide_detail'), icon: <SidebarGlyph right size={14} />, keys: 'Ctrl+Alt+I', disabled: isPage(place), run: () => setDetailHidden((h) => !h) },
     { kind: 'separator' },
     { label: t('menu.palette'), icon: <Icon name="search" size={14} />, keys: 'Ctrl+K', run: () => setPalette(true) },
     { label: t('menu.shortcuts'), icon: <Icon name="keyboard" size={14} />, keys: 'Ctrl+/', run: () => setKeysOpen(true) },
@@ -977,7 +1268,8 @@ export default function App() {
 
   // ---------------------------------------------------------------- the heading
   const scopeTitle = place === 'inbox' ? t('main.place.inbox') : place === 'progress' ? t('main.place.progress') : place === 'unassigned' ? t('project.inbox')
-    : place === 'all' ? t('main.place.all') : place === 'dictation' ? t('dictation.history.sidebar') : shownProject?.name ?? t('main.place.project');
+    : place === 'all' ? t('main.place.all') : place === 'dictation' ? t('dictation.history.sidebar') : place === 'home' ? t('home.title')
+      : place === 'cards' ? t('cards.title') : place === 'screen_text' ? t('feature.screen_text') : place === 'phone' ? t('feature.phone') : shownProject?.name ?? t('main.place.project');
   const headTitle = searching ? t('main.search.title', { a: text.trim() }) : scopeTitle;
   const counts = (() => {
     if (!loaded || missing || !rows.length) return '';
@@ -996,12 +1288,7 @@ export default function App() {
     showsState(place) && filter.state ? t(`state.${filter.state}`) : '',
   ].filter(Boolean);
   const filterText = filterParts.length ? t('main.filter.showing', { a: filterParts.join(' · ') }) : '';
-  const placeJobs = useMemo(() => {
-    const active = jobs.filter((j) => j.state === 'running' || j.state === 'queued');
-    if (place === 'unassigned') return active.filter((j) => !j.project || j.project === 'inbox');
-    if (isProject(place)) return active.filter((j) => j.project === place.slice(8));
-    return place === 'inbox' || place === 'progress' ? active : [];
-  }, [jobs, place]);
+  const placeJobs = useMemo(() => placeJobList(jobs, recs, place), [jobs, recs, place]);
   const sugGroups = place === 'unassigned' && !searching ? suggestionGroups(rows, registered) : [];
 
   // ---------------------------------------------------------------- the empty states (updateEmpty)
@@ -1015,7 +1302,7 @@ export default function App() {
         </EmptyState>
       );
     }
-    if (!loaded || rows.length) return null;
+    if (!loaded || !emptyStateShown(rows.length, placeRecs.length)) return null;
     const q = text.trim();
     const clear = () => {
       setText('');
@@ -1107,6 +1394,10 @@ export default function App() {
     undone: (uid) => {
       if (!selected.has(uid)) reveal(uid);
     },
+    addedFiles: (uid, r) => {
+      const it = itemsOf([uid])[0] ?? (current1?.uid === uid ? current1 : null);
+      added({ kind: 'item', uid, title: it?.title || it?.item_id || t('main.item.untitled') }, r);
+    },
   };
   const hostCb: HostCallbacks = useMemo(() => ({
     onHandoff: (_r: unknown, what: 'instruction' | 'full') => showToast(t(what === 'full' ? 'main.handoff.copied_full' : 'main.handoff.copied'), { mark: 'ok' }),
@@ -1134,6 +1425,7 @@ export default function App() {
     onWindowUndo: (r: boolean) => live.current.windowUndo(r),
     onUndone: (uid: string) => live.current.undone(uid),
     onDownloaded: (name: string) => showToast(name ? t('main.toast.downloaded', { name }) : t('main.toast.download_failed')),
+    onAddedFiles: (uid: string, r: AttachResult) => live.current.addedFiles(uid, r),
   }), []);
   /** an item the project's doc leaves out (discarded, moved in since): its page loads with it listed */
   const [docItem, setDocItem] = useState<string | null>(null);
@@ -1151,7 +1443,10 @@ export default function App() {
     const p = detail.project ? projectRow(detail.project) : null;
     return hostFor({ session: detail.dir }, p && p.kind !== 'inbox' ? p.path : null, hostCb, editor);
   }, [detail, editor]);
-  const shownJob = detail?.kind === 'job' ? jobs.find((j) => j.id === detail.id) ?? null : null;
+  // a recording's own detail turns into its run's once one starts (Organize, Retry from there)
+  const shownRec = detail?.kind === 'recording' ? recs.find((r) => samePath(r.info.dir, detail.dir)) ?? null : null;
+  const shownRecJob = shownRec && (shownRec.state.kind === 'organising' || shownRec.state.kind === 'failed') ? shownRec.state.job : null;
+  const shownJob = detail?.kind === 'job' ? jobs.find((j) => j.id === detail.id) ?? null : shownRecJob;
   /** the line above the item on show (the Mac's ItemBanner) */
   const banner = current1 ? bannerPlan(current1, jobs) : null;
   const bannerText = (() => {
@@ -1160,6 +1455,10 @@ export default function App() {
       const j = jobs.find((x) => x.id === banner.job);
       const step = j?.steps.find((x) => x.state === 'running') ?? j?.steps.find((x) => x.state === 'pending');
       return t(banner.text.key, { what: step ? t(`job.step.${step.id}`) : t('job.state.running') });
+    }
+    if (banner.text.key === 'main.banner.working') {
+      const id = banner.text.args[0];
+      return t(banner.text.key, { who: id ? agentNames[id] ?? id : t('main.banner.your_agent') });
     }
     return t(banner.text.key, { who: banner.text.args[0], what: banner.text.args[1] });
   })();
@@ -1170,12 +1469,15 @@ export default function App() {
       const j = jobs.find((x) => x.id === job);
       return j ? openJob(j) : undefined;
     }
-    if (a === 'done' || a === 'wontfix') void apply(a as Action, [current1]);
+    if (a === 'done' || a === 'wontfix' || a === 'take_back') void apply(a as Action, [current1]);
   }
   const jobTitle = (j: Job) => {
     // an organizing job with a name of its own is that name ("AI fill-in"), not "Organizing · AI fill-in": two names
     // glued by a dot read as one jargon phrase
     if (j.type === 'process' && j.title) return j.title;
+    // a recording's run: the recording ("Recording · 3:12")
+    const rec = recOfJob(j);
+    if (rec) return [t('inbox.mode.video'), recLength(rec)].filter(Boolean).join(' · ');
     const what = t(`job.type.${j.type}`);
     return j.title ? `${what} · ${j.title}` : what;
   };
@@ -1191,6 +1493,39 @@ export default function App() {
     setFocus(null);
     setDetail({ kind: 'job', id: j.id });
   }
+  /** The recording a process job organises (its detail is that recording's: its words, its buttons). */
+  const recOfJob = (j: Job): Recording | null => (j.type === 'process' && j.session ? recs.find((r) => samePath(r.info.dir, j.session)) ?? null : null);
+  /** The recording a run's detail is: while this run is that recording's newest (an older run is just a job). */
+  const recDetailOf = (j: Job): RecDetail | null => {
+    const r = recOfJob(j);
+    if (!r || (r.state.kind !== 'organising' && r.state.kind !== 'failed') || r.state.job?.id !== j.id) return null;
+    return { r, agent: agentReady, handlers: recHandlers };
+  };
+  /** A recording's place: its project, or Unassigned. */
+  const placeOfProject = (id: string | null | undefined): Place => (id && id !== 'inbox' ? `project:${id}` : 'unassigned');
+  const recHandlers: RecHandlers = {
+    // from Home (a page, no detail column): the recording's place, with it in the detail
+    onReview: (r: Recording) => {
+      if (isPage(place)) go(placeOfProject(r.info.project_id), { focusList: false });
+      setScreen({ kind: 'main' });
+      setDetail({ kind: 'session', dir: r.info.dir, project: r.info.project_id });
+    },
+    onJob: (j: Job) => {
+      if (isPage(place)) go(placeOfProject(j.project), { focusList: false });
+      openJob(j);
+    },
+    // from Home: the recording's place, with its detail (Play Video, Show in Folder, Organize… are there)
+    onDetail: (r: Recording) => {
+      if (isPage(place)) go(placeOfProject(r.info.project_id), { focusList: false });
+      setScreen({ kind: 'main' });
+      setSelected(new Set());
+      setFocus(null);
+      setDetail({ kind: 'recording', dir: r.info.dir });
+    },
+    onSettings: (pane: string) => (setScreen({ kind: 'settings' }), goSettingsPane(pane)),
+    onToast: (m: string, action?: { label: string; run: () => void }) => showToast(m, action ? { action, mark: 'warn' } : {}),
+    onChanged: () => refresh(),
+  };
   const lang = i18n().lang;
   const platform = status?.platform ?? 'win';
 
@@ -1211,17 +1546,19 @@ export default function App() {
       const n = /^[1-9]$/.test(key) ? Number(key) : 0;
       if (key === 'k') return stop(() => setPalette((p) => !p));
       if (key === 'f') return stop(focusSearch);
-      if (key === 'o') return stop(openFolder);
-      if (key === 'n' && place !== 'dictation') return stop(() => setNewItem(true));
+      if (key === 'o' && recordingOn) return stop(openFolder);
+      if (key === 'n' && recordingOn && !isPage(place)) return stop(() => setNewItem(true));
       if (key === ',') return stop(() => setScreen({ kind: 'settings' }));
       if (key === '/') return stop(() => setKeysOpen(true));
       // the window's own close (Blurt stays in the notification area)
       if (key === 'w' && inTauri) return stop(() => void getCurrentWindow().close().catch(() => {}));
       if (key === 'i' && shownProject) return stop(() => setSettingsFor(shownProject));
-      if (n >= 1 && n <= 4) return stop(() => go((['inbox', 'progress', 'unassigned', 'all'] as Place[])[n - 1]));
-      if (n >= 5) return stop(() => registered[n - 5] && go(`project:${registered[n - 5].id}`));
+      // Ctrl+0 Home; Ctrl+1–4 the items' places and Ctrl+5–9 the projects, while Recording & Items is on
+      if (key === '0') return stop(() => go('home'));
+      if (n >= 1 && n <= 4 && recordingOn) return stop(() => go((['inbox', 'progress', 'unassigned', 'all'] as Place[])[n - 1]));
+      if (n >= 5 && recordingOn) return stop(() => registered[n - 5] && go(`project:${registered[n - 5].id}`));
     }
-    if (ctrl && e.altKey && !e.shiftKey && !overlay && key === 'd') return stop(() => go('dictation'));
+    if (ctrl && e.altKey && !e.shiftKey && !overlay && key === 'd' && !off.has('dictation')) return stop(() => go('dictation'));
     if (ctrl && e.altKey && !e.shiftKey && !overlay && key === 'i') return stop(() => setDetailHidden((h) => !h));
     if (ctrl && e.shiftKey && !e.altKey && !overlay && key === 's') return stop(toggleSide);
     if (ctrl && e.shiftKey && !overlay && key === 'r' && selectedRows.length) return stop(() => revealItems(selectedRows));
@@ -1230,11 +1567,11 @@ export default function App() {
     if (e.key === 'Escape') {
       if (overlay) return;
       if (narrow && sidePeek) return stop(() => setSidePeek(false));
-      if (detail?.kind === 'session') return stop(() => setDetail(null));
+      if (detail?.kind === 'session' || detail?.kind === 'recording') return stop(() => setDetail(null));
       if (inDetail && !field) return stop(focusList);
       return;
     }
-    if (overlay || field || inDetail || renaming || (menu.isOpen && stateMenu) || screen.kind !== 'main' || place === 'dictation') return;
+    if (overlay || field || inDetail || renaming || (menu.isOpen && stateMenu) || screen.kind !== 'main' || isPage(place)) return;
     const sel = selectedRows;
     // Hand Off: Ctrl+Enter, and Ctrl+Shift+C (Copy Instruction's key before it was the one hand-off)
     if ((ctrl && e.key === 'Enter') || (ctrl && e.shiftKey && key === 'c')) return stop(() => sel.length && void handOff(sel.map((i) => i.uid)));
@@ -1302,6 +1639,27 @@ export default function App() {
     return () => window.removeEventListener('keydown', h);
   }, []);
 
+  // Ctrl+V wherever the focus is, unless the page took it itself (pasteTarget, pasteInto)
+  const onPaste = (e: ClipboardEvent) => {
+    if (e.defaultPrevented || welcome || overlay) return;
+    const el = e.target as HTMLElement | null;
+    const field = inField(el);
+    const item = detailZone();
+    const types = [...(e.clipboardData?.types ?? [])];
+    const to = pasteTarget({ field, detail: !!el?.closest?.('.mw-detail'), item: !!item, files: types.includes('Files'), main: screen.kind === 'main' && !isPage(place) });
+    if (to === 'page' || to === 'none') return;
+    const sync = { files: [...(e.clipboardData?.files ?? [])], text: e.clipboardData?.getData('text/plain') ?? '', field: field ? el : null };
+    e.preventDefault();
+    void pasteInto(to, item, sync);
+  };
+  const pasteRef = useRef(onPaste);
+  pasteRef.current = onPaste;
+  useEffect(() => {
+    const h = (e: ClipboardEvent) => pasteRef.current(e);
+    document.addEventListener('paste', h);
+    return () => document.removeEventListener('paste', h);
+  }, []);
+
   // The dictation key while this window has the focus: Windows' key hook doesn't hear it then, so it is passed on.
   useEffect(() => {
     const FORWARD_CODES = new Set(['AltRight', 'AltLeft', 'ControlRight', 'ControlLeft', 'ShiftRight', 'ShiftLeft', 'MetaLeft', 'MetaRight', 'CapsLock']);
@@ -1335,30 +1693,41 @@ export default function App() {
         { id: 'move_pick', title: t('main.palette.move_pick'), icon: ic('move'), keys: 'M', hint: plural('main.selection.move.tip', items.length), section: 'selected', pinned: true, run: () => setTimeout(() => pickProject(items.map((i) => i.uid))) },
         { id: 'export', title: t('main.menu.export_bundle'), icon: ic('archive'), section: 'selected', run: () => exportBundle(items) },
         { id: 'picture', title: t('mw.open_picture'), icon: ic('eye'), keys: t('main.keys.space'), section: 'selected', run: () => openPicture(items) },
-        { id: 'reveal', title: revealLabel, icon: ic('reveal'), keys: 'Ctrl+Shift+R', section: 'selected', run: () => revealItems(items) },
+        { id: 'reveal', title: revealLabel(), icon: ic('reveal'), keys: 'Ctrl+Shift+R', section: 'selected', run: () => revealItems(items) },
         { id: 'copy_path', title: t('action.copy_path'), icon: ic('copy'), keys: 'Ctrl+Alt+C', section: 'selected', run: () => copyLines(items.map(pathOf), t('mw.copied.path')) },
         { id: 'rename', title: t('main.menu.rename'), icon: ic('pencil'), keys: 'E', section: 'selected', run: () => items.length === 1 && setRenaming(items[0].uid) },
         { id: 'enrich', title: t('main.menu.enrich'), icon: ic('text-plus'), section: 'selected', run: () => enrich(items) },
       );
     }
+    // only what the capabilities that are on can do (an off one's places and actions aren't offered)
+    const rec = recordingOn;
+    const on = (c: Parameters<typeof off.has>[0]) => !off.has(c);
     out.push(
-      { id: 'record', title: t('main.action.record'), icon: ic('record'), keys: hotkeyOf('record') || undefined, hint: t('main.toolbar.record.tip', { a: '' }).trim(), section: 'capture', pinned: true, run: record },
-      { id: 'snap', title: t('main.action.snap'), icon: ic('screenshot'), keys: hotkeyOf('snap') || undefined, hint: t('main.toolbar.snap.tip', { a: '' }).trim(), section: 'capture', pinned: true, run: snap },
-      { id: 'go:inbox', title: t('main.place.inbox'), icon: ic('inbox'), keys: 'Ctrl+1', section: 'go', pinned: true, run: () => go('inbox') },
-      { id: 'go:progress', title: t('main.place.progress'), icon: <ProgressGlyph size={15} />, keys: 'Ctrl+2', section: 'go', pinned: true, run: () => go('progress') },
-      { id: 'go:unassigned', title: t('project.inbox'), icon: <Icon name="tray-2" size={15} />, keys: 'Ctrl+3', section: 'go', run: () => go('unassigned') },
-      { id: 'go:all', title: t('main.place.all'), icon: ic('list-box'), keys: 'Ctrl+4', section: 'go', pinned: true, run: () => go('all') },
-      { id: 'go:dictation', title: t('dictation.history.menu'), icon: ic('character-cursor'), keys: 'Ctrl+Alt+D', section: 'go', pinned: true, run: () => go('dictation') },
-      { id: 'new_item', title: t('main.new_item.menu'), icon: ic('plus'), keys: 'Ctrl+N', run: () => setNewItem(true) },
-      { id: 'open_folder', title: t('project.open_folder'), icon: ic('folder-plus'), keys: 'Ctrl+O', run: openFolder },
-      ...(kindsOn ? [{ id: 'clear_filters', title: t('main.empty.clear_filters'), icon: <FilterGlyph size={15} />, run: () => setFilter(NO_FILTER) }] : []),
-      { id: 'rescan', title: t('menu.rescan'), icon: ic('refresh'), run: () => api.rescan().catch(fail) },
+      ...(rec ? [{ id: 'record', title: t('main.action.record'), icon: ic('record'), keys: hotkeyOf('record') || undefined, hint: t('main.toolbar.record.tip', { a: '' }).trim(), section: 'capture', pinned: true, run: record } as PaletteEntry] : []),
+      ...(on('cards') ? [{ id: 'snap', title: t('main.action.snap'), icon: ic('screenshot'), keys: hotkeyOf('snap') || undefined, hint: t('main.toolbar.snap.tip', { a: '' }).trim(), section: 'capture', pinned: true, run: snap } as PaletteEntry] : []),
+      { id: 'go:home', title: t('home.title'), icon: ic('home'), keys: 'Ctrl+0', section: 'go', pinned: true, run: () => go('home') },
+      ...(on('dictation') ? [{ id: 'go:dictation', title: t('dictation.history.menu'), icon: ic('character-cursor'), keys: 'Ctrl+Alt+D', section: 'go', pinned: true, run: () => go('dictation') } as PaletteEntry] : []),
+      ...(on('cards') ? [{ id: 'go:cards', title: t('cards.title'), icon: ic('cards'), section: 'go', run: () => go('cards') } as PaletteEntry] : []),
+      ...(on('screen_text') && status && builds(status).screenText ? [{ id: 'go:screen_text', title: t('feature.screen_text'), icon: ic('text-viewfinder'), section: 'go', run: () => go('screen_text') } as PaletteEntry] : []),
+      ...(on('phone') ? [{ id: 'go:phone', title: t('feature.phone'), icon: ic('phone'), section: 'go', run: () => go('phone') } as PaletteEntry] : []),
+      ...(rec
+        ? ([
+            { id: 'go:inbox', title: t('main.place.inbox'), icon: ic('inbox'), keys: 'Ctrl+1', section: 'go', pinned: true, run: () => go('inbox') },
+            { id: 'go:progress', title: t('main.place.progress'), icon: <ProgressGlyph size={15} />, keys: 'Ctrl+2', section: 'go', pinned: true, run: () => go('progress') },
+            { id: 'go:unassigned', title: t('project.inbox'), icon: <Icon name="tray-2" size={15} />, keys: 'Ctrl+3', section: 'go', run: () => go('unassigned') },
+            { id: 'go:all', title: t('main.place.all'), icon: ic('list-box'), keys: 'Ctrl+4', section: 'go', pinned: true, run: () => go('all') },
+            { id: 'new_item', title: t('main.new_item.menu'), icon: ic('plus'), keys: 'Ctrl+N', run: () => setNewItem(true) },
+            { id: 'open_folder', title: t('project.open_folder'), icon: ic('folder-plus'), keys: 'Ctrl+O', run: openFolder },
+            ...(kindsOn ? [{ id: 'clear_filters', title: t('main.empty.clear_filters'), icon: <FilterGlyph size={15} />, run: () => setFilter(NO_FILTER) }] : []),
+            { id: 'rescan', title: t('menu.rescan'), icon: ic('refresh'), run: () => api.rescan().catch(fail) },
+          ] as PaletteEntry[])
+        : []),
       { id: 'shortcuts', title: t('menu.shortcuts'), icon: ic('keyboard'), keys: '?', run: () => setKeysOpen(true) },
-      ...KINDS.map((k): PaletteEntry => ({ id: `only:${k}`, title: t('main.palette.only_kind', { a: t(`kind.${k}`) }), icon: <KindIcon kind={k} size={15} />, run: () => setFilter({ ...filter, kinds: [k] }) })),
-      ...jobs.filter((j) => j.state === 'running' || j.state === 'queued').map((j): PaletteEntry => ({ id: `job:${j.id}`, title: jobTitle(j), icon: ic('spark'), run: () => openJob(j) })),
+      ...(rec ? KINDS.map((k): PaletteEntry => ({ id: `only:${k}`, title: t('main.palette.only_kind', { a: t(`kind.${k}`) }), icon: <KindIcon kind={k} size={15} />, run: () => setFilter({ ...filter, kinds: [k] }) })) : []),
+      ...(rec ? jobs.filter((j) => j.state === 'running' || j.state === 'queued').map((j): PaletteEntry => ({ id: `job:${j.id}`, title: jobTitle(j), icon: ic('spark'), run: () => openJob(j) })) : []),
       { id: 'settings', title: t('mw.settings_menu'), icon: ic('settings'), keys: 'Ctrl+,', run: () => setScreen({ kind: 'settings' }) },
     );
-    for (const p of registered) {
+    for (const p of rec ? registered : []) {
       out.push({ id: `project:${p.id}`, title: p.name, icon: <ProjectGlyph id={p.id} size={15} />, hint: p.id === current ? t('main.project.current_count', { a: p.path }) : t('main.palette.project', { a: p.path }), run: () => go(`project:${p.id}`) });
       // a move target is a project the items aren't all in already, whose folder is there; it carries its own folder
       if (items.length && p.exists && !items.every((i) => i.project_id === p.id))
@@ -1403,17 +1772,19 @@ export default function App() {
 
   const mainScreen = screen.kind === 'main';
   const dictationPage = mainScreen && place === 'dictation';
+  /** a page of its own (Home, Dictation, Cards, Phone): it takes the list and the detail columns */
+  const pageShown = mainScreen && isPage(place);
   // a narrow window with the sidebar shown on demand: sidebar and list, the detail comes back once a place is picked
   // the sidebar shown on demand in a narrow window lies over the list (Windows 11 NavigationView's overlay pane):
   // nothing under it reflows, the open item stays open; a click outside, Esc or a pick folds it back (windows-parity
   // main-window.md 12.1 / 14.4)
   const peek = narrow && sidePeek && screen.kind !== 'settings';
-  const showDetail = mainScreen && !dictationPage && !detailHidden && !fold;
+  const showDetail = mainScreen && !pageShown && !detailHidden && !fold;
   const sideFit = narrow ? sideW : Math.max(190, Math.min(sideW, winW - 330 - 380));
   const sideIn = sideOff || peek ? 0 : sideFit;
   const listFit = Math.max(330, Math.min(listW, winW - sideIn - 380));
-  const cols = [`${sideIn}px`, !mainScreen || dictationPage ? '1fr' : showDetail ? `${listFit}px` : '1fr', showDetail ? `minmax(${winW < 710 ? 0 : 380}px, 1fr)` : '0px'].join(' ');
-  const empty = mainScreen && !dictationPage ? emptyView() : null;
+  const cols = [`${sideIn}px`, !mainScreen || pageShown ? '1fr' : showDetail ? `${listFit}px` : '1fr', showDetail ? `minmax(${winW < 710 ? 0 : 380}px, 1fr)` : '0px'].join(' ');
+  const empty = mainScreen && !pageShown ? emptyView() : null;
   // a toast sits under the column it is about — the detail's when there is one, else the content's — never across a
   // pane divider (it straddled the list and the detail when centred on the window)
   const toastAt = (() => {
@@ -1431,13 +1802,18 @@ export default function App() {
         <span className="grow" />
         {!dictationPage && (
           <>
-            {/* icon-only, as the Mac's toolbar: the words and the user's key are the tooltip */}
-            <button className="mw-tool sq" onClick={record} aria-label={t('main.action.record')} title={t('main.toolbar.record.tip', { a: hotkeyOf('record') }).trim()} data-testid="record">
-              <Icon name="record" size={16} />
-            </button>
-            <button className="mw-tool sq" onClick={snap} aria-label={t('main.action.snap')} title={t('main.toolbar.snap.tip', { a: hotkeyOf('snap') }).trim()} data-testid="snap">
-              <Icon name="screenshot" size={16} />
-            </button>
+            {/* icon-only, as the Mac's toolbar: the words and the user's key are the tooltip; each only while its
+                capability is on */}
+            {recordingOn && (
+              <button className="mw-tool sq" onClick={record} aria-label={t('main.action.record')} title={t('main.toolbar.record.tip', { a: hotkeyOf('record') }).trim()} data-testid="record">
+                <Icon name="record" size={16} />
+              </button>
+            )}
+            {!off.has('cards') && (
+              <button className="mw-tool sq" onClick={snap} aria-label={t('main.action.snap')} title={t('main.toolbar.snap.tip', { a: hotkeyOf('snap') }).trim()} data-testid="snap">
+                <Icon name="screenshot" size={16} />
+              </button>
+            )}
           </>
         )}
         <button className="mw-tool" onClick={(e) => menu.open(moreMenu(), { x: 0, y: 0, anchor: e.currentTarget }, t('mw.more'))} aria-label={t('mw.more')} title={t('mw.more')} aria-haspopup="menu" data-testid="more">
@@ -1458,8 +1834,17 @@ export default function App() {
               projects={registered}
               current={current}
               onMove={(u, p) => moveItems(u, p)}
+              onDropAt={(e, p, phase) => sidebarDrop(e, p ?? listTarget, phase)}
               onOpenFolder={openFolder}
+              onReorder={(id, onto, after) => {
+                const ids = reorderedProjects(registered, id, onto, after);
+                if (ids) api.orderProjects(ids).then(refresh, (e) => showToast(`${t('main.project.save_failed')} — ${errText(e)}`));
+              }}
               onSettings={() => setScreen({ kind: 'settings' })}
+              off={off}
+              screenText={!!status && builds(status).screenText}
+              cards={cardsWaiting}
+              phoneAlert={!!remote && phoneNeedsAttention(remote)}
               onProjectMenu={(p, at) => menu.open(projectMenu(p), at, p.name)}
               renaming={renamingProject}
               onRename={(id) => setRenamingProject(id)}
@@ -1476,7 +1861,7 @@ export default function App() {
       {screen.kind === 'settings' && status && (
         <main className="mw-wide content">
           <section className="pad st-host">
-            <SettingsView status={status} onToast={(m) => showToast(m)} onBack={() => setScreen({ kind: 'main' })} onWelcome={() => api.onboarding().then((o) => setWelcome({ onb: o, firstRun: false }), fail)} onLang={(l) => (l === 'auto' ? api.status().then((s) => relang(s.lang)) : relang(l))} />
+            <SettingsView status={status} onToast={(m) => showToast(m)} onBack={() => setScreen({ kind: 'main' })} onGo={(p) => (setScreen({ kind: 'main' }), go(p))} onWelcome={() => api.onboarding().then((o) => setWelcome({ onb: o, firstRun: false }), fail)} onLang={(l) => (l === 'auto' ? api.status().then((s) => relang(s.lang)) : relang(l))} />
           </section>
         </main>
       )}
@@ -1486,7 +1871,30 @@ export default function App() {
         </main>
       )}
 
-      {mainScreen && !dictationPage && (
+      {pageShown && place === 'home' && status && (
+        <main className="mw-wide content">
+          <HomePage status={status} hotkeys={hotkeys} summary={summary} cardsWaiting={cardsWaiting} onGo={go} onReveal={(uid) => void reveal(uid)} onToast={(m) => showToast(m)}
+            onSettings={(pane) => (setScreen({ kind: 'settings' }), goSettingsPane(pane))} tick={tick}
+            recordings={recs} recAgent={agentReady} recHandlers={recHandlers} />
+        </main>
+      )}
+      {pageShown && place === 'cards' && (
+        <main className="mw-wide content">
+          <CardsPage hotkeys={hotkeys} platform={platform} onSnap={snap} onToast={(m, undo) => showToast(m, undo ? { undo } : {})} />
+        </main>
+      )}
+      {pageShown && place === 'screen_text' && (
+        <main className="mw-wide content">
+          <ScreenTextPage hotkeys={hotkeys} onToast={(m) => showToast(m)} onSettings={() => (setScreen({ kind: 'settings' }), goSettingsPane('screentext'))} />
+        </main>
+      )}
+      {pageShown && place === 'phone' && status && (
+        <main className="mw-wide content">
+          <PhonePage status={status} onSettings={(pane) => (setScreen({ kind: 'settings' }), goSettingsPane(pane))} />
+        </main>
+      )}
+
+      {mainScreen && !pageShown && (
         <section
           className="mw-list"
           ref={listRef}
@@ -1494,29 +1902,34 @@ export default function App() {
           aria-label={scopeTitle}
           data-testid="list"
           onDragOver={(e) => {
-            if (!dragging.current && e.dataTransfer.types.includes('Files')) {
-              e.preventDefault();
-              e.dataTransfer.dropEffect = 'copy';
-            }
+            // files, pictures, text from another app, or the island's cards (rows of the list have their own drag)
+            const what = dragWhat(e);
+            if (what === 'rows' || what === 'none') return;
+            e.preventDefault();
+            e.dataTransfer.dropEffect = 'copy'; // (Windows' drag of files and cards allows only a copy)
+            dragOverZone(e, listZone(e.target as HTMLElement), what, 'list');
+          }}
+          onDragLeave={(e) => {
+            if (!e.currentTarget.contains(e.relatedTarget as Node | null)) setDrop((d) => (d?.where === 'list' ? null : d));
           }}
           onDrop={(e) => {
-            if (dragging.current || !e.dataTransfer.files.length) return;
+            const what = dragWhat(e);
+            if (what === 'rows' || what === 'none') return;
             e.preventDefault();
-            newItemFrom([...e.dataTransfer.files], '');
-          }}
-          onPaste={(e) => {
-            if (inField(e.target) || place === 'dictation') return;
-            const files = [...e.clipboardData.files];
-            const text = e.clipboardData.getData('text/plain');
-            if (!files.length && !text.trim()) return;
-            e.preventDefault();
-            newItemFrom(files, files.length ? '' : text);
+            dropOn(e, listZone(e.target as HTMLElement), what);
           }}
           onMouseDown={(e) => {
             const el = e.target as HTMLElement;
             if (!inField(el) && !el.closest('button')) listRef.current?.focus({ preventScroll: true });
           }}
         >
+          {drop?.where === 'list' && (
+            // pinned at the top while something is dragged over the list: a full list has no empty area to drop on
+            <div className={`mw-drop-band ${drop.zone.kind === 'new' ? 'on' : ''}`} aria-hidden="true" data-testid="drop-band">
+              <Icon name="plus" size={14} />
+              {drop.what === 'cards' ? t('main.drop.file_into', { a: projectName(listTarget) }) : t('main.drop.new')}
+            </div>
+          )}
           <ListHeading
             title={headTitle}
             counts={counts}
@@ -1549,6 +1962,8 @@ export default function App() {
           )}
           {shownProject && !shownProject.exists && rows.length > 0 && <MissingFolderBanner onLocate={() => locate(shownProject)} />}
           {place === 'inbox' && <CapturesBanner count={cardsWaiting} onChoose={() => void api.revealCards().catch(() => {})} />}
+          <RecordingsSection recs={placeRecs} agent={agentReady} selectedJob={detail?.kind === 'job' ? detail.id : null} selectedDir={detail?.kind === 'recording' ? detail.dir : null} handlers={recHandlers}
+            onMenu={(entries, at) => menu.open(entries, at)} />
           <JobsSection jobs={placeJobs} selected={detail?.kind === 'job' ? detail.id : null} projectName={projectName} showProject={!isProject(place) && place !== 'unassigned'} onSelect={openJob} />
           <SuggestionsBanner groups={sugGroups} onMoveAll={(p, u) => moveItems(u, p)} />
           {filterText && !emptyWorld && <FilterBar text={filterText} canClear={rows.length > 0} onOpen={openFilterMenu} onClear={() => setFilter(NO_FILTER)} />}
@@ -1585,6 +2000,7 @@ export default function App() {
               mac={mac}
               scrollTo={scrollTo}
               nativeDrag={nativeDrag}
+              dropUid={drop?.zone.kind === 'item' ? drop.zone.uid : null}
               onNativeDrag={(uids) => {
                 dragging.current = uids;
                 api.dragOut(uids).then((ok) => !ok && (dragging.current = null), () => (dragging.current = null));
@@ -1596,11 +2012,38 @@ export default function App() {
       )}
 
       {showDetail && (
-        <aside className="mw-detail" data-testid="detail" aria-label={t('main.detail.label')}>
+        <aside
+          className={`mw-detail ${drop?.where === 'detail' ? 'drop' : ''}`}
+          data-testid="detail"
+          aria-label={t('main.detail.label')}
+          // files, pictures and the island's cards dropped on the item on show are added to it (drag-drop.md §4);
+          // text stays the page's (into the field under the pointer)
+          onDragOver={(e) => {
+            const what = dragWhat(e);
+            const zone = detailZone();
+            if (!zone || !detailTakes(what, e.dataTransfer.types)) return;
+            e.preventDefault();
+            e.dataTransfer.dropEffect = 'copy';
+            dragOverZone(e, zone, what, 'detail');
+          }}
+          onDragLeave={(e) => {
+            if (!e.currentTarget.contains(e.relatedTarget as Node | null)) setDrop((d) => (d?.where === 'detail' ? null : d));
+          }}
+          onDrop={(e) => {
+            const what = dragWhat(e);
+            const zone = detailZone();
+            if (!zone || !detailTakes(what, e.dataTransfer.types)) return;
+            e.preventDefault();
+            dropOn(e, zone, what);
+          }}
+        >
           {detail?.kind === 'session' && reviewHost ? (
             <ReviewPane host={reviewHost} hostKey={detail.dir} opts={{ mode: 'review', platform, theme: 'auto', lang }} rev={tick} onHandle={onPage} />
           ) : shownJob ? (
-            <JobDetail job={shownJob} title={jobTitle(shownJob)} onItem={(u) => reveal(u)} />
+            <JobDetail job={shownJob} title={jobTitle(shownJob)} onItem={(u) => reveal(u)} onSettings={(pane) => (setScreen({ kind: 'settings' }), goSettingsPane(pane))}
+              rec={recDetailOf(shownJob)} />
+          ) : shownRec ? (
+            <RecordingDetail rec={{ r: shownRec, agent: agentReady, handlers: recHandlers }} />
           ) : plan ? (
             <SelectionView
               items={selectedRows}
@@ -1650,10 +2093,18 @@ export default function App() {
       )}
 
       {menu.node}
+      {(() => {
+        const label = drop && dropLabel(drop.zone, drop.what, projectName);
+        return label ? (
+          <div ref={dropTip} className="mw-drop-tip" role="status" style={{ transform: `translate(${dropAt.current.x + 14}px, ${dropAt.current.y + 18}px)` }}>
+            {t(label.key, label.vars)}
+          </div>
+        ) : null;
+      })()}
       <Tooltip />
       {movePop && <MovePopover projects={registered} here={movePop.here} subject={movePop.subject} anchor={movePop.anchor} onClose={() => setMovePop(null)} onPick={(p) => moveItems(movePop.uids, p)} onOpenFolder={openFolder} />}
       {newItem && (() => {
-        const target = isProject(place) ? place.slice(8) : place === 'inbox' || place === 'unassigned' ? 'inbox' : current ?? 'inbox';
+        const target = (typeof newItem === 'object' && newItem.target) || listTarget;
         return (
           <NewItemSheet
             target={target}

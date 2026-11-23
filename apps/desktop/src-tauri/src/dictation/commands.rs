@@ -30,6 +30,55 @@ pub static POLISH_READY: Mutex<Option<bool>> = Mutex::new(None);
 /// `polish.py models`' last answer.
 pub static POLISH_MODELS: Mutex<Option<Value>> = Mutex::new(None);
 
+/// Room left for everything else once a model is in (the founder, 2026-11-21: what is left + 2 GB; the Mac's
+/// ModelDownloadNotice.headroomMB).
+const HEADROOM_MB: f64 = 2048.0;
+
+/// Free space on the volume that holds `dir` (MB; the nearest folder that exists). None: it couldn't be read — never a
+/// refusal on a guess.
+pub fn free_mb(dir: &std::path::Path) -> Option<f64> {
+    let mut d = dir.to_path_buf();
+    while !d.exists() {
+        if !d.pop() {
+            return None;
+        }
+    }
+    free_mb_at(&d)
+}
+
+#[cfg(windows)]
+fn free_mb_at(d: &std::path::Path) -> Option<f64> {
+    use windows::core::HSTRING;
+    use windows::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+    let mut avail = 0u64;
+    unsafe { GetDiskFreeSpaceExW(&HSTRING::from(d.as_os_str()), Some(&mut avail), None, None) }.ok()?;
+    Some(avail as f64 / 1_048_576.0)
+}
+
+#[cfg(target_os = "linux")]
+fn free_mb_at(d: &std::path::Path) -> Option<f64> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(d.as_os_str().as_bytes()).ok()?;
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
+        return None;
+    }
+    Some(st.f_bavail as f64 * st.f_frsize as f64 / 1_048_576.0)
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+fn free_mb_at(_d: &std::path::Path) -> Option<f64> {
+    None
+}
+
+/// "disk_full:<need MB>:<free MB>" when a download of `size_mb` (plus the headroom) doesn't fit in `free`: the pages
+/// turn it into "4.5 GB needed, 3.1 GB free · Show Storage" (ModelDownload.tsx diskShort). None: it fits.
+pub fn disk_short(size_mb: f64, free: Option<f64>) -> Option<String> {
+    let free = free?;
+    let need = size_mb.max(0.0) + HEADROOM_MB;
+    (size_mb >= 1.0 && need > free).then(|| format!("disk_full:{}:{}", need.round(), free.max(0.0).round()))
+}
+
 fn remember_models(v: &Value) {
     *READY.lock().unwrap() = Some(v["ready"] == json!(true));
     *MODELS.lock().unwrap() = Some(v.clone());
@@ -129,6 +178,8 @@ pub fn dictation_models(state: tauri::State<'_, AppState>) -> R<Value> {
     remember_models(&v);
     v["downloading"] = json!(DOWNLOADING.lock().unwrap().clone());
     v["dashscope_model"] = json!(cloud::dashscope_speech_model());
+    // said beside the size before Download (the founder, 2026-11-21)
+    v["free_mb"] = json!(free_mb(&crate::paths::blurt_home().join("models")));
     Ok(v)
 }
 
@@ -160,6 +211,19 @@ pub fn dictation_dashscope_model(model: Option<String>) -> R<()> {
 /// Start downloading a speech model; progress arrives as `model-download` events {id, done_mb, total_mb, state}.
 #[tauri::command]
 pub fn model_download(app: AppHandle, id: String) -> R<()> {
+    // the size Download… promised (the catalogue's size_mb): the bar counts up to it even when the archive itself is
+    // smaller, so "x / y" never names a second size (the Mac's max(p.total, sizeMB))
+    let promised = MODELS
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|v| v["models"].as_array().cloned())
+        .and_then(|ms| ms.iter().find(|m| m["id"] == json!(id)).and_then(|m| m["size_mb"].as_f64()))
+        .unwrap_or(0.0);
+    // it has to fit, with 2 GB to spare, before anything starts (every surface: the Welcome, Settings, the island)
+    if let Some(short) = disk_short(promised, free_mb(&crate::paths::blurt_home().join("models"))) {
+        return Err(short);
+    }
     {
         let mut d = DOWNLOADING.lock().unwrap();
         if d.is_some() {
@@ -184,15 +248,6 @@ pub fn model_download(app: AppHandle, id: String) -> R<()> {
             return Err(e.message);
         }
     };
-    // the size Download… promised (the catalogue's size_mb): the bar counts up to it even when the archive itself is
-    // smaller, so "x / y" never names a second size (the Mac's max(p.total, sizeMB))
-    let promised = MODELS
-        .lock()
-        .unwrap()
-        .as_ref()
-        .and_then(|v| v["models"].as_array().cloned())
-        .and_then(|ms| ms.iter().find(|m| m["id"] == json!(id)).and_then(|m| m["size_mb"].as_f64()))
-        .unwrap_or(0.0);
     std::thread::spawn(move || {
         // its own process group (Unix) / a tree taskkill ends (Windows): Stop ends uv and the Python under it
         let mut c = scripts::daemon_command(&argv);
@@ -255,6 +310,11 @@ pub fn model_download(app: AppHandle, id: String) -> R<()> {
             }
         };
         *DOWNLOADING.lock().unwrap() = None;
+        // the disk filled up on the way (the script's `disk_full`, ENOSPC): said as the refusal before a start is
+        if !ok && (last_err.contains("No space left on device") || last_err.contains("[Errno 28]") || last_err.contains("disk_full")) {
+            let free = free_mb(&crate::paths::blurt_home().join("models")).unwrap_or(0.0);
+            last_err = format!("disk_full:{}:{}", (promised + HEADROOM_MB).round(), free.round());
+        }
         if !ok {
             eprintln!("blurt: speech model download failed: {last_err}");
             // the island says so, with Retry (a take's "Download…" must not just go quiet)
@@ -527,13 +587,16 @@ pub fn cloud_disconnect(id: String) -> R<Value> {
 /// (`preset`, `region` for a preset with two addresses, `base_url` for the user's own address, `name`). What can be
 /// checked here goes first (the address, the model id, the key), then the job itself (`polish_cloud.py check` with the
 /// job: one short sentence, or a small picture with text for Copy Text from Screen); only when that passes is the
-/// service saved and the job put on the model. {"ok", "ms", "service", "summary"} or {"ok": false, "code"}: address |
-/// model_id | no_key | key_spaces | key_characters | auth | network | timeout | rate_limited | model | vision | empty | …
+/// service saved and the job put on the model. `jobs` (Add Cloud Model's 用于 boxes, for a service Blurt never
+/// measured): each is checked in turn and nothing is saved unless all pass; then each is put on the model.
+/// {"ok", "ms", "service", "summary"} or {"ok": false, "code", "job"?}: address | model_id | no_key | key_spaces |
+/// key_characters | auth | network | timeout | rate_limited | model | vision | empty | … (`job`: the one that failed)
 #[tauri::command(async)]
 #[allow(clippy::too_many_arguments)]
 pub fn cloud_custom_connect(
     app: AppHandle,
-    job: String,
+    job: Option<String>,
+    jobs: Option<Vec<String>>,
     service: Option<String>,
     preset: Option<String>,
     region: Option<String>,
@@ -542,9 +605,7 @@ pub fn cloud_custom_connect(
     key: String,
     model: String,
 ) -> R<Value> {
-    if !cloud::JOBS.contains(&job.as_str()) {
-        return Err(format!("unknown job {job}"));
-    }
+    let jobs = cloud::job_list(job.as_deref(), jobs.as_deref())?;
     let services: Vec<Value> = cloud::setup()["services"].as_array().cloned().unwrap_or_default();
     let existing = match service.as_deref().filter(|s| !s.is_empty()) {
         Some(id) => Some(services.iter().find(|x| x["id"] == json!(id)).cloned().ok_or("no such service")?),
@@ -580,28 +641,35 @@ pub fn cloud_custom_connect(
         return Ok(json!({"ok": false, "code": code}));
     }
     let k = if typed.is_empty() { saved.unwrap_or_default() } else { typed.clone() };
-    // the key on stdin, never on the command line
-    let body = json!({"cloud": cloud::request(&svc, &m, &k), "job": job}).to_string();
     let runner = app.state::<AppState>().runner();
-    let v = match runner.run("polish_cloud.py", &["check".to_string()], Some(body.as_bytes()), Duration::from_secs(45)) {
-        Ok(v) => v,
-        Err(e) => e
-            .stdout
-            .lines()
-            .rev()
-            .find_map(|l| serde_json::from_str::<Value>(l.trim()).ok())
-            .unwrap_or_else(|| json!({"ok": false, "code": "error"})),
-    };
-    if v["ok"] != json!(true) {
-        return Ok(json!({"ok": false, "code": v["code"].as_str().filter(|c| !c.is_empty()).unwrap_or("error")}));
+    let mut ms = Value::Null;
+    for job in &jobs {
+        // the key on stdin, never on the command line
+        let body = json!({"cloud": cloud::request(&svc, &m, &k), "job": job}).to_string();
+        let v = match runner.run("polish_cloud.py", &["check".to_string()], Some(body.as_bytes()), Duration::from_secs(45)) {
+            Ok(v) => v,
+            Err(e) => e
+                .stdout
+                .lines()
+                .rev()
+                .find_map(|l| serde_json::from_str::<Value>(l.trim()).ok())
+                .unwrap_or_else(|| json!({"ok": false, "code": "error"})),
+        };
+        if v["ok"] != json!(true) {
+            let code = v["code"].as_str().filter(|c| !c.is_empty()).unwrap_or("error");
+            return Ok(json!({"ok": false, "code": code, "job": job}));
+        }
+        ms = v["ms"].clone();
     }
     if existing.is_none() || !typed.is_empty() {
         cloud::connect_service(svc, Some(&typed))?;
         // a key that also recognises speech (OpenAI, Model Studio): the next take's speech server has it
         restart_asr();
     }
-    cloud::set_job(&job, &id, &m)?;
-    Ok(json!({"ok": true, "ms": v["ms"], "service": id, "summary": cloud::summary()}))
+    for job in &jobs {
+        cloud::set_job(job, &id, &m)?;
+    }
+    Ok(json!({"ok": true, "ms": ms, "service": id, "summary": cloud::summary()}))
 }
 
 pub(crate) fn cloud_check(app: &AppHandle, preset: &str, key: &str, base_url: Option<&str>) -> R<Value> {
@@ -733,4 +801,19 @@ pub fn dictation_mics() -> Value {
     }
     #[cfg(not(windows))]
     json!({"default": null, "devices": []})
+}
+
+#[cfg(test)]
+mod disk_tests {
+    use super::*;
+
+    #[test]
+    fn a_download_needs_its_size_and_two_gigabytes() {
+        assert_eq!(disk_short(2468.0, Some(10_240.0)), None);
+        assert_eq!(disk_short(2468.0, Some(4096.0)).as_deref(), Some("disk_full:4516:4096"));
+        assert_eq!(disk_short(2468.0, None), None, "unreadable: never refused on a guess");
+        assert_eq!(disk_short(0.0, Some(0.0)), None, "nothing to fetch");
+        #[cfg(any(windows, target_os = "linux"))]
+        assert!(free_mb(&std::env::temp_dir().join("no/such/dir")).is_some_and(|f| f > 0.0));
+    }
 }

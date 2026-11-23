@@ -143,6 +143,14 @@ pub fn set(runner: &Runner, id: &str, patch: &Value) -> Result<Value, String> {
     runner.run("projects.py", &["set".into(), id.into(), "--json".into(), patch.to_string()], None, Duration::from_secs(20)).map_err(String::from)
 }
 
+/// The user's order (the sidebar, dragged): these first, in this order — ⌘5–⌘9 follow it; using a project never
+/// reorders (projects.py order).
+pub fn order(runner: &Runner, ids: &[String]) -> Result<Value, String> {
+    let mut args = vec!["order".to_string()];
+    args.extend(ids.iter().cloned());
+    runner.run("projects.py", &args, None, Duration::from_secs(20)).map_err(String::from)
+}
+
 /// Remove from Blurt (the folder and its items stay): the answer carries the entry as it was, for `restore`.
 pub fn remove(runner: &Runner, id: &str) -> Result<Value, String> {
     runner.run("projects.py", &["remove".into(), id.into()], None, Duration::from_secs(20)).map_err(String::from)
@@ -179,6 +187,17 @@ fn unique(p: PathBuf) -> PathBuf {
 /// The open shots batch of the capture store (the newest `<ts>-shots` session nobody has processed yet), or a new one.
 pub fn shots_session(reg: &Registry) -> (Option<String>, PathBuf) {
     let (project, store) = reg.capture_store();
+    (project, open_shots_session(&store))
+}
+
+/// The open shots batch of Unassigned (the inbox store), whatever the current project: where things dropped on the
+/// island hang (drag-drop.md §3 — "hang it" is what was asked, not "file it").
+pub fn inbox_shots_session() -> PathBuf {
+    open_shots_session(&paths::inbox_store())
+}
+
+/// `store`'s newest shots batch still collecting, else a new one's path.
+fn open_shots_session(store: &Path) -> PathBuf {
     let dir = store.join("sessions");
     let open = std::fs::read_dir(&dir)
         .ok()
@@ -188,7 +207,7 @@ pub fn shots_session(reg: &Registry) -> (Option<String>, PathBuf) {
         .map(|e| e.path())
         .filter(|p| p.file_name().is_some_and(|n| n.to_string_lossy().ends_with("-shots")) && is_open_batch(p))
         .max();
-    (project, open.unwrap_or_else(|| unique(dir.join(format!("{}-shots", timestamp())))))
+    open.unwrap_or_else(|| unique(dir.join(format!("{}-shots", timestamp()))))
 }
 
 /// A shots session still collecting: no agent has written its items yet.

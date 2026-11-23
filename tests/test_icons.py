@@ -2,6 +2,7 @@
 and no UI source uses emoji or text glyphs as icons (assets/icons/tools/check_glyphs.py)."""
 from __future__ import annotations
 
+import platform
 import re
 import subprocess
 import sys
@@ -152,7 +153,9 @@ def test_app_icon_has_a_dark_appearance_for_macos_26():
     assert re.search(r"<key>CFBundleIconName</key>\s*<string>AppIcon</string>", plist)
     assert re.search(r"<key>CFBundleIconFile</key>\s*<string>AppIcon</string>", plist)
     car = ROOT / "skills/blurt/recorder/macos/Sources/BlurtApp/Resources/Assets.car"
-    if subprocess.run(["which", "assetutil"], capture_output=True).returncode == 0:
+    # read with the assetutil of macOS 26 or later: a macOS 15 one (the CI runner) lists none of the stack's looks
+    macos = int((platform.mac_ver()[0] or "0").split(".")[0] or 0) if sys.platform == "darwin" else 0
+    if macos >= 26 and subprocess.run(["which", "assetutil"], capture_output=True).returncode == 0:
         info = json.loads(subprocess.run(["assetutil", "--info", str(car)], capture_output=True, text=True).stdout)
         looks = {e.get("Appearance") for e in info if e.get("Name") == "AppIcon" and e.get("AssetType") == "IconImageStack"}
         assert {"NSAppearanceNameAqua", "NSAppearanceNameDarkAqua"} <= looks, looks
@@ -261,15 +264,18 @@ def test_brand_effects_stay_restrained():
 
 
 def test_cards_have_one_look():
-    """docs/design/system.md §3.2 (v1.0.7, BA-62): every set of cards is the Cards panel — Current and History are one
-    grid of the same tiles (OverviewTile, the picture 148 × 100) with the cards' one action cluster ([eye][···][Copy],
+    """docs/design/system.md §3.2 (v1.0.7, BA-62; v1.0.23 the Cards page): every set of cards is one grid of the same
+    tiles (CardTile, the picture at least 148 × 100) with the cards' one action cluster ([eye][···][Copy],
     CardChrome.CardActions — no gradient button on a tile) and one preview (CardPreview). The old Recently Dragged Out
-    rows (56 × 40 CaptureThumb tiles, TakenRow) are gone; done toasts carry the ok check."""
+    rows (56 × 40 CaptureThumb tiles, TakenRow) and ⌥H's floating Cards panel (CardsOverview) are gone; done toasts
+    carry the ok check."""
     app = ROOT / "skills/blurt/recorder/macos/Sources/BlurtApp"
-    overview = (app / "Capture/Island/CardsOverview.swift").read_text()
+    tile = (app / "Capture/Island/CardTile.swift").read_text()
+    page = (app / "MainWindow/CardsPage.swift").read_text()
     taken = (app / "Capture/TakenPanel.swift").read_text()
-    assert "CardActions(" in overview and "preview:" in overview and "BrandButton(" not in overview
-    assert "OverviewTile($0, overview: self, used: used)" in overview
+    assert "CardActions(" in tile and "preview:" in tile and "BrandButton(" not in tile
+    assert "CardTile(s, host: self, used: used, size: size)" in page
+    assert not (app / "Capture/Island/CardsOverview.swift").exists()
     assert "class TakenRow" not in taken and "class TakenThumb" not in taken and "CaptureThumb" not in taken
     assert not (app / "Capture/CaptureThumb.swift").exists()
     assert (app / "Capture/Island/CardPreview.swift").exists()
@@ -368,16 +374,18 @@ def test_mac_mascot_is_peep_frames():
 
 
 def _sf(icon: str) -> list[str]:
-    """The SF Symbols a family glyph stands for (sf-symbols.json, through its aliases)."""
+    """The SF Symbols a family glyph stands for (sf-symbols.json, through its aliases): a generic glyph's candidates,
+    or a brand glyph's one `nearest` symbol."""
     import json
 
     m = json.loads((ROOT / "assets/icons/sf-symbols.json").read_text())
     name = m["aliases"].get(icon, icon)
-    return m["generic"].get(name, []) + m["nearest"].get(name, [])
+    nearest = m["nearest"].get(name)
+    return m["generic"].get(name, []) + ([nearest] if nearest else [])
 
 
 # the SF Symbols that are one metaphor with another name ("terminal" and "apple.terminal" are both a prompt in a window)
-SAME = {"terminal": "apple.terminal"}
+SAME = {"terminal": "apple.terminal", "command": "keyboard"}   # Shortcuts: ⌘ on the Mac, a keyboard where there is no ⌘ key (Windows, Linux)
 # one pane under two ids: the Mac's Remote is Windows / Linux's Phone (Blurt Remote reaches every host since v1.0.15)
 WIN_ID = {"remote": "phone"}
 

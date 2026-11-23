@@ -100,6 +100,17 @@ InkFit / InkStyle / InkHint / BubbleDock）、`CaptureRules.swift`（NoteEsc / N
 | 6.1 | ⌥C / ⌥T：只有十字光标，一拖一放，不暗屏、不点窗口、没有工具栏；拖的区域薄荷 10 % 底 + 2 pt 线 | 和截图一样的暗屏 + 工具栏 + 确认 | 对齐 | 已对齐（选择器 `purpose=text|translate` 走十字光标模式） |
 | 6.2 | 结果直接粘进前台的输入框（按听写的规则），剪贴板也留一份；灵动岛只说结果（Pasted / Copied · ⌘V to paste / Copied） | 只复制 + 提示 | 对齐 | 已对齐：`flow.rs` `deliver`——paste_policy::screen_text 决定（UIA 读焦点：文本框 / 读不出 = 粘；密码框 / 明显不是输入框 / Blurt 自己 = 只复制），Ctrl+V 后读回输入框确认落地（最多 1.5 s）；灵动岛说 Pasted / Copied · Ctrl+V to paste / Copied（Mac 原文）。第二遍读（ScreenTextRefine）：record.screen_text.refine 开 + 接了能看图的云模型时 `screen_text.py read --stdin` 合并，剪贴板还是草稿才替换；Mac 的本地读图模型是 MLX，Windows 没有（系统能力差异） |
 | 6.3 | 翻译结果在灵动岛下的卡片里（ScreenTextCard：可复制、10 s 后消失、指针在上面不消失、Esc 只在指针在上面时关） | live 文字 6 s | 对齐 | 已对齐：新窗口 `textcard.html`（Kind::TextCard，不抢焦点）在灵动岛下方 live 面板的位置，14 px / 20 px 行、最多 8 行后滚动、最后一行渐隐、Copy → Copied（勾）；指针离开 10 s 后消失；指针在上面时才注册全局 Esc（global-shortcut），离开就放掉；下一次 Alt+Shift+C/T 换掉它。「Translating…」、已是目标语言、翻译失败（Key / 额度 / 连不上 / 其他 + Try Again）用 Mac 原文；没有云模型时说 translate_needs_model（Windows 只有云端翻译）。位置用 `island::below_cards`：挂着卡片时在卡片下面 |
+| 6.4 | 取字与翻译（screen-text.md §1g，2026-11-16）：⌥T 的方向由 App 先判语种、模型只收一种目标语言；⌥C / ⌥T 一样：粘进了输入框只有一行字，只进了剪贴板才挂卡片（× + 复制）；记录 `~/.blurt/screen-text/history.jsonl`；主窗口「取字与翻译」页、主页时间线；设置页改名并加「记录」组、自动下面一行「其他语言译成简体中文」 | 方向交给模型（`auto` / `X|keep`）；翻译总挂卡片；没有记录 | 对齐 | 已对齐，见下 |
+
+6.4 的细节（Windows / Linux）：
+
+- 方向：`screen_text/direction.rs`，语种用 whatlang（文字系统 + 三元组统计，不是词表）。whatlang 的 confidence 是「领先第二名的幅度 / 这么长的文字算确定的幅度」，不是概率：一句普通英文常是 0.35–0.5。实测 30 句（10 种拉丁字母语言 + 西里尔 + 其他）：≥ 0.6 没有判错，判错的最高 0.32（一句英文判成法文）。所以 `SURE = 0.6` 照用，另加一条「肯定不是」：文字里每个字母的文字系统（whatlang 自己的表）都不写某种语言，就肯定不是它——英文、泰文肯定不是中文，这样「自动」的英文都直接发 `zh`。whatlang 只看字母最多的那种文字系统，「用 Claude Code 跑一下测试」被读成罗马尼亚文：拉丁字母的答案、但别的文字系统占 ≥ 10 % 字母时不算数，交给模型（`auto:zh|en`，和以前一样）。日文的假名 + 汉字照常判成日文。
+- 「自动」按用户自己的语言（`direction::Pair::of`，照 Mac 的 `TranslateAutoPair.of`）：home = 口喷鸡里选的界面语言，否则系统首选语言里第一个在列表里的（都没有就 English）；other = home 不是英语时是 English，是英语时是系统里下一个在列表里的语言，没有就没有配对（「自动：译成English」，行下面说「English 的文字会原样保留；要翻译它，请选一种语言」）。系统语言用 sys-locale 读：Windows 是 GetUserPreferredUILanguages，Linux 是 LANGUAGE / LC_ALL / LC_MESSAGES / LANG。设置里的标签由 `translate_auto_pair` 给出（「自动：简体中文 ↔ English」「Auto: English ↔ 日本語」），⌥T 行下面「其他语言译成{home}」。听写的「自动」（engine.rs）用同一个配对和同一个 `plan`：语种用 whatlang 读识别出的文字（Windows 的语音模型不报语种），说的已经是固定目标语言就按原话输入；Ctrl 打开翻译时的提示也说这对语言。测试：日本用户 ja ↔ en（韩文 → ja，日文 → en）、只有英语的用户没有配对。
+- 卡片的规则：`paste_policy::screen_text::shows_card`（只在 `Copied` 时）。卡片左下 ×（`textcard.close {why: close_button}`），右下「复制」；一行的卡片 × 和「复制」并排在行尾。
+- 「正在翻译…」挂 30 秒的 bug：Windows 的取字 / 翻译那一行走 `kind: capture`，从不进 ear，同 key 的完成行直接替换它，所以没有这个 bug。听写那条路（短的完成行进 ear）有同样的缺口，补了：进 ear 时去掉同 key 的提示（`island.ts dropToasts`）。
+- 记录：`screen_text/history.rs`，和 Mac 同一个文件格式（键排序、`t` 毫秒 UTC、`/` 转成 `\/`，测试里拿 Mac 写的一行读回再写出逐字节相同），0600；保留 `record.screen_text.history_days`，读的时候（页面、主页、设置）先按它清理。`bundle` 存 exe 名。
+- 页面：`ScreenTextPage.tsx`（逻辑在 `screentext.ts`，有测试）：两个快捷键和保留时长、设置…；搜索；按天；点选 / Ctrl 点选 / Shift 点选、↑↓ / Shift+↑↓、Ctrl+A；双击或 Enter 复制，Ctrl+C 复制所选（空一行），Delete 删除；右键 复制 / 复制原文 / 删除；指针移上去时间变「复制」。
+- 没在真 Windows / Linux 上验证：真实 ⌥C / ⌥T 后记录里的 App 名、粘贴后不挂卡片、卡片 × 在不抢焦点的窗口上点得到、精确识别改写后记录跟着改。
 
 ## 7. 录屏中的截图
 
@@ -148,8 +159,7 @@ strokes、flash、lw、selW、g）。
 
 - 全部只在 Mac 的浏览器里跑过页面（截图在 scratchpad `parity/snap-and-note/`），Windows 上没跑：麦克风、暖服务出字、
   Alt 拖动（Alt 松开是否让窗口进菜单模式——页面里 preventDefault 了）、WebView2 失焦事件、窗口列表的准确度。
-- 截图时冻结的选择器和舞台都还在屏幕上，靠 content protection（WDA_EXCLUDEFROMCAPTURE）不进 gdigrab 的画面——灵动岛录屏一直靠
-  这个，但截图这条路以前是先关窗再拍。要在 Windows 上确认截出来的图里没有暗色。
+- 截图时冻结的选择器和舞台都还在屏幕上：截图的图已不再在这时抓屏，改用选择器打开前拍的整屏静帧切出来（§15）。
 
 - 回收站（SHFileOperationW）、放大镜的整屏截图耗时（4K BMP 写到 $BLURT_HOME/run，在 asset 协议的范围里）、翻译卡片的全局 Esc、粘贴落地确认、Edit Note 的窗口缩放：都只在 Mac 上编译、在浏览器里看过。
 
@@ -270,3 +280,26 @@ strokes、flash、lw、selW、g）。
 还没找到原因的：语音备注按「完成」后出现「语音备注已丢弃 · 撤销」。只有 `Ended::Cancel`（Esc / `voice.cancel`）才会走到这句，「完成」发的是 `voice.stop`；需要在 Windows 上用 `BLURT_DEBUG_VOICE=1` 复现看是谁发的 Cancel（拍摄脚本这一步在重新启动之后，只点了「完成」）。
 
 **本轮也没有在 Windows 上重拍**：测试 VM（42.120.60.29 等四台克隆）11-03 00:00 已自动释放，IP 已归别人。只做了 Mac `cargo check`、Windows 目标 `cargo check`（假编译器）、overlays `tsc --noEmit` + `vitest` 72/72。要重拍的同 §13 末尾的清单，外加 picker-text-crosshair（放大镜在右下）。
+
+## 15. Windows 10 2004 之前（build < 19041）：截图变黑（2026-11-18）
+
+用户报告：Win10（2004 之前）截图后定格画面变黑。原因：浮层都 `content_protected` → tao 设 `WDA_EXCLUDEFROMCAPTURE`；这个值 2004
+（19041）才有，之前的系统按 `WDA_MONITOR` 处理——窗口在任何抓屏（BitBlt / gdigrab / Desktop Duplication）里是黑的。截图的 PNG
+是 `tk_recorder.py shot`（gdigrab）在冻结的选择器和舞台盖着屏幕时拍的，所以是一块黑。
+
+- **截图的图 = 选择器的静帧切出来的**（Windows、Linux 一条路，所有 Windows 版本）：每个选择器打开前拍一张静帧
+  （`snap.rs monitor_still`：Windows 用 GDI 拍光标所在的显示器，物理像素 1:1，与缩放 125/150/225 % 无关；Linux 用门户拍整个桌面），
+  存进 `screen_text/grab.rs` 的 `keep_still`；截图切出选区（`grab::cut`，一次性，120 s 内有效），写成 PNG 交给
+  `tk_recorder.py shot --image`。存下的图就是用户在上面画的那张定格画面；静帧里没有光标（以前 gdigrab 带光标）。拍不到静帧时照旧抓屏。
+- **录屏中的截图**同样：`snap-region:x,y,w,h|<路径>`（路径里的空格、`%`、`|` 用 %-编码，`.cmd` 按空白切词），record.py 复制进来，
+  编号、视频时间、events.jsonl 照旧。
+- **复制屏幕文字（Windows）**也从静帧切（和 Linux 一样），没有静帧时才等 60 ms 抓屏。
+- **安全网**：截图拿回来后，如果它几乎全黑（≥ 98 % 像素三通道都 ≤ 24，`grab::near_black`，有测试）而静帧切出来的不是，就用切出来的
+  覆盖，并在日志里写 Windows 版本号（RtlGetVersion）、区域。静帧本身全黑、取字抓到全黑也写日志。原样复制进来的（文件大小相同）不再检查。
+- **2004 之前不再给浮层开 content protection**（`blurt_capture::winver::protection_blackens`，岛、选择器、舞台、卡片、倒计时、录制框；
+  `BLURT_WINDOWS_BUILD=17763` 可在新系统上模拟）：黑块比被看见更糟。录屏里的取舍（最不坏的）：这些浮层录得进视频——录制框在区域外
+  4 pt（全屏录时压在边缘几个像素上）；倒计时在开录之前就关了；岛在录制区域盖住顶部时挪到区域下面（`island::keep_clear_of`，和 Linux
+  一样）；录制中截图时选择器的暗罩和备注气泡会出现在视频里（Mac 本来也录得进）。静帧里也看得见岛（退后时 35 % 透明度），选区盖到顶部正中时
+  截图里会有它。Tk 录屏条同理：2004 之前不设 display affinity。
+- 只有 Windows Server 2019 VM（17763）能证明的：静帧不黑（岛不再是黑块）、截图 PNG 与定格画面逐像素一致、录屏中截图、取字、
+  录制视频里没有黑块；多显示器负坐标和 150 % 缩放下切的位置。日志里找 `snap came out black` / `picker still is black`。

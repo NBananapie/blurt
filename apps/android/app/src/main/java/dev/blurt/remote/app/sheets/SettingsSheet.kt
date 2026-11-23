@@ -2,6 +2,7 @@
 // gesture written out.
 package dev.blurt.remote.app.sheets
 
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -17,6 +18,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.selection.selectable
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
@@ -34,9 +36,18 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Paint
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.PathEffect
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.drawscope.drawIntoCanvas
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import dev.blurt.remote.app.BuildConfig
@@ -46,8 +57,9 @@ import dev.blurt.remote.app.keys.DeckText
 import dev.blurt.remote.app.net.Link
 import dev.blurt.remote.app.net.PairedMac
 import dev.blurt.remote.app.pad.PadScreen
-import dev.blurt.remote.core.LinkRoute
+import dev.blurt.remote.core.LinkPath
 import dev.blurt.remote.core.RemoteHost
+import dev.blurt.remote.core.RemoteModifiers
 import dev.blurt.remote.core.ScreenQuality
 import dev.blurt.remote.core.ToMac
 
@@ -70,7 +82,7 @@ private fun Settings(onClose: () -> Unit, onPair: () -> Unit, onDetails: (Paired
     val macs by l.macs.collectAsState()
     val cur by l.current.collectAsState()
     val state by l.state.collectAsState()
-    val route by l.route.collectAsState()
+    val path by l.path.collectAsState()
     val nearby by l.nearby.collectAsState()
     val use by Remote.screen.use.collectAsState()
     val host by l.host.collectAsState()
@@ -88,7 +100,7 @@ private fun Settings(onClose: () -> Unit, onPair: () -> Unit, onDetails: (Paired
         Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(bottom = 32.dp)) {
             Section(stringResource(R.string.computers), if (macs.size > 1) stringResource(R.string.computers_footer) else null) {
                 for (m in macs) {
-                    MacRow(m, m.id == cur?.id, stateOf(m, cur, state, route, nearby), onPick = { if (m.id != cur?.id) { l.choose(m); onClose() } }, onInfo = { onDetails(m) })
+                    MacRow(m, m.id == cur?.id, stateOf(m, cur, state, path, nearby), if (m.id == cur?.id) state else null, onPick = { if (m.id != cur?.id) { l.choose(m); onClose() } }, onInfo = { onDetails(m) })
                     Divider()
                 }
                 Row2(stringResource(R.string.add_computer), modifier = Modifier.clickable(onClick = onPair)) { Sym("add", color = MaterialTheme.colorScheme.primary) }
@@ -136,11 +148,15 @@ private fun Settings(onClose: () -> Unit, onPair: () -> Unit, onDetails: (Paired
                 val cyc = if (host == RemoteHost.MAC) "⌘Tab, ⌃Tab, ⌘`" else "Alt+Tab, Ctrl+Tab"
                 for ((a, b) in listOf(
                     R.string.g_tap to R.string.g_click, R.string.g_tap_drag to R.string.g_drag, R.string.g_hold_lift to R.string.g_right_click,
-                    R.string.g_hold_drag to R.string.g_select_area, R.string.g_tap_touch to R.string.g_click_there, R.string.g_edge to R.string.g_scroll,
-                    R.string.g_two to R.string.g_two_does, R.string.g_two_touch to R.string.g_scroll_under, R.string.g_pinch to R.string.g_zoom,
-                    R.string.g_pinch_screen to R.string.g_zoom_picture, R.string.g_one_zoomed to R.string.g_move_picture,
-                    R.string.g_pointer_zoomed to R.string.g_follows,
+                    R.string.g_hold_drag to R.string.g_select_area, R.string.g_tap_touch to R.string.g_click_there,
+                    R.string.g_two to R.string.g_two_does, R.string.g_two_touch to R.string.g_scroll_under, R.string.g_edge to R.string.g_scroll,
+                    R.string.g_pinch to R.string.g_zoom, R.string.g_pinch_screen to R.string.g_zoom_picture,
                 )) GestureRow(stringResource(a), stringResource(b))
+                // with the picture showing too: the computer's zoom, with its own modifier held
+                GestureRow(stringResource(R.string.g_pinch_mod, RemoteModifiers.label(PadScreen.zoomModifier(host), host)),
+                    stringResource(if (host == RemoteHost.MAC) R.string.g_zoom_mac else R.string.g_zoom_computer))
+                for ((a, b) in listOf(R.string.g_one_zoomed to R.string.g_move_picture, R.string.g_pointer_zoomed to R.string.g_follows))
+                    GestureRow(stringResource(a), stringResource(b))
                 GestureRow(stringResource(R.string.g_cycle, cyc), stringResource(R.string.g_step_both))
                 GestureRow(stringResource(R.string.g_arrow_tap), stringResource(R.string.g_arrow_tap_does))
                 GestureRow(stringResource(R.string.g_arrow_drag), stringResource(R.string.g_arrow_drag_does))
@@ -158,27 +174,59 @@ private fun Settings(onClose: () -> Unit, onPair: () -> Unit, onDetails: (Paired
 }
 
 @Composable
-private fun MacRow(m: PairedMac, current: Boolean, state: String, onPick: () -> Unit, onInfo: () -> Unit) {
+private fun MacRow(m: PairedMac, current: Boolean, state: String, link: Link.State?, onPick: () -> Unit, onInfo: () -> Unit) {
     Row(Modifier.fillMaxWidth().heightIn(min = 56.dp).clickable(onClick = onPick).padding(start = 12.dp, end = 4.dp), verticalAlignment = Alignment.CenterVertically) {
         androidx.compose.foundation.layout.Box(Modifier.width(28.dp)) { if (current) Sym("check", 18.sp, MaterialTheme.colorScheme.primary) }
         Column(Modifier.weight(1f).padding(vertical = 8.dp)) {
             Text(m.title, style = MaterialTheme.typography.bodyLarge)
-            Text(state, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            // the one in hand, not connected: said at reading size with a mark, not as a caption (as the pad's card does)
+            if (link != null && link != Link.State.CONNECTED) {
+                Row(Modifier.padding(top = 2.dp).semantics(mergeDescendants = true) {}, verticalAlignment = Alignment.CenterVertically) {
+                    when (link) {
+                        Link.State.CONNECTING -> CircularProgressIndicator(Modifier.size(14.dp), color = MaterialTheme.colorScheme.onSurface, strokeWidth = 2.dp)
+                        Link.State.REPLACED, Link.State.ENDED -> Sym("info", 16.sp, MaterialTheme.colorScheme.onSurface)
+                        else -> ProblemMark(Modifier.size(16.dp))
+                    }
+                    Text(state, Modifier.padding(start = 6.dp), fontSize = 15.sp, fontWeight = FontWeight.Medium, color = MaterialTheme.colorScheme.onSurface)
+                }
+            } else {
+                Text(state, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
         }
         IconButton(onInfo) { Sym("info", 22.sp, MaterialTheme.colorScheme.primary) }
     }
 }
 
+/** The pad card's amber triangle (StatusCard.kt), drawn: the icon font is cut down to the keys' own symbols. */
 @Composable
-private fun stateOf(m: PairedMac, cur: PairedMac?, state: Link.State, route: LinkRoute, nearby: Set<String>): String {
+private fun ProblemMark(modifier: Modifier) {
+    val cut = MaterialTheme.colorScheme.surface
+    Canvas(modifier) {
+        val u = size.width / 30f
+        val tri = Path().apply { moveTo(15 * u, 3.5f * u); lineTo(28 * u, 26 * u); lineTo(2 * u, 26 * u); close() }
+        drawIntoCanvas { c ->
+            val p = Paint().apply { color = Color(dev.blurt.remote.app.Theme.attn); pathEffect = PathEffect.cornerPathEffect(3 * u) }
+            c.drawPath(tri, p)
+        }
+        drawLine(cut, Offset(15 * u, 11.5f * u), Offset(15 * u, 18 * u), strokeWidth = 2.6f * u, cap = StrokeCap.Round)
+        drawCircle(cut, 1.6f * u, Offset(15 * u, 22.2f * u))
+    }
+}
+
+@Composable
+private fun stateOf(m: PairedMac, cur: PairedMac?, state: Link.State, path: LinkPath, nearby: Set<String>): String {
+    if (m.id == cur?.id && state == Link.State.CONNECTED) return stringResource(R.string.s_connected_path, dev.blurt.remote.app.pad.pathName(LocalContext.current, path))
     if (m.id == cur?.id) return stringResource(when (state) {
-        Link.State.CONNECTED -> when (route) { LinkRoute.LOCAL -> R.string.s_connected; LinkRoute.DIRECT -> R.string.s_connected_direct; LinkRoute.RELAY -> R.string.s_connected_relay }
+        Link.State.CONNECTED -> R.string.s_connected
         Link.State.CONNECTING -> R.string.s_connecting
         Link.State.UNREACHABLE -> R.string.s_unreachable
-        Link.State.FORGOTTEN -> R.string.s_forgotten
+        // removed there in a session (the key is gone), or a key refused this run (kept): either way, a new code adds it again
+        Link.State.FORGOTTEN -> R.string.s_removed
         Link.State.REPLACED -> R.string.s_replaced
+        Link.State.ENDED -> R.string.s_ended
         Link.State.UNPAIRED -> R.string.s_not_connected
     })
+    if (m.removed) return stringResource(R.string.s_removed)
     return stringResource(if (m.id in nearby) R.string.s_on_network else if (m.relayAddress != null) R.string.s_uses_relay else R.string.s_not_on_network)
 }
 
