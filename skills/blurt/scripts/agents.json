@@ -113,7 +113,9 @@
                        "value": {"command": "{uv}", "args": ["run", "--script", "{mcp_server}"]}}, "verified": "docs"}
     },
     {
-      "id": "workbuddy", "name": "WorkBuddy", "bins": [], "app": {"macos": "/Applications/WorkBuddy.app"}, "verified": "docs",
+      "id": "workbuddy", "name": "WorkBuddy", "bins": [],
+      "app": {"macos": "/Applications/WorkBuddy.app", "windows": ["${LOCALAPPDATA}/Programs/WorkBuddy/WorkBuddy.exe", "${ProgramFiles}/WorkBuddy/WorkBuddy.exe"]},
+      "verified": "docs",
       "headless": false,
       "install": {"zh": "见 workbuddy.ai", "en": "see workbuddy.ai"},
       "skill_dir": "~/.workbuddy/skills",
@@ -121,7 +123,9 @@
                        "value": {"command": "{uv}", "args": ["run", "--script", "{mcp_server}"]}}, "verified": "docs"}
     },
     {
-      "id": "cursor", "name": "Cursor", "bins": [], "app": {"macos": "/Applications/Cursor.app"}, "verified": "docs",
+      "id": "cursor", "name": "Cursor", "bins": [],
+      "app": {"macos": "/Applications/Cursor.app", "windows": ["${LOCALAPPDATA}/Programs/cursor/Cursor.exe", "${ProgramFiles}/Cursor/Cursor.exe"]},
+      "verified": "docs",
       "headless": false,
       "install": {"zh": "见 cursor.com", "en": "see cursor.com"},
       "skill_dir": "~/.agents/skills",
@@ -129,7 +133,19 @@
                        "value": {"command": "{uv}", "args": ["run", "--script", "{mcp_server}"]}}, "verified": "docs"}
     },
     {
-      "id": "zcode", "name": "ZCode", "bins": [], "app": {"macos": "/Applications/ZCode.app"}, "verified": "docs",
+      "id": "antigravity", "name": "Antigravity", "bins": [],
+      "app": {"macos": "/Applications/Antigravity.app", "windows": ["${LOCALAPPDATA}/Programs/antigravity/Antigravity.exe", "${ProgramFiles}/Antigravity/Antigravity.exe"]},
+      "verified": "docs",
+      "headless": false,
+      "install": {"zh": "见 antigravity.google", "en": "see antigravity.google"},
+      "skill_dir": "~/.gemini/config/skills",
+      "mcp": {"json": {"path": "~/.gemini/config/mcp_config.json", "key": ["mcpServers", "blurt"],
+                       "value": {"command": "{uv}", "args": ["run", "--script", "{mcp_server}"]}}, "verified": "docs"}
+    },
+    {
+      "id": "zcode", "name": "ZCode", "bins": [],
+      "app": {"macos": "/Applications/ZCode.app", "windows": ["${LOCALAPPDATA}/Programs/ZCode/ZCode.exe", "${ProgramFiles}/ZCode/ZCode.exe"]},
+      "verified": "docs",
       "headless": false,
       "fix": {"zh": "在 ZCode 设置 → Skills / MCP 里手动导入 blurt", "en": "in ZCode Settings → Skills / MCP, import blurt by hand"},
       "install": {"zh": "见 zcode.z.ai", "en": "see zcode.z.ai"}

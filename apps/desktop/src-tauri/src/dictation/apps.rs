@@ -46,9 +46,10 @@ const TERMINALS: &[&str] = &[
     "xfce4-terminal", "lxterminal", "mate-terminal", "qterminal", "urxvt", "st", "blackbox", "terminology", "rio",
 ];
 const CODE: &[&str] = &[
-    "code", "code - insiders", "cursor", "windsurf", "zed", "devenv", "idea64", "pycharm64", "webstorm64", "clion64",
-    "goland64", "rider64", "rustrover64", "phpstorm64", "datagrip64", "studio64", "sublime_text", "notepad++", "trae",
-    "kiro", "codium", "idea", "pycharm", "webstorm", "clion", "goland", "rider", "rustrover", "sublime_text_4",
+    "code", "code - insiders", "cursor", "windsurf", "antigravity", "zed", "devenv", "idea64", "pycharm64",
+    "webstorm64", "clion64", "goland64", "rider64", "rustrover64", "phpstorm64", "datagrip64", "studio64",
+    "sublime_text", "notepad++", "trae", "trae cn", "kiro", "qoder", "qoderwork", "workbuddy", "doubaowork",
+    "kimi code", "codium", "idea", "pycharm", "webstorm", "clion", "goland", "rider", "rustrover", "sublime_text_4",
 ];
 const MAIL: &[&str] = &["outlook", "olk", "thunderbird", "mailmaster", "foxmail", "hxoutlook"];
 const NOTES: &[&str] = &[
@@ -112,6 +113,7 @@ mod tests {
         assert_eq!(category(Some(r"C:\Program Files\Slack\slack.exe")), Category::Chat);
         assert_eq!(category(Some("ms-teams.exe")), Category::Chat);
         assert_eq!(category(Some("Code.exe")), Category::Code);
+        assert_eq!(category(Some(r"C:\Users\u\AppData\Local\Programs\antigravity\Antigravity.exe")), Category::Code);
         assert_eq!(category(Some("WindowsTerminal.exe")), Category::Code);
         assert_eq!(category(Some("OUTLOOK.EXE")), Category::Mail);
         assert_eq!(category(Some("WINWORD.EXE")), Category::Notes);

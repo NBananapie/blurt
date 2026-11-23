@@ -86,6 +86,7 @@ pub fn scripts_dir(app: &AppHandle) -> Option<PathBuf> {
         c.push(PathBuf::from(p));
     }
     if let Ok(res) = app.path().resource_dir() {
+        c.push(res.join("skill").join("scripts"));
         c.push(res.join("scripts"));
     }
     c.push(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../skills/blurt/scripts"));
@@ -115,7 +116,7 @@ pub fn uv() -> Option<PathBuf> {
     ])
 }
 
-/// Lexically clean `a/b/../c` (no symlink resolution: Windows `canonicalize` gives `\\?\` paths Python dislikes).
+/// Lexically clean `a/b/../c` and strip Windows `\\?\X:\` verbatim drive prefixes (`resource_dir()` canonicalizes).
 pub fn normalize(p: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for comp in p.components() {
@@ -127,6 +128,14 @@ pub fn normalize(p: &Path) -> PathBuf {
             }
             std::path::Component::CurDir => {}
             other => out.push(other.as_os_str()),
+        }
+    }
+    if cfg!(windows) {
+        let s = out.to_string_lossy();
+        if let Some(rest) = s.strip_prefix(r"\\?\") {
+            if rest.as_bytes().get(1) == Some(&b':') {
+                return PathBuf::from(rest);
+            }
         }
     }
     out
@@ -148,5 +157,8 @@ mod tests {
     #[test]
     fn normalize_dotdot() {
         assert_eq!(normalize(Path::new("/a/b/../c/./d")), PathBuf::from("/a/c/d"));
+        if cfg!(windows) {
+            assert_eq!(normalize(Path::new(r"\\?\D:\Blurt\skill\scripts")), PathBuf::from(r"D:\Blurt\skill\scripts"));
+        }
     }
 }

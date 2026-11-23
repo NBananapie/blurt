@@ -221,7 +221,12 @@ def failure_reason(cls: str | None, name: str, fix: str = "", lang: str = "en", 
 
 
 # ------------------------------------------------------------------ WP2: detect / command / install / prompt (C5)
-SCRIPTS = Path(__file__).resolve().parent
+def _clean_path(p: Path) -> Path:
+    s = str(p)
+    return Path(s[4:]) if os.name == "nt" and s.startswith("\\\\?\\") and len(s) >= 6 and s[5] == ":" else p
+
+
+SCRIPTS = _clean_path(Path(__file__).resolve().parent)
 SKILL_ROOT = SCRIPTS.parent
 MCP_SERVER = SCRIPTS / "mcp_server.py"
 _SESSION_PREFIXES = ("CLAUDE", "ANTHROPIC_", "CODEX_", "MCP_", "OTEL_")
@@ -374,10 +379,17 @@ def unshim(path: str) -> str:
     return str(exe) if exe.is_file() else path
 
 
-def app_path(defn: dict) -> str | None:
+def app_path(defn: dict, env: dict | None = None) -> str | None:
     key = "macos" if sys.platform == "darwin" else "windows" if os.name == "nt" else "linux"
-    p = (defn.get("app") or {}).get(key)
-    return str(expand(p)) if p and expand(p).exists() else None
+    cands = (defn.get("app") or {}).get(key)
+    if isinstance(cands, str):
+        cands = [cands]
+    for p in cands or []:
+        if isinstance(p, str) and p:
+            resolved = expand(p, env)
+            if resolved.exists():
+                return str(resolved)
+    return None
 
 
 def is_headless(defn: dict) -> bool:
@@ -449,8 +461,8 @@ def detect(ids: list[str] | None = None, login: bool = True, version: bool = Tru
             path = find_bin(d, env)
             r = {"id": d["id"], "name": d.get("name", d["id"]), "path": path,
                  "state": "unknown" if path else "not_installed", "why": "", "fix": ""}
-        if not r["path"] and app_path(d):  # app-only agents (ZCode): installed, nothing to probe
-            r.update(path=app_path(d), state="unknown", why="app" if lang == "en" else "应用", fix="")
+        if not r["path"] and app_path(d, env):  # app-only agents (ZCode, Cursor, Antigravity): installed, nothing to probe
+            r.update(path=app_path(d, env), state="unknown", why="app" if lang == "en" else "应用", fix="")
         r["installed"] = r["state"] != "not_installed"
         r["version"] = version_of(d, r["path"], env) if version and r["installed"] and find_bin(d, env) else None
         r["login"] = LOGIN.get(r["state"], "unknown")
@@ -731,14 +743,14 @@ def _link_dir(target: Path, source: Path, copy: bool = False) -> str:
         except OSError:
             pass
     shutil.copytree(source, target, ignore=shutil.ignore_patterns("__pycache__", ".venv", COPY_MARK))
-    (target / COPY_MARK).write_text(str(source.resolve()), encoding="utf-8")
+    (target / COPY_MARK).write_text(str(_clean_path(source.resolve())), encoding="utf-8")
     return "copy"
 
 
 def _our_copy(target: Path) -> bool:
     try:
         return (not target.is_symlink() and target.is_dir()
-                and (target / COPY_MARK).read_text(encoding="utf-8").strip() == str(SKILL_ROOT.resolve()))
+                and (target / COPY_MARK).read_text(encoding="utf-8").strip() == str(_clean_path(SKILL_ROOT.resolve())))
     except OSError:
         return False
 
@@ -785,8 +797,9 @@ def install(agent: str, skill: bool = True, mcp: bool = True, dry_run: bool = Fa
         else:
             target = expand(d["skill_dir"], env) / "blurt"
             if os.path.lexists(target):  # a dangling link / junction too: never replaced
-                same = target.resolve() == SKILL_ROOT.resolve()
-                ch = {"action": "exists" if same else "conflict", "path": str(target), "points_to": str(target.resolve())}
+                resolved_target = _clean_path(target.resolve())
+                same = resolved_target == _clean_path(SKILL_ROOT.resolve())
+                ch = {"action": "exists" if same else "conflict", "path": str(target), "points_to": str(resolved_target)}
                 if not same and _our_copy(target):  # the copy fallback: brought up to date, still ours
                     same = True
                     ch.update(action="exists", points_to=str(SKILL_ROOT), kind="copy")

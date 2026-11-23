@@ -65,11 +65,17 @@
       "icons/icon.ico"
     ],
     "resources": {
-      "../../../skills/blurt/scripts/*.py": "scripts/",
-      "../../../skills/blurt/scripts/*.json": "scripts/",
-      "../../../skills/blurt/scripts/.python-version": "scripts/.python-version",
-      "../../../skills/blurt/scripts/review.html": "scripts/review.html",
-      "../../../skills/blurt/models/*": "models/",
+      "../../../skills/blurt/SKILL.md": "skill/SKILL.md",
+      "../../../skills/blurt/scripts/*.py": "skill/scripts/",
+      "../../../skills/blurt/scripts/*.json": "skill/scripts/",
+      "../../../skills/blurt/scripts/.python-version": "skill/scripts/.python-version",
+      "../../../skills/blurt/scripts/review.html": "skill/scripts/review.html",
+      "../../../skills/blurt/reference/*.md": "skill/reference/",
+      "../../../skills/blurt/reference/lenses/*.md": "skill/reference/lenses/",
+      "../../../skills/blurt/models/*": "skill/models/",
+      "../../../skills/blurt/assets/*.png": "skill/assets/",
+      "../../../skills/blurt/assets/*.webp": "skill/assets/",
+      "../../../skills/blurt/assets/icons/*.png": "skill/assets/icons/",
       "sounds/*.wav": "sounds/"
     },
     "createUpdaterArtifacts": false,
@@ -145,10 +151,8 @@
       }
     },
     "updater": {
-      "endpoints": [
-        "https://dl.blurt.work/desktop/latest.json"
-      ],
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEI5M0U2Rjg0Q0FGQUQyNjYKUldSbTB2cktoRzgrdWVncnlhSWhya1djZEt4K1BkWmJVeWlXekxYZzZ2UlAvTHlNS0daL1RQKy8K",
+      "endpoints": [],
+      "pubkey": "",
       "windows": {
         "installMode": "passive"
       }
