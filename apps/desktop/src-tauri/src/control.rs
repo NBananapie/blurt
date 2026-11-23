@@ -422,6 +422,9 @@ fn provider_name(preset: &str) -> String {
     if preset == crate::housekeeping::VOLC_SPEECH {
         return VOLC_NAME.into();
     }
+    if preset == "gemini" {
+        return "Google Gemini".into();
+    }
     PRESETS.iter().find(|p| p.0 == preset).map_or(preset.to_string(), |p| p.1.to_string())
 }
 
@@ -433,6 +436,7 @@ fn failure(v: &Value) -> Value {
         "network" | "timeout" => "couldn't reach the service; check the network",
         "rate_limited" | "quota" => "the service says too many requests or no quota left; check the account's balance",
         "model" => "the service doesn't know this model id",
+        "vision" => "this model couldn't read the test image",
         "empty" => "the model answered nothing",
         "no_uv" | "uv_missing" => "Blurt's tools aren't installed yet; open Blurt and finish its setup",
         _ => "the service returned an error",
@@ -440,13 +444,31 @@ fn failure(v: &Value) -> Value {
     json!({"ok": false, "code": code, "error": msg})
 }
 
+fn check_cloud_job(app: &AppHandle, cloud_req: Value, job: Option<&str>) -> Value {
+    let mut payload = json!({"cloud": cloud_req});
+    if let Some(j) = job {
+        payload["job"] = json!(j);
+    }
+    let body = payload.to_string();
+    let runner = app.state::<AppState>().runner();
+    match runner.run("polish_cloud.py", &["check".to_string()], Some(body.as_bytes()), Duration::from_secs(45)) {
+        Ok(v) => v,
+        Err(e) => e
+            .stdout
+            .lines()
+            .rev()
+            .find_map(|l| serde_json::from_str::<Value>(l.trim()).ok())
+            .unwrap_or_else(|| json!({"ok": false, "code": "error"})),
+    }
+}
+
 fn connect(app: &AppHandle, o: &Value) -> Value {
     let preset = o["preset"].as_str().unwrap_or("");
     if preset == crate::housekeeping::VOLC_SPEECH {
         return connect_pair(app, o);
     }
-    if !PRESETS.iter().any(|p| p.0 == preset) {
-        return err("not_curated", "Blurt connects DeepSeek or Alibaba Cloud Model Studio here; other services are added in Settings → Models");
+    if !PRESETS.iter().any(|p| p.0 == preset) && preset != "gemini" {
+        return err("not_curated", "Blurt connects DeepSeek, Alibaba Cloud Model Studio or Google Gemini here; other services are added in Settings → Models");
     }
     let region = o["region"].as_str();
     if region.is_some_and(|r| r != "china" && r != "global") {
@@ -461,6 +483,25 @@ fn connect(app: &AppHandle, o: &Value) -> Value {
     }
     let name = provider_name(preset);
     step(app, "connect", preset, "running", &name);
+    if preset == "gemini" {
+        let model = o["model"].as_str().map(str::trim).filter(|m| !m.is_empty()).unwrap_or("gemini-3.8-flash");
+        let svc = json!({"id": "gemini", "preset": "gemini"});
+        let v = check_cloud_job(app, cloud::request(&svc, model, key), None);
+        if v["ok"] != true {
+            step(app, "connect", preset, "failed", &name);
+            return failure(&v);
+        }
+        return match cloud::connect("gemini", key, None, None) {
+            Ok(_) => {
+                step(app, "connect", preset, "done", &name);
+                json!({"ok": true, "service": "gemini", "ms": v["ms"], "speech": false})
+            }
+            Err(e) => {
+                step(app, "connect", preset, "failed", &name);
+                err("error", &e)
+            }
+        };
+    }
     match commands::cloud_connect(app.clone(), preset.to_string(), key.to_string(), base_url(preset, region).map(String::from)) {
         Ok(v) if v["ok"] == true => {
             step(app, "connect", preset, "done", &name);
@@ -524,6 +565,11 @@ fn test(app: &AppHandle, o: &Value) -> Value {
             Err(e) => err("error", &e),
         };
     }
+    if s["preset"] == json!("gemini") {
+        let model = o["model"].as_str().map(str::trim).filter(|m| !m.is_empty()).unwrap_or("gemini-3.8-flash");
+        let v = check_cloud_job(app, cloud::request(&s, model, &key), None);
+        return if v["ok"] == true { json!({"ok": true, "service": id, "ms": v["ms"]}) } else { failure(&v) };
+    }
     match commands::cloud_check(app, s["preset"].as_str().unwrap_or(""), &key, s["base_url"].as_str()) {
         Ok(v) if v["ok"] == true => json!({"ok": true, "service": id, "ms": v["ms"]}),
         Ok(v) => failure(&v),
@@ -550,9 +596,22 @@ fn use_(app: &AppHandle, o: &Value) -> Value {
                         curated["jobs"][job].as_array().into_iter().flatten().any(|c| c["service"] == s["preset"] && c["model"] == json!(m))
                     });
                     if !ok {
-                        return err("not_curated", "only Blurt's measured models are set from here; other models are a Custom Model in Settings → Models");
+                        if o["custom"] != true {
+                            return err("not_curated", "only Blurt's measured models are set from here; pass --custom or use Custom Model in Settings → Models");
+                        }
+                        let Some(m) = model.map(str::trim).filter(|m| !m.is_empty() && cloud::valid_model_id(m)) else {
+                            return err("bad_model", "give a valid model id");
+                        };
+                        let id = s["id"].as_str().unwrap_or("");
+                        let Some(k) = cloud::key(id) else {
+                            return err("needs_key", "Blurt holds no key for this service");
+                        };
+                        let v = check_cloud_job(app, cloud::request(&s, m, &k), Some(job));
+                        if v["ok"] != true {
+                            return failure(&v);
+                        }
                     }
-                    (s["id"].as_str().map(str::to_owned), model.map(str::to_owned))
+                    (s["id"].as_str().map(str::to_owned), model.map(str::trim).map(str::to_owned))
                 }
             };
             let name = model.clone().or(service.clone()).unwrap_or_else(|| "auto".into());

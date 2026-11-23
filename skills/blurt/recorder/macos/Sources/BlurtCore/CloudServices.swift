@@ -22,7 +22,7 @@ public enum CloudRegion: String, CaseIterable, Hashable {
     public static func forSystem(_ regionCode: String?) -> CloudRegion { regionCode == "CN" ? .china : .global }
 }
 
-public enum CloudProtocol: String, Hashable { case openai, anthropic }
+public enum CloudProtocol: String, Hashable { case openai, anthropic, gemini }
 
 /// One model of a service's list: what the list said about it (nil = it didn't say).
 public struct CloudModelInfo: Hashable {
@@ -159,14 +159,16 @@ public struct CloudPreset: Hashable, Identifiable {
             CloudPreset(id: "anthropic", api: .anthropic, endpoints: [
                 CloudEndpoint(nil, "https://api.anthropic.com", key: "https://platform.claude.com/settings/keys"),
             ], speech: false, allSeeImages: true, keyPrefixes: ["sk-ant-"]),
-            CloudPreset(id: "gemini", api: .openai, endpoints: [
-                CloudEndpoint(nil, "https://generativelanguage.googleapis.com/v1beta/openai", key: "https://aistudio.google.com/apikey"),
-            ], speech: false, allSeeImages: true, keyPrefixes: ["AIza"]),
+            CloudPreset(id: "gemini", api: .gemini, endpoints: [
+                CloudEndpoint(nil, "https://generativelanguage.googleapis.com/v1beta", key: "https://aistudio.google.com/apikey",
+                              known: ["gemini-4-hydrogen", "gemini-4-hydrogen@medium", "gemini-4-argon", "gemini-3.8-flash", "gemini-3.5-flash-lite"].map { m($0, vision: true) }),
+            ], speech: false, allSeeImages: true, keyPrefixes: ["AIza", "AQ."]),
             CloudPreset(id: "openrouter", api: .openai, endpoints: [
                 CloudEndpoint(nil, "https://openrouter.ai/api/v1", key: "https://openrouter.ai/keys"),
             ], speech: false, allSeeImages: false, keyPrefixes: ["sk-or-"]),
             CloudPreset(id: "custom-openai", api: .openai, endpoints: [], speech: false, allSeeImages: false, keyPrefixes: []),
             CloudPreset(id: "custom-anthropic", api: .anthropic, endpoints: [], speech: false, allSeeImages: false, keyPrefixes: []),
+            CloudPreset(id: "custom-gemini", api: .gemini, endpoints: [], speech: false, allSeeImages: false, keyPrefixes: []),
         ]
     }()
 

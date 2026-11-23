@@ -12,9 +12,13 @@ describe('custom model presets', () => {
     expect(endpointOf(textPreset('deepseek')!, 'global')?.base).toBe('https://api.deepseek.com');
     expect(isCustom(textPreset('custom-anthropic')!)).toBe(true);
     expect(textPreset('custom-anthropic')!.protocol).toBe('anthropic');
+    expect(isCustom(textPreset('custom-gemini')!)).toBe(true);
+    expect(textPreset('custom-gemini')!.protocol).toBe('gemini');
+    expect(textPreset('gemini')!.protocol).toBe('gemini');
+    expect(endpointOf(textPreset('gemini')!, null)?.base).toBe('https://generativelanguage.googleapis.com/v1beta');
     expect(textPreset('volcengine-speech')).toBeUndefined();
     // the user's own last, as the Mac lists them
-    expect(TEXT_PRESETS.slice(-2).map((p) => p.id)).toEqual(['custom-openai', 'custom-anthropic']);
+    expect(TEXT_PRESETS.slice(-3).map((p) => p.id)).toEqual(['custom-openai', 'custom-anthropic', 'custom-gemini']);
   });
 
   it('a key names its service only by a start no other service uses', () => {
@@ -22,6 +26,7 @@ describe('custom model presets', () => {
     expect(detectKey(' sk-ant-api03-x\n')).toBe('anthropic');
     expect(detectKey('sk-or-v1-x')).toBe('openrouter');
     expect(detectKey('AIzaSyx')).toBe('gemini');
+    expect(detectKey('AQ.Ab8RN6x')).toBe('gemini');
     expect(detectKey('sk-proj-x')).toBe('openai');
     expect(detectKey('sk-0123456789abcdef')).toBeNull();
     expect(detectKey('')).toBeNull();

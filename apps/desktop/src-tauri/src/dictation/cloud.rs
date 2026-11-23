@@ -75,10 +75,11 @@ pub const PRESETS: &[Preset] = &[
     Preset { id: "xiaomi", protocol: "openai", endpoints: &[(None, "https://api.xiaomimimo.com/v1")] },
     Preset { id: "openai", protocol: "openai", endpoints: &[(None, "https://api.openai.com/v1")] },
     Preset { id: "anthropic", protocol: "anthropic", endpoints: &[(None, "https://api.anthropic.com")] },
-    Preset { id: "gemini", protocol: "openai", endpoints: &[(None, "https://generativelanguage.googleapis.com/v1beta/openai")] },
+    Preset { id: "gemini", protocol: "gemini", endpoints: &[(None, "https://generativelanguage.googleapis.com/v1beta")] },
     Preset { id: "openrouter", protocol: "openai", endpoints: &[(None, "https://openrouter.ai/api/v1")] },
     Preset { id: "custom-openai", protocol: "openai", endpoints: &[] },
     Preset { id: "custom-anthropic", protocol: "anthropic", endpoints: &[] },
+    Preset { id: "custom-gemini", protocol: "gemini", endpoints: &[] },
 ];
 
 pub fn preset(id: &str) -> Option<&'static Preset> {
@@ -503,7 +504,10 @@ mod tests {
         assert_eq!(super::preset("deepseek").unwrap().base(Some("global")), Some("https://api.deepseek.com"));
         assert!(super::preset("custom-openai").unwrap().custom());
         assert_eq!(super::preset("custom-anthropic").unwrap().base(None), None);
+        assert!(super::preset("custom-gemini").unwrap().custom());
         assert_eq!(super::preset("anthropic").unwrap().protocol, "anthropic");
+        assert_eq!(super::preset("gemini").unwrap().protocol, "gemini");
+        assert_eq!(super::preset("gemini").unwrap().base(None), Some("https://generativelanguage.googleapis.com/v1beta"));
         assert!(super::preset("volcengine-speech").is_none());
     }
 
@@ -526,6 +530,8 @@ mod tests {
         assert_eq!(c["base_url"], "https://api.moonshot.cn/v1");
         let c = super::request(&json!({"id": "anthropic", "preset": "anthropic"}), "claude", "k");
         assert_eq!((c["protocol"].as_str(), c["base_url"].as_str()), (Some("anthropic"), Some("https://api.anthropic.com")));
+        let c = super::request(&json!({"id": "gemini", "preset": "gemini"}), "gemini-3.8-flash", "k");
+        assert_eq!((c["protocol"].as_str(), c["base_url"].as_str()), (Some("gemini"), Some("https://generativelanguage.googleapis.com/v1beta")));
         // a preset this build doesn't know: OpenAI-compatible, at its own address
         let c = super::request(&json!({"id": "x", "preset": "future", "base_url": "https://x.example/v1"}), "m", "k");
         assert_eq!((c["protocol"].as_str(), c["base_url"].as_str()), (Some("openai"), Some("https://x.example/v1")));

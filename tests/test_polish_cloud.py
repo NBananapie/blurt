@@ -32,9 +32,23 @@ class Fake:
                 body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
                 fake.seen.append({"path": self.path, "headers": {k.lower(): v for k, v in self.headers.items()}, "body": body})
                 if fake.status != 200:
-                    self.send_response(fake.status); self.end_headers(); return
+                    self.send_response(fake.status)
+                    err_body = getattr(fake, "error_body", b"")
+                    if err_body:
+                        self.send_header("Content-Length", str(len(err_body)))
+                    self.end_headers()
+                    if err_body:
+                        self.wfile.write(err_body)
+                    return
                 if self.path.endswith("/messages"):
                     out = {"content": [{"type": "text", "text": fake.reply}], "usage": {"input_tokens": 9, "output_tokens": 3}}
+                elif self.path.endswith("/interactions"):
+                    out = {
+                        "id": "int_1",
+                        "status": getattr(fake, "interaction_status", "completed"),
+                        "steps": [{"type": "model_output", "content": [{"type": "text", "text": fake.reply}]}],
+                        "usage": {"total_input_tokens": 9, "total_output_tokens": 3, "total_tokens": 12},
+                    }
                 else:
                     out = {"choices": [{"message": {"content": fake.reply}}], "usage": {"prompt_tokens": 9, "completion_tokens": 3}}
                 d = json.dumps(out).encode()
@@ -390,3 +404,70 @@ def test_a_key_no_header_can_carry_is_an_auth_failure_that_never_shows_the_key(a
     # the founder's key ended in two "ç" as ⌥C types them: c + U+0327, which no header can carry
     r = C.check({**cloud(api), "key": "sk-test" + "c\u0327" * 2})
     assert r["ok"] is False and r["code"] == "auth" and "sk-test" not in json.dumps(r)
+
+
+def test_gemini_interactions_api_requests_and_vision(api, tmp_path):
+    assert C.PRESETS["gemini"] == {
+        "base_url": "https://generativelanguage.googleapis.com/v1beta",
+        "model": "",
+        "protocol": "gemini",
+    }
+    migrated = C.settings({
+        "provider": "gemini",
+        "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
+        "protocol": "openai",
+        "model": "gemini-4-argon",
+        "key": "AQ.test-key",
+    })
+    assert (migrated["protocol"], migrated["base_url"]) == ("gemini", "https://generativelanguage.googleapis.com/v1beta")
+    u_full = C.request({**migrated, "base_url": "https://generativelanguage.googleapis.com/v1beta/interactions"},
+                       [{"role": "user", "content": "hi"}], 10)[0]
+    assert u_full == "https://generativelanguage.googleapis.com/v1beta/interactions"
+
+    gem_h = C.settings({
+        "provider": "gemini",
+        "model": "gemini-4-hydrogen@medium",
+        "key": "AQ.test-key",
+    })
+    assert gem_h["model"] == "gemini-4-hydrogen" and gem_h["thinking_level"] == "medium"
+    _, h_body, _ = C.request(gem_h, [{"role": "user", "content": "hi"}], 10)
+    assert h_body["model"] == "gemini-4-hydrogen"
+    assert h_body["generation_config"]["thinking_level"] == "medium"
+    assert h_body["generation_config"]["max_output_tokens"] >= 2048
+    gem = {"provider": "gemini", "base_url": api.url + "/v1beta", "model": "gemini-4-argon",
+           "protocol": "gemini", "key": "AQ.test-key"}
+    api.reply = "我们明天下午三点开会，讨论一下 release 的计划。"
+    r = polish.cloud_polish("嗯 我们明天下午三点开会 讨论一下 release 的计划", [], None, None, gem)
+    assert not r["fell_back"] and r["text"] == api.reply
+    seen = api.seen[-1]
+    assert seen["path"] == "/v1beta/interactions"
+    assert seen["headers"]["x-goog-api-key"] == "AQ.test-key"
+    assert "authorization" not in seen["headers"]
+    assert seen["body"]["model"] == "gemini-4-argon"
+    assert seen["body"]["store"] is False and seen["body"]["stream"] is False
+    assert seen["body"]["system_instruction"].startswith("You turn what a speech recognizer typed")
+    assert seen["body"]["input"][0]["type"] == "user_input"
+    assert seen["body"]["input"][1]["type"] == "model_output"
+    assert seen["body"]["generation_config"]["max_output_tokens"] >= 1024
+    assert "temperature" not in seen["body"]
+
+    # Vision check (Custom Model test) + screen_text.read_cloud
+    api.reply = "Blurt 4721"
+    assert C.check(gem, job="vision")["ok"]
+    img_part = api.seen[-1]["body"]["input"][1]
+    assert img_part["type"] == "image" and img_part["mime_type"] == "image/png" and img_part["data"].startswith("iVBOR")
+
+    import base64
+    import screen_text
+    img = tmp_path / "shot.png"
+    img.write_bytes(base64.b64decode(C.CHECK_IMAGE))
+    sr = screen_text.read_cloud(gem, str(img), None)
+    assert sr["ok"] and sr["text"] == "Blurt 4721"
+    assert api.seen[-1]["body"]["input"][1]["type"] == "image"
+
+    # Google 400 API_KEY_INVALID maps directly to auth without retrying
+    api.status = 400
+    api.error_body = json.dumps({"error": {"code": 400, "status": "INVALID_ARGUMENT", "message": "API key not valid."}}).encode()
+    before = len(api.seen)
+    assert C.check({**gem, "thinking_level": "medium"})["code"] == "auth"
+    assert len(api.seen) == before + 1

@@ -164,6 +164,7 @@ enum CloudStore {
         case "gemini": return M("models.preset.gemini")
         case "openrouter": return M("models.preset.openrouter")
         case "custom-anthropic": return M("models.preset.custom_anthropic")
+        case "custom-gemini": return M("models.preset.custom_gemini")
         default: return M("models.preset.custom_openai")
         }
     }

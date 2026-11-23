@@ -274,6 +274,9 @@ def read_cloud(cloud: dict, image: str, draft: str | None, timeout: float = 20) 
     if cfg["protocol"] == "anthropic":
         content = [{"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": b64}},
                    {"type": "text", "text": CLOUD_PROMPT}]
+    elif cfg["protocol"] == "gemini":
+        content = [{"type": "text", "text": CLOUD_PROMPT},
+                   {"type": "image", "data": b64, "mime_type": "image/png"}]
     else:
         content = [{"type": "text", "text": CLOUD_PROMPT},
                    {"type": "image_url", "image_url": {"url": "data:image/png;base64," + b64}}]

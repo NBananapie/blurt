@@ -13,7 +13,7 @@ final class CloudServicesTests: XCTestCase {
         XCTAssertEqual(CloudPreset.all.filter(\.recommended).count, 1)
         XCTAssertEqual(Set(CloudPreset.all.map(\.id)).count, CloudPreset.all.count)
         for p in CloudPreset.all {
-            XCTAssertTrue([.openai, .anthropic].contains(p.api), p.id)
+            XCTAssertTrue([.openai, .anthropic, .gemini].contains(p.api), p.id)
             for e in p.endpoints {
                 // a speech-only service's address is the websocket transcribe.py opens
                 XCTAssertTrue(e.baseURL.hasPrefix(p.speechOnly ? "wss://" : "https://"), "\(p.id) \(e.baseURL)")
@@ -23,7 +23,7 @@ final class CloudServicesTests: XCTestCase {
             // a China and an international address, or one
             if p.regional { XCTAssertEqual(Set(p.endpoints.compactMap(\.region)), Set(CloudRegion.allCases), p.id) }
         }
-        XCTAssertEqual(CloudPreset.all.filter(\.custom).map(\.id), ["custom-openai", "custom-anthropic"])
+        XCTAssertEqual(CloudPreset.all.filter(\.custom).map(\.id), ["custom-openai", "custom-anthropic", "custom-gemini"])
         // the regions the founder asked for
         for id in ["dashscope", "volcengine", "moonshot", "zhipu", "minimax"] { XCTAssertTrue(CloudPreset.preset(id)!.regional, id) }
         // speech: Model Studio, Volcengine Speech and OpenAI only (transcribe.py speaks those); Volcengine Speech does

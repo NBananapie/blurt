@@ -184,6 +184,8 @@
 "speech.tag.recommended" = "推荐";
 "speech.tag.small_mac" = "适合内存小的 Mac";
 "speech.tag.apple-speech" = "系统自带，无需下载；同音字识别较弱";
+"speech.tag.qwen3-asr-0.6b-cuda" = "NVIDIA 显卡高速运行，支持词库";
+"speech.tag.qwen3-asr-1.7b-cuda" = "NVIDIA 显卡最准，支持词库与光标上下文";
 "speech.tag.qwen3-asr-0.6b-mlx" = "准确，支持词库";
 "speech.tag.qwen3-asr-1.7b-mlx" = "英文稍好，体积是 0.6B 的 2.5 倍";
 "speech.tag.fun-asr-nano-mlx" = "中英混说更准，速度快";

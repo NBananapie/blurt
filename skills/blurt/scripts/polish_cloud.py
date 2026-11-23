@@ -38,6 +38,7 @@ PRESETS = {
                   "vision_model": "qwen3.6-flash", "protocol": "openai"},
     "openai": {"base_url": "https://api.openai.com/v1", "model": "", "protocol": "openai"},
     "anthropic": {"base_url": "https://api.anthropic.com", "model": "", "protocol": "anthropic"},
+    "gemini": {"base_url": "https://generativelanguage.googleapis.com/v1beta", "model": "", "protocol": "gemini"},
 }
 
 LIGHT = """You turn what a speech recognizer typed while someone was dictating into the text they meant to type. Reply with that text only: no preface, no quotes, no notes, no Markdown.
@@ -105,13 +106,25 @@ def settings(cloud: dict | None) -> dict:
     p = PRESETS.get(c.get("provider") or "", {})
     # translate_model / vision_model: the user's pick for translate and Copy Text from Screen ("" = translate on the
     # polish model; Copy Text from Screen on the provider's vision model, else the polish model)
-    out = {k: (c.get(k) or p.get(k) or "") for k in ("base_url", "model", "protocol", "translate_model", "vision_model")}
+    out = {k: (c.get(k) or p.get(k) or "") for k in ("base_url", "model", "protocol", "translate_model", "vision_model",
+                                                       "thinking_level")}
     out["protocol"] = out["protocol"] or "openai"
     out["key"] = c.get("key") or ""
     out["provider"] = c.get("provider") or "custom"
+    if out["provider"] == "gemini" and out["base_url"].rstrip("/") == "https://generativelanguage.googleapis.com/v1beta/openai":
+        out["base_url"] = "https://generativelanguage.googleapis.com/v1beta"
+        out["protocol"] = "gemini"
+    if out["protocol"] == "gemini":
+        m, sep, lvl = out["model"].rpartition("@")
+        if sep and m and lvl in ("minimal", "low", "medium", "high", "xhigh"):
+            out["model"] = m
+            if not out["thinking_level"]:
+                out["thinking_level"] = lvl
+        if not out["thinking_level"] and out["model"].startswith("gemini-4-"):
+            out["thinking_level"] = "medium"
     if not out["base_url"] or not out["model"] or not out["key"]:
         raise CloudError("cloud polish is not set up (base URL, model and key)", "config")
-    if out["protocol"] not in ("openai", "anthropic"):
+    if out["protocol"] not in ("openai", "anthropic", "gemini"):
         raise CloudError(f"unknown protocol {out['protocol']}", "config")
     return out
 
@@ -181,6 +194,48 @@ OPTIONAL = ("temperature", "thinking", "enable_thinking", "reasoning_effort", "r
 _bare: set = set()      # (base URL, model) that refused an optional field: sent without them
 
 
+def _gemini_content(content) -> list[dict]:
+    """Convert a message's string or multimodal parts into Gemini Interactions API content blocks."""
+    if isinstance(content, str):
+        return [{"type": "text", "text": content}]
+    parts = []
+    for part in content or []:
+        if not isinstance(part, dict):
+            continue
+        t = part.get("type")
+        if t == "text":
+            parts.append({"type": "text", "text": part.get("text", "")})
+        elif t == "image":
+            if "data" in part and "mime_type" in part:
+                parts.append({"type": "image", "data": part["data"], "mime_type": part["mime_type"]})
+            elif isinstance(part.get("source"), dict):
+                src = part["source"]
+                parts.append({"type": "image", "data": src.get("data", ""), "mime_type": src.get("media_type", "image/png")})
+        elif t == "image_url":
+            url = (part.get("image_url") or {}).get("url") or ""
+            if url.startswith("data:") and ";base64," in url:
+                mime, data = url[5:].split(";base64,", 1)
+                parts.append({"type": "image", "data": data, "mime_type": mime})
+            elif url:
+                parts.append({"type": "image", "uri": url})
+    return parts
+
+
+def _has_optional(body: dict) -> bool:
+    if any(k in body for k in OPTIONAL):
+        return True
+    gc = body.get("generation_config")
+    return isinstance(gc, dict) and "thinking_level" in gc
+
+
+def _without_optional(body: dict) -> dict:
+    out = {k: v for k, v in body.items() if k not in OPTIONAL}
+    gc = out.get("generation_config")
+    if isinstance(gc, dict) and "thinking_level" in gc:
+        out["generation_config"] = {k: v for k, v in gc.items() if k != "thinking_level"}
+    return out
+
+
 def request(cfg: dict, msgs: list[dict], max_tokens: int) -> tuple[str, dict, dict]:
     """(url, body, headers) for one request. The key goes in a header only."""
     base = cfg["base_url"].rstrip("/")
@@ -192,6 +247,30 @@ def request(cfg: dict, msgs: list[dict], max_tokens: int) -> tuple[str, dict, di
         body = {"model": cfg["model"], "max_tokens": max_tokens, "system": system,
                 "messages": [m for m in msgs if m["role"] != "system"]}
         headers = {"x-api-key": cfg["key"], "anthropic-version": "2023-06-01", "content-type": "application/json"}
+        return url, body, headers
+    if cfg["protocol"] == "gemini":
+        if base.endswith("/interactions"):
+            url = base
+        elif base.endswith(("/v1", "/v1beta")):
+            url = base + "/interactions"
+        else:
+            url = base + "/v1beta/interactions"
+        system = "\n\n".join(m["content"] for m in msgs if m["role"] == "system" and isinstance(m.get("content"), str))
+        turns = [m for m in msgs if m["role"] != "system"]
+        if len(turns) == 1 and turns[0]["role"] == "user":
+            c0 = turns[0]["content"]
+            inp = c0 if isinstance(c0, str) else _gemini_content(c0)
+        else:
+            inp = [{"type": "model_output" if m["role"] == "assistant" else "user_input",
+                    "content": _gemini_content(m["content"])} for m in turns]
+        body: dict = {"model": cfg["model"], "input": inp, "store": False, "stream": False}
+        if system:
+            body["system_instruction"] = system
+        gen_cfg: dict = {"max_output_tokens": max(max_tokens, 2048)}
+        if not bare and cfg.get("thinking_level"):
+            gen_cfg["thinking_level"] = cfg["thinking_level"]
+        body["generation_config"] = gen_cfg
+        headers = {"x-goog-api-key": cfg["key"], "Content-Type": "application/json"}
         return url, body, headers
     url = base + "/chat/completions"
     host = base.split("//", 1)[-1].split("/", 1)[0]
@@ -217,21 +296,40 @@ def complete(cfg: dict, msgs: list[dict], timeout: float, max_tokens: int, allow
     try:
         j = _send(url, body, headers, timeout)
     except urllib.error.HTTPError as e:
-        if e.code == 400 and any(k in body for k in OPTIONAL):
+        err0 = _http_error(e)
+        if e.code == 400 and err0.code != "auth" and _has_optional(body):
             # a field this model doesn't take: once more without the optional ones, and remember it
             _bare.add((cfg["base_url"].rstrip("/"), cfg["model"]))
             try:
-                j = _send(url, {k: v for k, v in body.items() if k not in OPTIONAL}, headers, timeout)
+                j = _send(url, _without_optional(body), headers, timeout)
             except urllib.error.HTTPError as e2:
                 raise _http_error(e2) from None
             except Exception as e2:  # noqa: BLE001 — the same mapping as the first try
                 raise _error(e2) from None
         else:
-            raise _http_error(e) from None
+            raise err0 from None
     except Exception as e:  # noqa: BLE001
         raise _error(e) from None
     if cfg["protocol"] == "anthropic":
         text = "".join(b.get("text", "") for b in j.get("content") or [] if b.get("type") == "text")
+    elif cfg["protocol"] == "gemini":
+        if j.get("status") == "failed":
+            err = j.get("error") or {}
+            msg = err.get("message") if isinstance(err, dict) else str(err)
+            raise CloudError(msg or "interaction failed", "server")
+        text = "".join(
+            part.get("text", "")
+            for step in (j.get("steps") or [])
+            if isinstance(step, dict) and step.get("type") == "model_output"
+            for part in (step.get("content") or [])
+            if isinstance(part, dict) and part.get("type") == "text"
+        )
+        if not text and j.get("outputs"):
+            text = "".join(
+                part.get("text", "")
+                for part in (j.get("outputs") or [])
+                if isinstance(part, dict) and part.get("type") == "text"
+            )
     else:
         ch = (j.get("choices") or [{}])[0]
         text = (ch.get("message") or {}).get("content") or ""
@@ -248,6 +346,13 @@ def _send(url: str, body: dict, headers: dict, timeout: float) -> dict:
 
 def _http_error(e: urllib.error.HTTPError) -> CloudError:
     code = {401: "auth", 403: "auth", 402: "auth", 429: "rate_limited"}.get(e.code, "server")
+    if e.code == 400:
+        try:
+            body = (e.read(2048) or b"").decode("utf-8", errors="ignore")
+        except Exception:  # noqa: BLE001
+            body = ""
+        if any(tok in body for tok in ("API_KEY_INVALID", "API key not valid", "UNAUTHENTICATED")):
+            code = "auth"
     return CloudError(f"HTTP {e.code}", code)
 
 

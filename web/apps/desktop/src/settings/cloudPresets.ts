@@ -14,7 +14,7 @@ export interface Endpoint {
 }
 export interface TextPreset {
   id: string;
-  protocol: 'openai' | 'anthropic';
+  protocol: 'openai' | 'anthropic' | 'gemini';
   endpoints: Endpoint[];
   /** a pasted key that starts like this is this service's (only starts no other service uses) */
   keyPrefixes: string[];
@@ -53,10 +53,11 @@ export const TEXT_PRESETS: TextPreset[] = [
   ] },
   { id: 'openai', protocol: 'openai', keyPrefixes: ['sk-proj-', 'sk-svcacct-', 'sk-admin-'], endpoints: [{ region: null, base: 'https://api.openai.com/v1', page: 'https://platform.openai.com/api-keys' }] },
   { id: 'anthropic', protocol: 'anthropic', keyPrefixes: ['sk-ant-'], endpoints: [{ region: null, base: 'https://api.anthropic.com', page: 'https://platform.claude.com/settings/keys' }] },
-  { id: 'gemini', protocol: 'openai', keyPrefixes: ['AIza'], endpoints: [{ region: null, base: 'https://generativelanguage.googleapis.com/v1beta/openai', page: 'https://aistudio.google.com/apikey' }] },
+  { id: 'gemini', protocol: 'gemini', keyPrefixes: ['AIza', 'AQ.'], endpoints: [{ region: null, base: 'https://generativelanguage.googleapis.com/v1beta', page: 'https://aistudio.google.com/apikey', known: ['gemini-4-hydrogen', 'gemini-4-hydrogen@medium', 'gemini-4-argon', 'gemini-3.8-flash', 'gemini-3.5-flash-lite'] }] },
   { id: 'openrouter', protocol: 'openai', keyPrefixes: ['sk-or-'], endpoints: [{ region: null, base: 'https://openrouter.ai/api/v1', page: 'https://openrouter.ai/keys' }] },
   { id: 'custom-openai', protocol: 'openai', keyPrefixes: [], endpoints: [] },
   { id: 'custom-anthropic', protocol: 'anthropic', keyPrefixes: [], endpoints: [] },
+  { id: 'custom-gemini', protocol: 'gemini', keyPrefixes: [], endpoints: [] },
 ];
 
 export const textPreset = (id: string) => TEXT_PRESETS.find((p) => p.id === id);
