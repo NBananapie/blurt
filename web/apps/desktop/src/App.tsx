@@ -1304,12 +1304,15 @@ export default function App() {
 
   // The dictation key while this window has the focus: Windows' key hook doesn't hear it then, so it is passed on.
   useEffect(() => {
+    const FORWARD_CODES = new Set(['AltRight', 'AltLeft', 'ControlRight', 'ControlLeft', 'ShiftRight', 'ShiftLeft', 'MetaLeft', 'MetaRight', 'CapsLock']);
     const on = (e: KeyboardEvent) => {
-      if (e.code !== 'AltRight' && e.code !== 'AltLeft') return;
-      if (document.querySelector('.st-key.rec')) return; // a shortcut field is recording keys: Alt is part of the combo
+      const vk = e.keyCode || e.which;
+      const isSpecial = (vk >= 0x71 && vk <= 0x87) || [0x13, 0x2D, 0x5D, 0x91, 0x6A, 0x6B, 0x6D, 0x6F, 0xC0].includes(vk);
+      if (!FORWARD_CODES.has(e.code) && !isSpecial) return;
+      if (document.querySelector('.st-key.rec')) return; // a shortcut field is recording keys
       if (e.code === 'AltRight') e.preventDefault(); // a lone right Alt would put the window in menu mode (the next key lost)
       if (document.querySelector('[data-key-probe]')) return; // the Welcome's key check: the press only checks the key
-      if (!e.repeat) void api.dictationKey(e.code, e.type === 'keydown').catch(() => {});
+      if (!e.repeat) void api.dictationKey(e.code, e.type === 'keydown', vk).catch(() => {});
     };
     window.addEventListener('keydown', on, true);
     window.addEventListener('keyup', on, true);

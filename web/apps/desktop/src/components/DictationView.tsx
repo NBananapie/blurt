@@ -24,6 +24,7 @@ import { FeedbackSheet } from './FeedbackSheet';
 import { EmptyState } from './EmptyState';
 import { Menu, MenuItem } from './DictMenu';
 import { DictationWords } from './DictationWords';
+import { dictationKeyLabel } from './DictationSettings';
 
 type Mode = 'polished' | 'raw' | 'compare';
 type Undo = { msg: string; run: () => Promise<void> };
@@ -432,7 +433,9 @@ export function DictationView({ project, onShowItem, onSettings, onToast }: {
     return () => window.removeEventListener('keydown', onKey);
   });
 
-  const keyName = cfg.record?.dictation?.key === 'either_option' ? t('dictation.key.either_alt') : t('dictation.key.right_alt');
+  const keyName = cfg.record?.dictation?.key === 'either_option' ? t('dictation.key.either_alt')
+    : (!cfg.record?.dictation?.key || cfg.record?.dictation?.key === 'right_option') ? t('dictation.key.right_alt')
+      : dictationKeyLabel(cfg.record?.dictation?.key);
   const blocked = data ? (!data.enabled ? 'off' : data.ready === false ? 'no_model' : null) : null;
 
   // what stands in dictation's way, in one line: the fact, then the one way out (off: neutral, a ring; no model: the

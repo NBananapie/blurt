@@ -9,11 +9,11 @@
 //                   each job uses · every speech model on this PC
 // What the Mac has here that Windows doesn't (yet): docs/design/windows-parity/settings.md.
 import { useEffect, useRef, useState } from 'react';
-import { api, builds, listen, type AgentSetupState, type AgentSetupStep, type AppStatus, type AsrModel, type CloudSummary, type CuratedOption, type DictationHistory, type VoiceprintEvent, type VoiceprintStatus } from '../api';
+import { api, builds, listen, type AgentSetupState, type AgentSetupStep, type AppStatus, type AsrModel, type CloudSummary, type CuratedOption, type DictationHistory, type PolishModels, type VoiceprintEvent, type VoiceprintStatus } from '../api';
 import { t } from '../i18n';
 import { Icon } from '@blurt/icons';
 import { Group, Line, Page, Popup, Row, S, Switch, TextLink, Toggle } from '../settings/kit';
-import { mb, ModelProgress, useDictationModels } from './ModelDownload';
+import { mb, ModelProgress, useDictationModels, usePolishModels } from './ModelDownload';
 import { openWordsTab } from './DictationView';
 import { Menu, type MenuAt, type MenuEntry } from './Menu';
 import { KeyCaps } from './SettingsView';
@@ -46,10 +46,12 @@ export function modelName(sum: CloudSummary | null, curated: Record<string, Cura
 /** what a text job runs on (translate follows polish until it has its own route) */
 const routeOf = (sum: CloudSummary | null, job: string): Route | null => sum?.routes?.[job] ?? (job === 'translate' ? sum?.routes?.polish ?? null : null);
 
-/** "DeepSeek V4.1 Flash · cloud" / "Not set" for a text job (the Mac's CloudText.uses). */
-function uses(sum: CloudSummary | null, job: 'polish' | 'translate', curated?: Record<string, CuratedOption[]>): string {
+/** "DeepSeek V4.1 Flash · cloud" / "Gemma 4 E2B · on your PC" / "Not set" for a text job. */
+function uses(sum: CloudSummary | null, job: 'polish' | 'translate', curated?: Record<string, CuratedOption[]>, polish?: PolishModels | null): string {
   const r = routeOf(sum, job);
-  return r ? S('models.uses.cloud', modelName(sum, curated, job, r)) : S('models.uses.none');
+  if (r) return S('models.uses.cloud', modelName(sum, curated, job, r));
+  const loc = polish?.selected ? polish.models.find((m) => m.id === polish.selected && m.installed) : undefined;
+  return loc ? S('models.uses.local', loc.name) : S('models.uses.none');
 }
 export function useCurated() {
   const [c, setC] = useState<Record<string, CuratedOption[]>>({});
@@ -68,6 +70,49 @@ export function useCloud() {
 
 // ------------------------------------------------------------------ Dictation
 
+export const BUILTIN_DICTATION_KEYS = ['right_option', 'either_option', 'right_control', 'ctrl_win', 'right_shift', 'caps_lock'] as const;
+
+export function customVkName(vk: number): string {
+  if (vk >= 0x70 && vk <= 0x87) return `F${vk - 0x6F}`;
+  const map: Record<number, string> = {
+    0x13: 'Pause', 0x14: 'Caps Lock', 0x2D: 'Insert', 0x5D: 'Menu', 0x91: 'Scroll Lock',
+    0x6A: 'Num *', 0x6B: 'Num +', 0x6D: 'Num -', 0x6F: 'Num /',
+    0xC0: '`', 0xDB: '[', 0xDD: ']', 0xDC: '\\', 0xBA: ';', 0xDE: "'",
+  };
+  return map[vk] ?? `VK ${vk}`;
+}
+
+export function normDictationKey(v: unknown): string {
+  if (typeof v !== 'string') return 'right_option';
+  const s = v.trim();
+  if ((BUILTIN_DICTATION_KEYS as readonly string[]).includes(s)) return s;
+  if (s === 'right_alt' || s === 'fn') return 'right_option';
+  if (s === 'either_alt') return 'either_option';
+  if (s === 'right_ctrl') return 'right_control';
+  if (s.startsWith('custom:')) {
+    const n = Number(s.slice(7));
+    if (Number.isInteger(n) && n >= 8 && n <= 254 && n !== 0x1B) return `custom:${n}`;
+  }
+  return 'right_option';
+}
+
+export function dictationKeyLabel(v: unknown): string {
+  const k = normDictationKey(v);
+  if (k.startsWith('custom:')) return customVkName(Number(k.slice(7)));
+  return S(`dictation.key.${k}`);
+}
+
+export function dictationKeyInline(v: unknown): string {
+  const k = normDictationKey(v);
+  if (k.startsWith('custom:')) return S('dictation.key.custom.inline', customVkName(Number(k.slice(7))));
+  return S(`dictation.key.${k}.inline`);
+}
+
+export function allowedCustomVk(vk: number): boolean {
+  if (vk >= 0x71 && vk <= 0x87) return true; // F2..F24 (F1 is Help everywhere)
+  return [0x13, 0x2D, 0x5D, 0x91, 0x6A, 0x6B, 0x6D, 0x6F, 0xC0].includes(vk);
+}
+
 export function DictationPane({ cfg, save, goModels, goTranslate, keyOf, portalKey = null }: {
   cfg: Record<string, any>;
   save: Save;
@@ -81,10 +126,12 @@ export function DictationPane({ cfg, save, goModels, goTranslate, keyOf, portalK
   const d = cfg.record?.dictation ?? {};
   const set = (patch: Record<string, unknown>) => save({ record: { dictation: { ...d, ...patch } } });
   // record.dictation.* as dictation/prefs.rs reads it (the Mac's keys; the engine reloads them when the file changes)
-  const key = d.key === 'either_option' ? 'either_option' : 'right_option';
+  const key = normDictationKey(d.key);
+  const [pickingCustom, setPickingCustom] = useState(false);
+  const [customWarn, setCustomWarn] = useState(false);
   const portal = portalKey !== null;
   // the key as a sentence names it ("the right Alt key", or GNOME's "Menu")
-  const keyInline = portal ? S('dictation.key.portal.inline', portalKey || S('dictation.key.portal.unset')) : S(`dictation.key.${key}.inline`);
+  const keyInline = portal ? S('dictation.key.portal.inline', portalKey || S('dictation.key.portal.unset')) : dictationKeyInline(key);
   const keyCap = portalKey || S('dictation.key.portal.unset');
   const mode: string = ['auto', 'tap', 'hold'].includes(d.mode) ? d.mode : 'auto';
   const styles: Record<string, any> = d.styles ?? {};
@@ -93,6 +140,7 @@ export function DictationPane({ cfg, save, goModels, goTranslate, keyOf, portalK
   const [sum] = useCloud();
   const curated = useCurated();
   const { models, dl } = useDictationModels();
+  const { polish } = usePolishModels();
   const [hist, setHist] = useState<DictationHistory | null>(null);
   const [mics, setMics] = useState<{ default: string | null; devices: string[] } | null>(null);
   const [words, setWords] = useState<{ term: string; state: string; source?: string }[] | null>(null);
@@ -110,12 +158,15 @@ export function DictationPane({ cfg, save, goModels, goTranslate, keyOf, portalK
   // the polish model beside the recogniser while a style polishes ("Fun-ASR-Nano (CPU) · DeepSeek V4.1 Flash (cloud)",
   // the Mac's modelNames); Windows polishes in the cloud only
   const polishRoute = style !== 'verbatim' ? routeOf(sum, 'polish') : null;
+  const localPolish = style !== 'verbatim' && !polishRoute && polish?.selected
+    ? polish.models.find((m) => m.id === polish.selected && m.installed)
+    : undefined;
   const modelLine = !models
     ? undefined
     : dl
-      ? S('speech.rec.downloading', models.models.find((m) => m.id === dl.id)?.name ?? '')
+      ? S('speech.rec.downloading', models.models.find((m) => m.id === dl.id)?.name ?? polish?.models.find((m) => m.id === dl.id)?.name ?? '')
       : sel?.installed
-        ? [sel.name, polishRoute && S('dictation.models.cloud', modelName(sum, curated, 'polish', polishRoute))].filter(Boolean).join(' · ')
+        ? [sel.name, polishRoute ? S('dictation.models.cloud', modelName(sum, curated, 'polish', polishRoute)) : localPolish?.name].filter(Boolean).join(' · ')
         : S('dictation.models.missing', models.models.find((m) => m.id === models.recommended)?.name ?? '');
   const styleName = (s: string) => S(`dictation.style.${s}`);
   const STYLES = ['verbatim', 'light', 'structured', 'auto'];
@@ -163,9 +214,44 @@ export function DictationPane({ cfg, save, goModels, goTranslate, keyOf, portalK
                 <span className="st-key static"><KeyCaps label={keyCap} /></span>
               </Row>
             ) : (
-              <Row id="dictation.key" detail={key === 'either_option' ? S('dictation.settings.either_hint') : undefined}>
-                <Popup label={S('dictation.settings.key')} value={key} choices={[['right_option', S('dictation.key.right_option')], ['either_option', S('dictation.key.either_option')]]}
-                  onChange={(v) => set({ key: v })} />
+              <Row id="dictation.key" warn={customWarn}
+                detail={customWarn ? S('dictation.key.custom_refused')
+                  : pickingCustom ? S('dictation.key.custom_press')
+                    : key === 'either_option' ? S('dictation.settings.either_hint')
+                      : key === 'caps_lock' ? S('dictation.key.caps_lock.hint') : undefined}>
+                {pickingCustom ? (
+                  <button autoFocus className="st-key rec" onBlur={() => (setPickingCustom(false), setCustomWarn(false))}
+                    onKeyDown={(e) => {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      if (e.key === 'Escape') {
+                        setPickingCustom(false);
+                        setCustomWarn(false);
+                        return;
+                      }
+                      const vk = e.keyCode || e.which;
+                      if ([16, 17, 18, 91, 92].includes(vk)) return; // modifier alone: wait or use dropdown
+                      if (!allowedCustomVk(vk)) {
+                        setCustomWarn(true);
+                        return;
+                      }
+                      setPickingCustom(false);
+                      setCustomWarn(false);
+                      void set({ key: `custom:${vk}` });
+                    }}>
+                    <span className="st-key-type">{S('capture.keys.type')}</span>
+                    <kbd className="st-key-esc">Esc</kbd>
+                  </button>
+                ) : (
+                  <Popup label={S('dictation.settings.key')} value={key}
+                    dividers={[BUILTIN_DICTATION_KEYS.length]}
+                    choices={[
+                      ...BUILTIN_DICTATION_KEYS.map((k) => [k, S(`dictation.key.${k}`)] as [string, string]),
+                      ...(key.startsWith('custom:') ? [[key, dictationKeyLabel(key)] as [string, string]] : []),
+                      ['__pick_custom', S('dictation.key.custom_pick')],
+                    ]}
+                    onChange={(v) => (v === '__pick_custom' ? (setCustomWarn(false), setPickingCustom(true)) : set({ key: v }))} />
+                )}
               </Row>
             )}
             <Row id="dictation.mode" detail={S(`dictation.mode.${mode}.detail`, keyInline)} help={modeHelp}>
@@ -270,7 +356,7 @@ export function DictationPane({ cfg, save, goModels, goTranslate, keyOf, portalK
               onChange={(v) => set({ translate_target: v === 'auto' ? undefined : v })} />
           </Row>
         </div>
-        <Row id="dictation.translate_model" detail={uses(sum, 'translate', curated)}>
+        <Row id="dictation.translate_model" detail={uses(sum, 'translate', curated, polish)}>
           <button onClick={goTranslate}>{S('models.uses.change')}</button>
         </Row>
       </Group>
@@ -454,6 +540,7 @@ export function ScreenTextPane({ cfg, save, goTranslate, linux = false }: { cfg:
   const tr = st.translate ?? {};
   const [sum, setSum] = useCloud();
   const curated = useCurated();
+  const { polish } = usePolishModels();
   // Copy (Alt+Shift+C): the second, cloud pass that reads the screenshot (the Mac's 精确识别) — the same setting as
   // Models → Copy Text from Screen (record.cloud.jobs.vision), so the two never disagree
   const [jobs, setJobs] = useState<Record<string, unknown>>({});
@@ -492,7 +579,7 @@ export function ScreenTextPane({ cfg, save, goTranslate, linux = false }: { cfg:
           <Popup label={S('settings.screen_text.translate', '')} value={normTarget(tr.target)} wide dividers={[1]} choices={targetChoices()}
             onChange={(v) => save({ record: { screen_text: { ...st, translate: { cloud: tr.cloud ?? true, ...(v === 'auto' ? {} : { target: v }) } } } })} />
         </Row>
-        <Row id="screentext.translate_model" detail={uses(sum, 'translate', curated)}>
+        <Row id="screentext.translate_model" detail={uses(sum, 'translate', curated, polish)}>
           <button onClick={goTranslate}>{S('models.uses.change')}</button>
         </Row>
       </Group>
@@ -581,7 +668,11 @@ export function ModelsPane({ status, onToast }: { status: AppStatus; onToast: (m
     api.detect({ login: false }).then((d) => setHasAgent(d.agents.some((a) => a.installed)), () => {});
   }, []);
   const { models, err, dl, failed, failedId, load, download } = useDictationModels();
+  const { polish, load: loadPolish, download: downloadPolish } = usePolishModels();
   const rec = models?.models.find((m) => m.id === models.recommended);
+  const polishRec = polish?.models.find((m) => m.id === polish.recommended && m.local_supported);
+  const localPolishes = polish?.models.filter((m) => m.local_supported) ?? [];
+  const installedPolishes = localPolishes.filter((m) => m.installed);
   const taken = new Set(sum?.services.map((s) => s.preset) ?? []);
   const left = PRESETS.filter((p) => !taken.has(p.id) && (p.id !== 'volcengine-speech' || volcOffered()));
   const installed = models?.models.filter((m) => m.installed) ?? [];
@@ -650,23 +741,33 @@ export function ModelsPane({ status, onToast }: { status: AppStatus; onToast: (m
    *  measured it ("Not tested"), and Custom Model… (the Mac's JobModelControl.items). */
   const jobValue = (job: TextJob) => {
     const r = sum?.routes?.[job];
-    return jobsCfg[job] && r ? `${r.service}:${r.model}` : 'auto';
+    if (jobsCfg[job] && r) return `${r.service}:${r.model}`;
+    if ((job === 'polish' || job === 'translate') && !routeOf(sum, job) && polish?.configured && polish.configured !== 'off' && installedPolishes.some((m) => m.id === polish.configured)) {
+      return `local:${polish.configured}`;
+    }
+    return 'auto';
   };
   const jobMenu = (job: TextJob) => {
     const conn = new Map((sum?.services ?? []).map((x) => [x.preset, x.id]));
-    const opts = (curated[job] ?? []).map((o) => conn.has(o.service)
-      ? ([`${conn.get(o.service)}:${o.model}`, o.name] as [string, string])
-      : ([`add:${o.service}`, S('win.models.add_key', `${o.name} · ${S(`models.preset.${presetKey(o.service)}`)}`)] as [string, string]));
+    const localOpts: [string, string][] = (job === 'polish' || job === 'translate')
+      ? installedPolishes.map((m) => [`local:${m.id}`, S('models.uses.local', m.name)])
+      : [];
+    const opts = [
+      ...localOpts,
+      ...(curated[job] ?? []).map((o) => conn.has(o.service)
+        ? ([`${conn.get(o.service)}:${o.model}`, o.name] as [string, string])
+        : ([`add:${o.service}`, S('win.models.add_key', `${o.name} · ${S(`models.preset.${presetKey(o.service)}`)}`)] as [string, string])),
+    ];
     // a model picked elsewhere that the measured list doesn't have (a Custom Model, an agent's setup, an older Blurt):
     // kept under Advanced, by its id, with its service and "Not tested" under it
     const v = jobValue(job), r = sum?.routes?.[job];
-    const kept: [string, string][] = v !== 'auto' && r && !opts.some(([x]) => x === v) ? [[v, modelName(sum, curated, job, r)]] : [];
+    const kept: [string, string][] = v !== 'auto' && !v.startsWith('local:') && r && !opts.some(([x]) => x === v) ? [[v, modelName(sum, curated, job, r)]] : [];
     const svc = r ? sum?.services.find((x) => x.id === r.service) : undefined;
     const adv = 1 + opts.length;
     // the closed pop-up says only Automatic or the model's name: what runs now is the row's detail (nothing cut off)
     return {
       choices: [['auto', S('win.models.auto')], ...opts, ...kept, [CUSTOM, S('models.job.custom')]] as [string, string][],
-      dividers: [1, adv],
+      dividers: [1, ...(localOpts.length && opts.length > localOpts.length ? [1 + localOpts.length] : []), adv],
       headers: { [adv]: S('models.job.advanced') },
       hints: [...Array(adv).fill(undefined), ...kept.map(() => [svc ? serviceName(svc) : undefined, S('models.untested')].filter(Boolean).join(' · ')), undefined],
     };
@@ -674,34 +775,61 @@ export function ModelsPane({ status, onToast }: { status: AppStatus; onToast: (m
   const setJob = async (job: TextJob, v: string) => {
     if (v === CUSTOM) return setCustomJob(job);
     if (v.startsWith('add:')) return setAdding(true);
+    if (v.startsWith('local:')) {
+      const id = v.slice(6);
+      setSum(await api.cloudJobSet(job, null, null));
+      await api.polishUse(id);
+      await loadPolish();
+      loadJobs();
+      return;
+    }
     const [service, model] = v === 'auto' ? [null, null] : splitPick(v);
+    if (v === 'auto' && (job === 'polish' || job === 'translate') && polish?.configured) {
+      await api.polishUse(null);
+      await loadPolish();
+    }
     setSum(await api.cloudJobSet(job, service, model));
     loadJobs();
   };
   const textJob = (job: TextJob, icon: 'wand' | 'character-bubble' | 'text-viewfinder') => {
     const r = routeOf(sum, job);
+    const localSel = !r && (job === 'polish' || job === 'translate') && polish?.selected
+      ? installedPolishes.find((m) => m.id === polish.selected)
+      : undefined;
     // Copy Text from Screen reads the picture here (Windows OCR) when no model is set; a model makes it better
     const none = job === 'vision' ? S('models.job.vision.detail') : S('models.job.none');
     // every row reads the same: what the feature does, then what it uses now (the Mac's "Models in use")
     const does = S(job === 'polish' ? 'models.job.polish.does' : job === 'translate' ? 'models.job.translate.detail' : 'models.job.vision.detail');
+    const detail = r
+      ? S('speech.auto.using', does, modelName(sum, curated, job, r))
+      : localSel
+        ? S('speech.auto.using', does, S('models.uses.local', localSel.name))
+        : none;
     return (
-      <Row key={job} id={`speech.${job}`} icon={icon} detail={r ? S('speech.auto.using', does, modelName(sum, curated, job, r)) : none}>
+      <Row key={job} id={`speech.${job}`} icon={icon} detail={detail}>
         <Popup label={S(job === 'polish' ? 'speech.purpose.polish' : `models.job.${job}`)} value={jobValue(job)} {...jobMenu(job)} onChange={(v) => setJob(job, v)} />
       </Row>
     );
   };
   return (
     <Page id="speech" lead={!models && !err ? S('speech.loading') : undefined}>
-      {/* the one recommendation, only while it is missing (or coming down) */}
-      {dict && rec && !rec.installed && (
+      {/* the recommendations on this PC, while missing (or coming down) */}
+      {dict && ((rec && !rec.installed) || (polishRec && !polishRec.installed && !routeOf(sum, 'polish'))) && (
         <Group id="speech.use" title={S('speech.section.mac')}>
-          {/* with no speech model on this PC at all, dictation can't run: the line says so in the attention mark (the
-              Dictation pane's notice), the Download beside it the one way out */}
-          <Line title={S('speech.rec.title_size', mb(rec.size_mb))}
-            detail={failed && failedId === rec.id ? S('win.models.failed_row') : !installed.length && !dl ? S('dictation.nomodel.notice', rec.name) : S('speech.rec.line', S('speech.purpose.dictation'), rec.name)}
-            warn={(failed && failedId === rec.id) || (!installed.length && !dl)}>
-            {dl?.id === rec.id ? <><ModelProgress dl={dl} /><StopDownload /></> : <button className="primary" disabled={!!dl} onClick={() => download(rec.id)}>{S(failed && failedId === rec.id ? 'speech.rec.retry' : 'speech.download.button')}</button>}
-          </Line>
+          {rec && !rec.installed && (
+            <Line title={S('speech.rec.title_size', mb(rec.size_mb))}
+              detail={failed && failedId === rec.id ? S('win.models.failed_row') : !installed.length && !dl ? S('dictation.nomodel.notice', rec.name) : S('speech.rec.line', S('speech.purpose.dictation'), rec.name)}
+              warn={(failed && failedId === rec.id) || (!installed.length && !dl)}>
+              {dl?.id === rec.id ? <><ModelProgress dl={dl} /><StopDownload /></> : <button className="primary" disabled={!!dl} onClick={() => download(rec.id)}>{S(failed && failedId === rec.id ? 'speech.rec.retry' : 'speech.download.button')}</button>}
+            </Line>
+          )}
+          {polishRec && !polishRec.installed && !routeOf(sum, 'polish') && (
+            <Line title={S('speech.rec.title_size', mb(polishRec.size_mb))}
+              detail={failed && failedId === polishRec.id ? S('win.models.failed_row') : S('speech.rec.line', S('speech.purpose.polish'), polishRec.name)}
+              warn={failed && failedId === polishRec.id}>
+              {dl?.id === polishRec.id ? <><ModelProgress dl={dl} /><StopDownload /></> : <button className={!rec || rec.installed ? 'primary' : ''} disabled={!!dl} onClick={() => downloadPolish(polishRec.id)}>{S(failed && failedId === polishRec.id ? 'speech.rec.retry' : 'speech.download.button')}</button>}
+            </Line>
+          )}
         </Group>
       )}
 
@@ -761,6 +889,21 @@ export function ModelsPane({ status, onToast }: { status: AppStatus; onToast: (m
                   <><ModelProgress dl={dl} /><StopDownload /></>
                 ) : (
                   <button disabled={!!dl} title={dl ? S('win.models.one_at_a_time') : undefined} onClick={() => download(m.id)}>{S(broke ? 'speech.rec.retry' : 'speech.download.button')}</button>
+                )}
+              </Line>
+            );
+          })}
+          {localPolishes.map((m) => {
+            const broke = failed && failedId === m.id;
+            return (
+              <Line key={m.id} icon="wand" title={m.name} badge={m.recommended && !m.installed ? S('models.recommended') : undefined} warn={broke}
+                detail={broke ? `${mb(m.size_mb)} · ${S('win.models.failed_row')}` : dl?.id === m.id ? S('speech.rec.downloading', '').trim() : `${mb(m.size_mb)} · ${S('speech.purpose.polish')}`}>
+                {m.installed ? (
+                  <span className="st-have"><Icon name="check" size={13} />{S('win.models.installed')}</span>
+                ) : dl?.id === m.id ? (
+                  <><ModelProgress dl={dl} /><StopDownload /></>
+                ) : (
+                  <button disabled={!!dl} title={dl ? S('win.models.one_at_a_time') : undefined} onClick={() => downloadPolish(m.id)}>{S(broke ? 'speech.rec.retry' : 'speech.download.button')}</button>
                 )}
               </Line>
             );

@@ -48,9 +48,14 @@ struct Hook {
 }
 
 static HOOK: OnceLock<Hook> = OnceLock::new();
-/// the dictation key is down and nothing else was pressed with it (its release is then masked)
+/// Active trigger key spec: 0 RightAlt, 1 EitherAlt, 2 RightCtrl, 3 RightShift, 4 CtrlWin, 5 CapsLock,
+/// 0x10000|vk Custom(vk), 0xFFFF_FFFF disabled.
+static TRIGGER_SPEC: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// the Alt dictation key is down and nothing else was pressed with it (its release is then masked)
 static ALONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-static RHELD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static ALT_HELD: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static WIN_CHORD_MASK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static SWALLOWED_VK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 /// Esc is Blurt's (a voice note's first seconds, voice.rs): it is reported but never reaches the app in front
 pub static ESC_TAKEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// Esc is Blurt's while a dictation listens (the Mac's Esc hotkey, held from the start to the stop): it cancels the
@@ -60,6 +65,24 @@ pub static ESC_DICTATION: std::sync::atomic::AtomicBool = std::sync::atomic::Ato
 /// The cancel key's modifier (record.dictation.cancel_key): 0 Esc alone, 1 Ctrl+Esc, 2 Shift+Esc — only that Esc is
 /// kept from the app while a dictation listens.
 pub static CANCEL_MODS: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+pub fn set_trigger_key(k: super::trigger::Key, enabled: bool) {
+    use super::trigger::Key;
+    let v = if !enabled {
+        0xFFFF_FFFF
+    } else {
+        match k {
+            Key::RightAlt => 0,
+            Key::EitherAlt => 1,
+            Key::RightCtrl => 2,
+            Key::RightShift => 3,
+            Key::CtrlWin => 4,
+            Key::CapsLock => 5,
+            Key::Custom(vk) => 0x1_0000 | (vk & 0xFFFF),
+        }
+    };
+    TRIGGER_SPEC.store(v, std::sync::atomic::Ordering::SeqCst);
+}
 
 /// The key is down now, as the system says (GetAsyncKeyState; VK_CONTROL 0x11 / VK_SHIFT 0x10 for either side).
 pub fn held(vk: i32) -> bool {
@@ -117,16 +140,56 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
             let up = msg == WM_KEYUP || msg == WM_SYSKEYUP;
             if down || up {
                 use std::sync::atomic::Ordering::SeqCst;
-                let rmenu = k.vkCode == VK_RMENU.0 as u32;
-                if down && rmenu {
-                    if !RHELD.swap(true, SeqCst) {
+                let spec = TRIGGER_SPEC.load(SeqCst);
+                let alt_trig = (spec == 0 && k.vkCode == VK_RMENU.0 as u32)
+                    || (spec == 1 && (k.vkCode == VK_RMENU.0 as u32 || k.vkCode == 0xA4));
+                if down && alt_trig {
+                    let prev = ALT_HELD.load(SeqCst);
+                    if prev == 0 {
+                        ALT_HELD.store(k.vkCode, SeqCst);
                         ALONE.store(true, SeqCst); // a fresh press (not a key repeat) starts alone
+                    } else if prev != k.vkCode {
+                        ALONE.store(false, SeqCst);
                     }
                 } else if down {
                     ALONE.store(false, SeqCst);
-                } else if rmenu {
-                    RHELD.store(false, SeqCst);
+                } else if alt_trig && ALT_HELD.load(SeqCst) == k.vkCode {
+                    ALT_HELD.store(0, SeqCst);
                 }
+
+                // Ctrl + Win chord: track so releasing Win after Ctrl+Win masks the Start menu
+                let is_win = k.vkCode == 0x5B || k.vkCode == 0x5C;
+                let is_ctrl = k.vkCode == 0xA2 || k.vkCode == 0xA3;
+                if spec == 4 && down {
+                    if (is_win && held(0x11)) || (is_ctrl && (held(0x5B) || held(0x5C))) {
+                        WIN_CHORD_MASK.store(true, SeqCst);
+                    } else if !is_win && !is_ctrl {
+                        WIN_CHORD_MASK.store(false, SeqCst);
+                    }
+                }
+
+                // Non-modifier trigger key (`CapsLock` or `Custom(vk)`): swallow when pressed without modifiers
+                let swallow_vk = if spec == 5 {
+                    Some(0x14u32)
+                } else if (spec & 0xFFFF_0000) == 0x1_0000 {
+                    Some(spec & 0xFFFF)
+                } else {
+                    None
+                };
+                let mut eat_non_mod = false;
+                if let Some(svk) = swallow_vk.filter(|&v| v == k.vkCode) {
+                    if down {
+                        if SWALLOWED_VK.load(SeqCst) == svk
+                            || (!held(0x10) && !held(0x11) && !held(0x12) && !held(0x5B) && !held(0x5C))
+                        {
+                            SWALLOWED_VK.store(svk, SeqCst);
+                            eat_non_mod = true;
+                        }
+                    } else if SWALLOWED_VK.swap(0, SeqCst) == svk {
+                        eat_non_mod = true;
+                    }
+                }
+
                 if let Some(h) = HOOK.get() {
                     let _ = h.tx.send(KeyEvent {
                         code: k.vkCode,
@@ -134,12 +197,24 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
                         tick_ms: k.time,
                     });
                 }
-                if rmenu && up && ALONE.swap(false, SeqCst) {
+                if eat_non_mod {
+                    return LRESULT(1);
+                }
+                if alt_trig && up && ALONE.swap(false, SeqCst) {
                     // swallow this release and send mask + release again, so no menu bar opens
                     send_keys(&[
                         (VK_MASK, false, false),
                         (VK_MASK, true, false),
-                        (VK_RMENU.0, true, true),
+                        (k.vkCode as u16, true, k.vkCode == VK_RMENU.0 as u32),
+                    ]);
+                    return LRESULT(1);
+                }
+                if spec == 4 && is_win && up && WIN_CHORD_MASK.swap(false, SeqCst) {
+                    // swallow Win release and send mask + Win release so the Start menu stays shut
+                    send_keys(&[
+                        (VK_MASK, false, false),
+                        (VK_MASK, true, false),
+                        (k.vkCode as u16, true, true),
                     ]);
                     return LRESULT(1);
                 }

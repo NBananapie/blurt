@@ -157,7 +157,7 @@ let current = 'p1';
 // ?models=0: no speech model on this PC yet (Settings' no-model notices)
 const modelsIn = new Set(param('models') === '0' ? [] : ['sensevoice-small']);
 /** dictation's choice in the browser mock: dictation_use / dictation_dashscope_model */
-const mockDict: { use: string | null; ds: string | null } = { use: null, ds: null };
+const mockDict: { use: string | null; ds: string | null; polish: string | null } = { use: null, ds: null, polish: null };
 /** Linux: GNOME's screenshot permission (?shots=1: given before) */
 const mockShots = { allowed: param('shots') === '1' };
 let mdl: { id: string; done: number } | null = null;
@@ -568,6 +568,35 @@ export async function mockInvoke<T>(cmd: string, args: Record<string, any> = {})
     }
     case 'dictation_use':
       mockDict.use = args.id ?? null;
+      return r(undefined);
+    case 'polish_models': {
+      const pModels = [
+        { id: 'gemma4-e2b', name: 'Gemma 4 E2B', size_mb: 3112, installed: modelsIn.has('gemma4-e2b'), recommended: true, local_supported: true },
+        { id: 'qwen3-1.7b', name: 'Qwen3 1.7B', size_mb: 1223, installed: modelsIn.has('qwen3-1.7b'), recommended: false, local_supported: true },
+        { id: 'qwen3-0.6b', name: 'Qwen3 0.6B', size_mb: 462, installed: modelsIn.has('qwen3-0.6b'), recommended: false, local_supported: true },
+      ];
+      const pSel = mockDict.polish === 'off'
+        ? null
+        : mockDict.polish
+          ? (modelsIn.has(mockDict.polish) ? mockDict.polish : null)
+          : (pModels.find((m) => m.installed)?.id ?? null);
+      return r({
+        supported: true,
+        backend: 'gguf',
+        tier: 'pro',
+        recommended: 'gemma4-e2b',
+        configured: mockDict.polish,
+        selected: pSel,
+        downloading: mdl?.id ?? null,
+        models: pModels,
+      });
+    }
+    case 'polish_model_download':
+      if (mdl) throw new Error('a download is already running');
+      mockDownload(args.id);
+      return r(undefined);
+    case 'polish_use':
+      mockDict.polish = args.id ?? null;
       return r(undefined);
     case 'screen_text_allowed':
       return r(mockShots.allowed);

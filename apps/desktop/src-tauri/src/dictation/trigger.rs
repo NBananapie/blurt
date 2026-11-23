@@ -63,6 +63,7 @@
 
 /// Windows virtual-key codes the trigger knows (the sided ones WH_KEYBOARD_LL reports).
 pub mod vk {
+    pub const CAPITAL: u32 = 0x14;
     pub const ESCAPE: u32 = 0x1B;
     pub const LWIN: u32 = 0x5B;
     pub const RWIN: u32 = 0x5C;
@@ -73,6 +74,9 @@ pub mod vk {
     pub const LMENU: u32 = 0xA4;
     pub const RMENU: u32 = 0xA5;
 }
+
+/// Synthetic code representing the Ctrl + Win chord inside `State::Down` and `Remote::Key`.
+pub const CHORD_CTRL_WIN: u32 = 0x1_005B;
 
 // The modifiers held, one bit per physical key (the Mac's flags: device bits for the sides, device-independent masks
 // for "a Shift / a Ctrl is down").
@@ -110,18 +114,48 @@ pub enum Key {
     RightAlt,
     /// either Alt — left or right, whichever is tapped alone
     EitherAlt,
+    /// right Ctrl alone
+    RightCtrl,
+    /// right Shift alone
+    RightShift,
+    /// Ctrl + Win held together (Wispr Flow / Windows Voice Access style chord)
+    CtrlWin,
+    /// Caps Lock alone (Shift + Caps Lock keeps toggling Caps Lock)
+    CapsLock,
+    /// a single non-modifier virtual-key code (`custom:<vk>`, e.g. F8 = 119, F13 = 124, ScrollLock = 145)
+    Custom(u32),
 }
 
 impl Key {
     /// Pickers list the default first.
-    pub const ALL: [Key; 2] = [Key::RightAlt, Key::EitherAlt];
+    pub const ALL: [Key; 6] = [
+        Key::RightAlt,
+        Key::EitherAlt,
+        Key::RightCtrl,
+        Key::CtrlWin,
+        Key::RightShift,
+        Key::CapsLock,
+    ];
 
     /// `record.dictation.key`, in the Mac's words so one settings file reads the same on both: `right_option`,
-    /// `either_option` (`right_alt` / `either_alt` too). `fn`, the Mac's default, is right Alt here.
+    /// `either_option` (`right_alt` / `either_alt` too), plus Windows-native keys (`right_control`, `right_shift`,
+    /// `ctrl_win`, `caps_lock`, `custom:<vk>`). `fn`, the Mac's default, is right Alt here.
     pub fn from_config(s: &str) -> Option<Key> {
+        let s = s.trim();
+        if let Some(rest) = s.strip_prefix("custom:") {
+            let v = rest.trim().parse::<u32>().ok()?;
+            if (0x08..=0xFE).contains(&v) && v != vk::ESCAPE && mod_bit(v).is_none() {
+                return Some(Key::Custom(v));
+            }
+            return None;
+        }
         match s {
             "right_option" | "right_alt" | "fn" => Some(Key::RightAlt),
             "either_option" | "either_alt" => Some(Key::EitherAlt),
+            "right_control" | "right_ctrl" => Some(Key::RightCtrl),
+            "right_shift" => Some(Key::RightShift),
+            "ctrl_win" => Some(Key::CtrlWin),
+            "caps_lock" => Some(Key::CapsLock),
             _ => None,
         }
     }
@@ -130,29 +164,79 @@ impl Key {
         match self {
             Key::RightAlt => "right_option",
             Key::EitherAlt => "either_option",
+            Key::RightCtrl => "right_control",
+            Key::RightShift => "right_shift",
+            Key::CtrlWin => "ctrl_win",
+            Key::CapsLock => "caps_lock",
+            Key::Custom(_) => "custom",
         }
     }
 
-    /// VK_RMENU; VK_LMENU and VK_RMENU
-    pub fn codes(self) -> &'static [u32] {
+    pub fn to_config(self) -> String {
         match self {
-            Key::RightAlt => &[vk::RMENU],
-            Key::EitherAlt => &[vk::LMENU, vk::RMENU],
+            Key::Custom(v) => format!("custom:{v}"),
+            other => other.as_str().to_string(),
         }
     }
 
-    /// The bit that says the key `code` is down.
+    /// Virtual-key codes involved in this trigger key.
+    pub fn codes(self) -> Vec<u32> {
+        match self {
+            Key::RightAlt => vec![vk::RMENU],
+            Key::EitherAlt => vec![vk::LMENU, vk::RMENU],
+            Key::RightCtrl => vec![vk::RCONTROL],
+            Key::RightShift => vec![vk::RSHIFT],
+            Key::CtrlWin => vec![vk::LCONTROL, vk::RCONTROL, vk::LWIN, vk::RWIN],
+            Key::CapsLock => vec![vk::CAPITAL],
+            Key::Custom(v) => vec![v],
+        }
+    }
+
+    /// When the trigger is a non-modifier key (`CapsLock` or `Custom`), its virtual-key code.
+    pub fn non_modifier_vk(self) -> Option<u32> {
+        match self {
+            Key::CapsLock => Some(vk::CAPITAL),
+            Key::Custom(v) => Some(v),
+            _ => None,
+        }
+    }
+
+    /// Human-readable name for a `Custom(vk)` key ("F8", "Scroll Lock", "`").
+    pub fn vk_name(v: u32) -> String {
+        match v {
+            0x70..=0x87 => format!("F{}", v - 0x6F),
+            0x13 => "Pause".into(),
+            0x14 => "Caps Lock".into(),
+            0x2D => "Insert".into(),
+            0x5D => "Menu".into(),
+            0x91 => "Scroll Lock".into(),
+            0x6A => "Num *".into(),
+            0x6B => "Num +".into(),
+            0x6D => "Num -".into(),
+            0x6F => "Num /".into(),
+            0xC0 => "`".into(),
+            0xDB => "[".into(),
+            0xDD => "]".into(),
+            0xDC => "\\".into(),
+            0xBA => ";".into(),
+            0xDE => "'".into(),
+            _ => format!("VK {v}"),
+        }
+    }
+
+    /// The bit that says the modifier key `code` is down.
     fn down_mask(code: u32) -> u32 {
         mod_bit(code).unwrap_or(0)
     }
 
-    /// Other modifiers that make a press of `code` "not alone": Ctrl, Shift, Win and the other Alt.
+    /// Other modifiers that make a press of `code` "not alone".
     fn other_mods(code: u32) -> u32 {
-        let common = M_CTRL | M_SHIFT | M_WIN;
-        if code == vk::LMENU {
-            common | B_RALT
-        } else {
-            common | B_LALT
+        match code {
+            vk::LMENU => M_CTRL | M_SHIFT | M_WIN | B_RALT,
+            vk::RMENU => M_CTRL | M_SHIFT | M_WIN | B_LALT,
+            vk::RCONTROL => M_SHIFT | M_WIN | B_LALT | B_RALT | B_LCTRL,
+            vk::RSHIFT => M_CTRL | M_WIN | B_LALT | B_RALT | B_LSHIFT,
+            _ => M_CTRL | M_SHIFT | M_WIN | B_LALT | B_RALT,
         }
     }
 }
@@ -348,6 +432,8 @@ pub struct DictationTrigger {
     held_miss_said: bool,
     /// the modifiers down (B_* bits), from the key events
     held: u32,
+    /// whether the non-modifier trigger key (`CapsLock` / `Custom`) is currently down (drops auto-repeat)
+    non_mod_held: bool,
 }
 
 impl Default for DictationTrigger {
@@ -400,6 +486,7 @@ impl DictationTrigger {
             quick_stop: false,
             held_miss_said: false,
             held: 0,
+            non_mod_held: false,
         }
     }
 
@@ -547,6 +634,13 @@ impl DictationTrigger {
                 down,
                 time: t,
             } => {
+                if self.key == Key::CtrlWin && code == CHORD_CTRL_WIN {
+                    return if down {
+                        self.key_down_with(CHORD_CTRL_WIN, true, t)
+                    } else {
+                        self.key_up(t)
+                    };
+                }
                 if let Some(bit) = mod_bit(code) {
                     // a modifier's auto-repeat: nothing changed (the Mac's flagsChanged comes only on a change)
                     if down && self.held & bit != 0 {
@@ -558,6 +652,18 @@ impl DictationTrigger {
                         self.held &= !bit;
                     }
                     return self.flags_changed(code, t);
+                }
+                if self.key.non_modifier_vk() == Some(code) {
+                    if down && self.non_mod_held {
+                        return vec![]; // key auto-repeat
+                    }
+                    self.non_mod_held = down;
+                    return if down {
+                        let alone = self.held == 0;
+                        self.key_down_with(code, alone, t)
+                    } else {
+                        self.key_up(t)
+                    };
                 }
                 if !down {
                     return vec![];
@@ -585,14 +691,43 @@ impl DictationTrigger {
 
     /// A modifier changed: the Mac's flagsChanged.
     fn flags_changed(&mut self, code: u32, t: f64) -> Vec<Output> {
-        if code == vk::LSHIFT || code == vk::RSHIFT {
-            return self.shift_changed(self.held & M_SHIFT != 0, t);
+        if self.key == Key::CtrlWin
+            && matches!(code, vk::LCONTROL | vk::RCONTROL | vk::LWIN | vk::RWIN)
+        {
+            let other = self.held & (M_SHIFT | B_LALT | B_RALT) != 0;
+            let both = (self.held & M_CTRL != 0) && (self.held & M_WIN != 0);
+            let was_down = matches!(self.state, State::Down { .. } | State::Holding | State::WaitRelease);
+            if both && !other && !was_down {
+                return self.key_down_with(CHORD_CTRL_WIN, true, t);
+            }
+            if was_down && (!both || other) {
+                if other {
+                    return self.other_input(t);
+                }
+                return self.key_up(t);
+            }
+            // while hands-free dictating (`State::Idle`), lone Ctrl still toggles Translate until Win joins
+            if self.active
+                && self.state == State::Idle
+                && (code == vk::LCONTROL || code == vk::RCONTROL)
+                && (self.held & M_WIN == 0)
+            {
+                return self.command_changed(self.held & M_CTRL != 0, t);
+            }
+            return vec![];
         }
-        if (code == vk::LCONTROL || code == vk::RCONTROL)
+        // Shift toggles Structured, except when RightShift IS the dictation key (then only LSHIFT toggles Style)
+        if code == vk::LSHIFT || (code == vk::RSHIFT && self.key != Key::RightShift) {
+            let mask = if self.key == Key::RightShift { B_LSHIFT } else { M_SHIFT };
+            return self.shift_changed(self.held & mask != 0, t);
+        }
+        // Ctrl toggles Translate, except when RightCtrl IS the dictation key (then only LCONTROL toggles Translate)
+        if (code == vk::LCONTROL || (code == vk::RCONTROL && self.key != Key::RightCtrl))
             && self.active
             && (self.state == State::Holding || self.state == State::Idle)
         {
-            return self.command_changed(self.held & M_CTRL != 0, t);
+            let mask = if self.key == Key::RightCtrl { B_LCTRL } else { M_CTRL };
+            return self.command_changed(self.held & mask != 0, t);
         }
         if self.key.codes().contains(&code) {
             // either Alt: the other side going down or up while one is held is another key, not this one
@@ -632,6 +767,11 @@ impl DictationTrigger {
     }
 
     fn key_down(&mut self, code: u32, t: f64) -> Vec<Output> {
+        let alone = self.held & Key::other_mods(code) == 0;
+        self.key_down_with(code, alone, t)
+    }
+
+    fn key_down_with(&mut self, code: u32, alone: bool, t: f64) -> Vec<Output> {
         if self.state == State::Holding || self.state == State::WaitRelease {
             return vec![]; // a repeat of what we know
         }
@@ -640,7 +780,6 @@ impl DictationTrigger {
                 return vec![]; // the same press reported again
             }
         }
-        let alone = self.held & Key::other_mods(code) == 0;
         self.state = State::Down {
             at: t,
             clean: alone,
@@ -1017,6 +1156,17 @@ impl DictationTrigger {
                         });
                         continue;
                     }
+                    if let Some(c) = name
+                        .strip_prefix("key-up:")
+                        .and_then(|c| c.parse::<u32>().ok())
+                    {
+                        out.push(Event::Key {
+                            code: c,
+                            down: false,
+                            time: t,
+                        });
+                        continue;
+                    }
                     let mp: Vec<&str> = name.split('-').collect();
                     let [m, dir] = mp[..] else { continue };
                     let code = match m {
@@ -1028,6 +1178,7 @@ impl DictationTrigger {
                         "rctrl" => vk::RCONTROL,
                         "win" => vk::LWIN,
                         "rwin" => vk::RWIN,
+                        "caps" => vk::CAPITAL,
                         _ => continue,
                     };
                     out.push(Event::Key {
@@ -2347,5 +2498,55 @@ mod tests {
         assert_eq!(t.run("ctrl-down@1000 ctrl-up@1080"), [Translate]);
         assert_eq!(t.run("shift-down@2000 shift-up@2080"), []);
         assert_eq!(t.run("shift-down@2200 shift-up@2280"), [Style]);
+    }
+
+    #[test]
+    fn windows_flexible_keys() {
+        // Right Ctrl: triggers alone, left Ctrl still toggles Translate while Right Ctrl stops the take
+        let mut t = DictationTrigger::new(Key::RightCtrl, Mode::Auto);
+        assert_eq!(t.run("rctrl-down@0 rctrl-up@100"), [Arm, Start]);
+        assert_eq!(t.run("ctrl-down@500 ctrl-up@580"), [Translate]);
+        assert_eq!(t.run("rctrl-down@1500 rctrl-up@1580"), [Stop]);
+
+        // Right Shift: triggers alone, left Shift still toggles Style while Right Shift stops the take
+        let mut t = DictationTrigger::new(Key::RightShift, Mode::Auto);
+        assert_eq!(t.run("rshift-down@0 rshift-up@100"), [Arm, Start]);
+        assert_eq!(t.run("shift-down@500 shift-up@580"), [Style]);
+        assert_eq!(t.run("rshift-down@1500 rshift-up@1580"), [Stop]);
+
+        // Ctrl + Win chord: tap, hold, and double-tap send
+        let mut t = DictationTrigger::new(Key::CtrlWin, Mode::Auto);
+        assert_eq!(
+            t.run("ctrl-down@0 win-down@20 win-up@100 ctrl-up@120"),
+            [Arm, Start]
+        );
+        assert_eq!(
+            t.run("ctrl-down@1000 win-down@1020 win-up@1100 ctrl-up@1120"),
+            [Stop]
+        );
+        // double-tap right after stop sends Return
+        assert_eq!(
+            t.run("ctrl-down@1250 win-down@1270 win-up@1330 ctrl-up@1350"),
+            [Send]
+        );
+
+        // Caps Lock alone triggers; Shift + Caps Lock does not
+        assert_eq!(
+            run_with("shift-down@0 caps-down@20 caps-up@90 shift-up@110", Key::CapsLock, Mode::Auto),
+            []
+        );
+        assert_eq!(
+            run_with("caps-down@0 caps-up@90 caps-down@1500 caps-up@1580", Key::CapsLock, Mode::Auto),
+            [Arm, Start, Stop]
+        );
+
+        // Custom function key (F8 = 119): auto-repeat ignored, tap starts and stops
+        assert_eq!(Key::from_config("custom:119"), Some(Key::Custom(119)));
+        assert_eq!(Key::Custom(119).to_config(), "custom:119");
+        assert_eq!(Key::vk_name(119), "F8");
+        assert_eq!(
+            run_with("key:119@0 key:119@40 key-up:119@100 key:119@1500 key-up:119@1580", Key::Custom(119), Mode::Auto),
+            [Arm, Start, Stop]
+        );
     }
 }

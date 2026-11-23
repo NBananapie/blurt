@@ -285,6 +285,24 @@ export interface DictationModels {
   /** cloud recognition may be offered (Privacy: recognition not kept on this computer) */
   cloud_allowed?: boolean;
 }
+export interface PolishModel {
+  id: string;
+  name: string;
+  size_mb: number;
+  installed: boolean;
+  recommended: boolean;
+  local_supported?: boolean;
+}
+export interface PolishModels {
+  supported: boolean;
+  backend?: string | null;
+  tier?: string;
+  recommended: string | null;
+  configured?: string | null;
+  selected: string | null;
+  downloading?: string | null;
+  models: PolishModel[];
+}
 export interface ModelDownload {
   id: string;
   state: 'running' | 'done' | 'failed';
@@ -434,13 +452,16 @@ export const api = {
   dictationModels: () => invoke<DictationModels>('dictation_models'),
   modelDownload: (id: string) => invoke<void>('model_download', { id }),
   dictationUse: (id: string | null) => invoke<void>('dictation_use', { id }),
+  polishModels: () => invoke<PolishModels>('polish_models'),
+  polishModelDownload: (id: string) => invoke<void>('polish_model_download', { id }),
+  polishUse: (id: string | null) => invoke<void>('polish_use', { id }),
   /** Linux: GNOME's screenshot question for Copy Text from Screen, asked with Blurt in front */
   screenTextAllow: () => invoke<{ ok: boolean; code?: string; error?: string }>('screen_text_allow'),
   screenTextAllowed: () => invoke<boolean>('screen_text_allowed'),
   /** dictation on Model Studio with this measured speech model (null: Qwen3-ASR Flash) */
   dictationDashscopeModel: (model: string | null) => invoke<void>('dictation_dashscope_model', { model }),
   /** the dictation key pressed in Blurt's own window: the key hook doesn't hear those (engine.rs `forward_key`) */
-  dictationKey: (code: string, down: boolean) => invoke<void>('dictation_key_forward', { code, down }),
+  dictationKey: (code: string, down: boolean, vk?: number) => invoke<void>('dictation_key_forward', { code, down, vk: vk ?? null }),
   dictationHistory: () => invoke<DictationHistory>('dictation_history'),
   dictationEdit: (edit: DictationEdit) => invoke<{ ok: boolean; deleted?: DictationEntry[] }>('dictation_history_edit', { edit }),
   dictationItem: (id: string, project: string | null, lang: string) =>

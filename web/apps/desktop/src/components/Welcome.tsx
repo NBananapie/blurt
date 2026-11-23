@@ -18,7 +18,7 @@ import { Icon, Mascot, type IconName } from '@blurt/icons';
 import { api, listen, type CloudSummary, type HotkeyRow, type LoginItem, type MicState, type Onboarding } from '../api';
 import { i18n, t } from '../i18n';
 import { Popup } from '../settings/kit';
-import { AddCloudModel, AddSpeechCloud, dictateInCloud, speechOffers, useCurated } from './DictationSettings';
+import { AddCloudModel, AddSpeechCloud, BUILTIN_DICTATION_KEYS, dictateInCloud, dictationKeyLabel, normDictationKey, speechOffers, useCurated } from './DictationSettings';
 import { mb, ModelProgress, useDictationModels } from './ModelDownload';
 
 export type StepId = 'welcome' | 'dictation' | 'models' | 'try';
@@ -187,10 +187,19 @@ export function Welcome({ onb: initial, firstRun, onDone, onToast, onSettings }:
   // [data-key-probe] and doesn't pass it on, so no take starts and the island stays out of the way
   useEffect(() => {
     if (step !== 'dictation') return;
-    const either = onb.dictation.key === 'either_option';
+    const dk = normDictationKey(onb.dictation.key);
     const on = (e: KeyboardEvent) => {
-      if (e.code !== 'AltRight' && !(either && e.code === 'AltLeft')) return;
       if ((e.target as HTMLElement | null)?.closest?.('.mw-menu')) return;
+      const vk = e.keyCode || e.which;
+      const match =
+        (dk === 'right_option' && e.code === 'AltRight') ||
+        (dk === 'either_option' && (e.code === 'AltRight' || e.code === 'AltLeft')) ||
+        (dk === 'right_control' && e.code === 'ControlRight') ||
+        (dk === 'right_shift' && e.code === 'ShiftRight') ||
+        (dk === 'caps_lock' && e.code === 'CapsLock') ||
+        (dk === 'ctrl_win' && e.ctrlKey && e.metaKey) ||
+        (dk.startsWith('custom:') && vk === Number(dk.slice(7)));
+      if (!match) return;
       const down = e.type === 'keydown';
       setKeyDown(down);
       if (down) setHeard(true);
@@ -260,8 +269,9 @@ export function Welcome({ onb: initial, firstRun, onDone, onToast, onSettings }:
     if (step === 'try') pressedHere.current = false;
   }, [step]);
 
-  const keyName = t(onb.dictation.key === 'either_option' ? 'dictation.key.either_alt' : 'dictation.key.right_alt');
-  const keyCaps = [onb.dictation.key === 'either_option' ? 'Alt' : t('dictation.key.right_alt')];
+  const dk = normDictationKey(onb.dictation.key);
+  const keyName = dk === 'either_option' ? t('dictation.key.either_alt') : dk === 'right_option' ? t('dictation.key.right_alt') : dictationKeyLabel(dk);
+  const keyCaps = dk === 'either_option' ? ['Alt'] : dk === 'ctrl_win' ? ['Ctrl', 'Win'] : [keyName];
   const mode = ['auto', 'tap', 'hold'].includes(onb.dictation.mode) ? onb.dictation.mode : 'auto';
   const micBlocked = !!mic?.supported && (!mic.device || mic.access === 'denied');
 
@@ -362,8 +372,11 @@ export function Welcome({ onb: initial, firstRun, onDone, onToast, onSettings }:
     <div className="wl-rows">
       <Row icon="text-cursor" first title={t('welcome.key.title')} detail={t(`welcome.gesture.${mode}`)} testid="welcome-key">
         {/* the key, chosen here (the Mac's ChoicePopup on this step) */}
-        <Popup label={t('welcome.key.title')} value={onb.dictation.key === 'either_option' ? 'either_option' : 'right_option'}
-          choices={[['right_option', t('dictation.key.right_alt')], ['either_option', t('dictation.key.either_alt')]]}
+        <Popup label={t('welcome.key.title')} value={dk}
+          choices={[
+            ...BUILTIN_DICTATION_KEYS.map((k) => [k, k === 'right_option' ? t('dictation.key.right_alt') : k === 'either_option' ? t('dictation.key.either_alt') : dictationKeyLabel(k)] as [string, string]),
+            ...(dk.startsWith('custom:') ? [[dk, dictationKeyLabel(dk)] as [string, string]] : []),
+          ]}
           hints={[undefined, t('welcome.key.either_hint')]} onChange={setKey} />
       </Row>
       {/* the check: a row of its own (the Mac's "Fn key in macOS" row), its status at the trailing edge */}

@@ -32,6 +32,8 @@ pub static ESC_DICTATION: AtomicBool = AtomicBool::new(false);
 /// The cancel key's modifier (record.dictation.cancel_key): 0 Esc alone, 1 Ctrl+Esc, 2 Shift+Esc.
 pub static CANCEL_MODS: AtomicU8 = AtomicU8::new(0);
 
+pub fn set_trigger_key(_k: super::trigger::Key, _enabled: bool) {}
+
 static TX: OnceLock<Mutex<Sender<KeyEvent>>> = OnceLock::new();
 /// "evdev" | "portal"
 static MODE: Mutex<&'static str> = Mutex::new("portal");
