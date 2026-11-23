@@ -426,10 +426,14 @@ dependencies = [
 name = "blurt-capture"
 version = "0.1.0"
 dependencies = [
+ "chrono",
+ "cpal",
  "gtk",
+ "png 0.17.16",
  "serde",
  "serde_json",
  "tauri",
+ "windows 0.62.2",
 ]
 
 [[package]]

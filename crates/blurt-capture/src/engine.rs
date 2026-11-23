@@ -184,20 +184,61 @@ struct Shared {
     stderr: VecDeque<String>,
 }
 
-/// A running `record.py` take. Dropping it while it records sends `stop` (the take is kept, never lost).
+/// A running `record.py` or native WGC take. Dropping it while it records sends `stop` (the take is kept, never lost).
 pub struct CaptureHandle {
     child: Option<Child>,
+    #[cfg(windows)]
+    native: Option<crate::wgc_win::NativeSession>,
     session: PathBuf,
     shared: Arc<Mutex<Shared>>,
     readers: Vec<JoinHandle<()>>,
 }
 
-/// Spawns the recorder. `on_event` is called from a reader thread for every status line, in order.
+/// Spawns the recorder (native WGC + Media Foundation on Windows, with automatic fallback to `record.py --engine ffmpeg`).
+/// `on_event` is called from a worker/reader thread for every status line, in order.
 pub fn start(opts: &CaptureOptions, on_event: impl FnMut(&StatusEvent) + Send + 'static) -> Result<CaptureHandle, CaptureError> {
     std::fs::create_dir_all(&opts.session)?;
     let session = std::fs::canonicalize(&opts.session)?;
     let mut opts = opts.clone();
     opts.session = session.clone();
+    let shared = Arc::new(Mutex::new(Shared { state: Some(CaptureState::Starting), ..Default::default() }));
+    let listener: Arc<Mutex<Listener>> = Arc::new(Mutex::new(Box::new(on_event)));
+
+    #[cfg(windows)]
+    if crate::wgc_win::should_use_native(&opts) {
+        let sh = shared.clone();
+        let cb = listener.clone();
+        let emit = Box::new(move |ev: StatusEvent| {
+            {
+                let mut s = sh.lock().unwrap();
+                match &ev {
+                    StatusEvent::Started { .. } | StatusEvent::Resumed { .. } => s.state = Some(CaptureState::Recording),
+                    StatusEvent::Paused { .. } => s.state = Some(CaptureState::Paused),
+                    e if e.is_final() => {
+                        s.state = Some(CaptureState::Finished);
+                        s.last_final = Some(e.clone());
+                    }
+                    _ => {}
+                }
+            }
+            (cb.lock().unwrap())(&ev);
+        });
+        match crate::wgc_win::start_native(&opts, emit) {
+            Ok(native) => {
+                return Ok(CaptureHandle {
+                    child: None,
+                    native: Some(native),
+                    session,
+                    shared,
+                    readers: Vec::new(),
+                });
+            }
+            Err(e) => {
+                eprintln!("blurt-capture: native WGC unavailable ({e}); falling back to ffmpeg");
+            }
+        }
+    }
+
     let mut cmd = Command::new(&opts.launcher.program);
     cmd.args(opts.args())
         .envs(opts.env.iter().map(|(k, v)| (k, v)))
@@ -213,11 +254,10 @@ pub fn start(opts: &CaptureOptions, on_event: impl FnMut(&StatusEvent) + Send + 
         cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW: no console flashing up
     }
     let mut child = cmd.spawn()?;
-    let shared = Arc::new(Mutex::new(Shared { state: Some(CaptureState::Starting), ..Default::default() }));
     let stdout = child.stdout.take().expect("piped");
     let stderr = child.stderr.take().expect("piped");
-    let mut listener: Listener = Box::new(on_event);
     let sh = shared.clone();
+    let cb = listener.clone();
     let out_reader = thread::spawn(move || {
         for line in BufReader::new(stdout).lines() {
             let Ok(line) = line else { break };
@@ -234,7 +274,7 @@ pub fn start(opts: &CaptureOptions, on_event: impl FnMut(&StatusEvent) + Send + 
                     _ => {}
                 }
             }
-            listener(&ev);
+            (cb.lock().unwrap())(&ev);
         }
     });
     let sh = shared.clone();
@@ -248,7 +288,14 @@ pub fn start(opts: &CaptureOptions, on_event: impl FnMut(&StatusEvent) + Send + 
             }
         }
     });
-    Ok(CaptureHandle { child: Some(child), session, shared, readers: vec![out_reader, err_reader] })
+    Ok(CaptureHandle {
+        child: Some(child),
+        #[cfg(windows)]
+        native: None,
+        session,
+        shared,
+        readers: vec![out_reader, err_reader],
+    })
 }
 
 impl CaptureHandle {
@@ -257,6 +304,10 @@ impl CaptureHandle {
     }
 
     pub fn pid(&self) -> Option<u32> {
+        #[cfg(windows)]
+        if self.native.is_some() {
+            return Some(std::process::id());
+        }
         self.child.as_ref().map(|c| c.id())
     }
 
@@ -292,13 +343,32 @@ impl CaptureHandle {
         self.send("discard")
     }
 
-    /// The recorder process has exited.
+    /// The recorder has exited.
     pub fn is_finished(&mut self) -> bool {
+        #[cfg(windows)]
+        if let Some(n) = &self.native {
+            return n.is_finished();
+        }
         !matches!(self.child.as_mut().map(|c| c.try_wait()), Some(Ok(None)))
     }
 
     /// Waits for the recorder to exit; returns its final line (`Stopped` / `Discarded` / `Error`).
     pub fn wait(&mut self, timeout: Duration) -> Result<StatusEvent, CaptureError> {
+        #[cfg(windows)]
+        if let Some(mut n) = self.native.take() {
+            if !n.wait(timeout) {
+                self.native = Some(n);
+                return Err(CaptureError::Timeout);
+            }
+            for r in self.readers.drain(..) {
+                let _ = r.join();
+            }
+            let s = self.shared.lock().unwrap();
+            return match &s.last_final {
+                Some(e) => Ok(e.clone()),
+                None => Err(CaptureError::Recorder("native WGC ended without final status".into())),
+            };
+        }
         let t0 = Instant::now();
         let child = self.child.as_mut().ok_or(CaptureError::Timeout)?;
         loop {
@@ -334,6 +404,11 @@ impl CaptureHandle {
 
     /// Hard stop (the take is lost); for a recorder that no longer reacts.
     pub fn kill(&mut self) -> io::Result<()> {
+        #[cfg(windows)]
+        if let Some(mut n) = self.native.take() {
+            n.kill();
+            return Ok(());
+        }
         match self.child.as_mut() {
             Some(c) => c.kill(),
             None => Ok(()),

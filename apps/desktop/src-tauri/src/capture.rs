@@ -293,7 +293,13 @@ impl Capture {
         let record_py = runner.scripts.as_ref().map(|d| d.join("record.py")).filter(|p| p.is_file()).ok_or("scripts")?;
         let launcher = match &runner.uv {
             Some(uv) => Launcher::uv(uv, &record_py),
-            None => Launcher::detect(&record_py).ok_or("uv")?,
+            None => match Launcher::detect(&record_py) {
+                Some(l) => l,
+                #[cfg(windows)]
+                None => Launcher::python("python", &record_py),
+                #[cfg(not(windows))]
+                None => return Err("uv".into()),
+            },
         };
         let cfg = overlay_config();
         let region = if pick && region.is_none() {

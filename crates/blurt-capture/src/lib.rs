@@ -13,6 +13,8 @@
 pub mod engine;
 pub mod region;
 pub mod status;
+#[cfg(windows)]
+pub mod wgc_win;
 
 #[cfg(feature = "overlay")]
 pub mod overlay;
