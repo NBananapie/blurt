@@ -25,10 +25,28 @@ pub static READY: Mutex<Option<bool>> = Mutex::new(None);
 
 /// `dictation-models`' last answer: what Download… gets, whether a weaker model ran, whether the pick is a cloud one.
 pub static MODELS: Mutex<Option<Value>> = Mutex::new(None);
+/// Local polish model is available and selected on this PC (None: not known yet).
+pub static POLISH_READY: Mutex<Option<bool>> = Mutex::new(None);
+/// `polish.py models`' last answer.
+pub static POLISH_MODELS: Mutex<Option<Value>> = Mutex::new(None);
 
 fn remember_models(v: &Value) {
     *READY.lock().unwrap() = Some(v["ready"] == json!(true));
     *MODELS.lock().unwrap() = Some(v.clone());
+}
+
+fn remember_polish_models(v: &Value) {
+    let ok = v["supported"] == json!(true)
+        && v["selected"].as_str().is_some_and(|s| !s.is_empty());
+    *POLISH_READY.lock().unwrap() = Some(ok);
+    *POLISH_MODELS.lock().unwrap() = Some(v.clone());
+}
+
+/// Ask `polish.py models` and remember whether local GPU polish can run on this PC.
+pub fn refresh_polish_ready(runner: &crate::scripts::Runner) {
+    if let Ok(v) = runner.run("polish.py", &["models".into()], None, Duration::from_secs(60)) {
+        remember_polish_models(&v);
+    }
 }
 
 /// Ask `dictation-models` (a `uv run`, ~1 s) and remember whether a dictation can run. The cloud speech keys go with
@@ -80,6 +98,7 @@ pub fn model_download_cancel() -> bool {
     let Some(mut c) = DL_PROC.lock().unwrap().take() else { return false };
     scripts::kill_tree(&mut c);
     clean_partial(&crate::paths::blurt_home().join("models"));
+    clean_partial(&crate::paths::blurt_home().join("bin"));
     true
 }
 
@@ -290,6 +309,190 @@ fn restart_asr() {
     let _ = server::call(server::ASR, &json!({"cmd": "exit"}), Duration::from_secs(2), None);
 }
 
+#[tauri::command(async)]
+pub fn polish_models(state: tauri::State<'_, AppState>) -> R<Value> {
+    let mut v = state
+        .runner()
+        .run("polish.py", &["models".into()], None, Duration::from_secs(60))
+        .map_err(String::from)?;
+    remember_polish_models(&v);
+    v["downloading"] = json!(DOWNLOADING.lock().unwrap().clone());
+    Ok(v)
+}
+
+/// Start downloading a local polish model (`polish.py setup --model <id>`); emits `model-download` events.
+#[tauri::command]
+pub fn polish_model_download(app: AppHandle, id: String) -> R<()> {
+    {
+        let mut d = DOWNLOADING.lock().unwrap();
+        if d.is_some() {
+            return Err("a download is already running".into());
+        }
+        *d = Some(id.clone());
+    }
+    let runner = app.state::<AppState>().runner();
+    let argv = match runner.argv(
+        "polish.py",
+        &[
+            "setup".into(),
+            "--model".into(),
+            id.clone(),
+            "--parent".into(),
+            std::process::id().to_string(),
+        ],
+    ) {
+        Ok(a) => a,
+        Err(e) => {
+            *DOWNLOADING.lock().unwrap() = None;
+            return Err(e.message);
+        }
+    };
+    let promised = POLISH_MODELS
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|v| v["models"].as_array().cloned())
+        .and_then(|ms| ms.iter().find(|m| m["id"] == json!(id)).and_then(|m| m["size_mb"].as_f64()))
+        .unwrap_or(0.0);
+    std::thread::spawn(move || {
+        let mut c = scripts::daemon_command(&argv);
+        c.stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let emit = |state: &str, done: f64, total: f64, msg: Option<String>| {
+            let total = if total > 0.0 { total.max(promised) } else { total };
+            *PROGRESS.lock().unwrap() = (state == "running" && total > 0.0).then_some((done, total));
+            let _ = app.emit(
+                "model-download",
+                json!({"id": id, "state": state, "done_mb": done, "total_mb": total, "message": msg}),
+            );
+        };
+        let mut last_err = String::new();
+        emit("running", 0.0, 0.0, None);
+        let ok = match c.spawn() {
+            Ok(mut ch) => {
+                let err_pipe = ch.stderr.take();
+                let out_pipe = ch.stdout.take();
+                *DL_PROC.lock().unwrap() = Some(ch);
+                if let Some(err) = err_pipe {
+                    for line in BufReader::new(err).lines().map_while(Result::ok) {
+                        if !line.trim().is_empty() && !line.trim().ends_with("MB") {
+                            last_err = line.trim().chars().take(300).collect();
+                        }
+                        if let Some((a, b)) = line
+                            .trim()
+                            .strip_suffix("MB")
+                            .and_then(|x| x.trim().split_once('/'))
+                        {
+                            if let (Ok(d), Ok(t)) = (a.trim().parse::<f64>(), b.trim().parse::<f64>()) {
+                                emit("running", d, t, None);
+                            }
+                        }
+                    }
+                }
+                let mut out = String::new();
+                if let Some(mut o) = out_pipe {
+                    use std::io::Read;
+                    let _ = o.read_to_string(&mut out);
+                }
+                let Some(mut ch) = DL_PROC.lock().unwrap().take() else {
+                    *DOWNLOADING.lock().unwrap() = None;
+                    emit("stopped", 0.0, 0.0, None);
+                    return;
+                };
+                let st = ch.wait().map(|s| s.success()).unwrap_or(false);
+                st && out
+                    .lines()
+                    .last()
+                    .and_then(|l| serde_json::from_str::<Value>(l).ok())
+                    .is_some_and(|v| v["ok"] == json!(true))
+            }
+            Err(e) => {
+                last_err = e.to_string();
+                false
+            }
+        };
+        *DOWNLOADING.lock().unwrap() = None;
+        if !ok {
+            eprintln!("blurt: polish model download failed: {last_err}");
+        }
+        emit(
+            if ok { "done" } else { "failed" },
+            0.0,
+            0.0,
+            (!ok && !last_err.is_empty()).then(|| last_err.clone()),
+        );
+        if ok {
+            refresh_polish_ready(&app.state::<AppState>().runner());
+            let _ = server::call(
+                server::POLISH,
+                &json!({"cmd": "exit"}),
+                Duration::from_secs(2),
+                None,
+            );
+        }
+    });
+    Ok(())
+}
+
+/// Use this local model for dictation polish and translation (`None`: Automatic, `Some("off")`: off/cloud-only).
+#[tauri::command]
+pub fn polish_use(id: Option<String>) -> R<()> {
+    let mut d = settings::read_config()
+        .pointer("/record/dictation")
+        .cloned()
+        .filter(Value::is_object)
+        .unwrap_or(json!({}));
+    match &id {
+        Some(i) => d["polish_model"] = json!(i),
+        None => {
+            d.as_object_mut().map(|o| o.remove("polish_model"));
+        }
+    }
+    settings::merge(json!({"record": {"dictation": d}}))?;
+    if let Some(v) = POLISH_MODELS.lock().unwrap().as_mut() {
+        let supported = v["supported"] == json!(true);
+        let sel = match id.as_deref() {
+            Some("off") => None,
+            Some(m) => v["models"]
+                .as_array()
+                .and_then(|ms| ms.iter().find(|x| x["id"] == json!(m) && x["installed"] == json!(true)))
+                .map(|_| m.to_string()),
+            None => {
+                let rec = v["recommended"].as_str().map(String::from);
+                rec.filter(|r| {
+                    v["models"]
+                        .as_array()
+                        .is_some_and(|ms| ms.iter().any(|x| x["id"] == json!(r) && x["installed"] == json!(true)))
+                })
+                .or_else(|| {
+                    v["models"].as_array().and_then(|ms| {
+                        ms.iter()
+                            .find(|x| x["installed"] == json!(true) && x["local_supported"] == json!(true))
+                            .and_then(|x| x["id"].as_str().map(String::from))
+                    })
+                })
+            }
+        };
+        v["configured"] = match &id {
+            Some(i) => json!(i),
+            None => Value::Null,
+        };
+        v["selected"] = match &sel {
+            Some(s) => json!(s),
+            None => Value::Null,
+        };
+        *POLISH_READY.lock().unwrap() = Some(supported && sel.is_some());
+    }
+    let _ = server::call(
+        server::POLISH,
+        &json!({"cmd": "exit"}),
+        Duration::from_secs(2),
+        None,
+    );
+    Ok(())
+}
+
 #[tauri::command]
 pub fn cloud_summary() -> Value {
     cloud::summary()
@@ -421,20 +624,29 @@ pub(crate) fn cloud_check(app: &AppHandle, preset: &str, key: &str, base_url: Op
     .ok_or_else(|| "no answer".into())
 }
 
-/// The dictation key seen by Blurt's own window (App.tsx): "AltRight" / "AltLeft" (engine.rs `forward_key`).
+/// The dictation key seen by Blurt's own window (App.tsx): DOM `code` and optional Win32 `vk` (`keyCode`).
 #[tauri::command]
-pub fn dictation_key_forward(code: String, down: bool) {
+pub fn dictation_key_forward(code: String, down: bool, vk: Option<u32>) {
     #[cfg(dict)]
     {
-        let vk = match code.as_str() {
-            "AltRight" => 0xA5,
-            "AltLeft" => 0xA4,
-            _ => return,
+        let mapped = match code.as_str() {
+            "AltRight" => Some(0xA5),
+            "AltLeft" => Some(0xA4),
+            "ControlRight" => Some(0xA3),
+            "ControlLeft" => Some(0xA2),
+            "ShiftRight" => Some(0xA1),
+            "ShiftLeft" => Some(0xA0),
+            "MetaLeft" => Some(0x5B),
+            "MetaRight" => Some(0x5C),
+            "CapsLock" => Some(0x14),
+            _ => vk.filter(|&v| (0x08..=0xFE).contains(&v)),
         };
-        super::engine::forward_key(vk, down);
+        if let Some(v) = mapped {
+            super::engine::forward_key(v, down);
+        }
     }
     #[cfg(not(dict))]
-    let _ = (code, down);
+    let _ = (code, down, vk);
 }
 
 // ------------------------------------------------------------------ the word list, the microphone

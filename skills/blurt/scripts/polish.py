@@ -55,14 +55,24 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 import dictation_vocab as vocab  # noqa: E402
 from _common import (BLURT_HOME, MODELS_DIR, SERVE_IDLE, global_config, landed_in, load_json, progress_line,  # noqa: E402
-                     save_config_if_readable, save_json, server_exit, serve_exit_reason, serve_said)
+                     save_config_if_readable, save_json, server_exit, serve_exit_reason, serve_said, use_system_certs)
 from _common import (begin_download, download_lock, download_path, end_download, fetch, folder_complete,  # noqa: E402
                      safetensors_complete, watch_parent)
+
+use_system_certs()
 
 HERE = Path(__file__).parent
 RUN_DIR = BLURT_HOME / "run"
 SERVE_FILE = RUN_DIR / "polish-serve.json"
 POLISH_DIR = MODELS_DIR / "polish"
+GGUF_DIR = MODELS_DIR / "polish-gguf"
+LLAMA_TAG = "b12377"
+LLAMA_BINS = {
+    ("win32", True): (f"llama-{LLAMA_TAG}-bin-win-vulkan-x64.zip", "0162ff9acc36ef88575d673e56e16673f455fb685fea1857c96fb57dd4831ff7"),
+    ("win32", False): (f"llama-{LLAMA_TAG}-bin-win-cpu-x64.zip", "d3b60c5abbe3a131c77e568310547492438bc7c785721eb765d2d817fe4424c5"),
+    ("linux", True): (f"llama-{LLAMA_TAG}-bin-ubuntu-vulkan-x64.tar.gz", "e685f1a7217a98de6a35b11d400e1412767efbc7bfe5831396c9b84496ede410"),
+    ("linux", False): (f"llama-{LLAMA_TAG}-bin-ubuntu-x64.tar.gz", "93713f6bf0ff11e8bc55e64fd14b2415fd8accd3e6f8aecf6e218973b625becd"),
+}
 MLX_PACKAGE = "mlx-lm==0.32.2"   # pinned (arch101): bumped on purpose, per release
 DEFAULT_TIMEOUT = 3.0
 
@@ -919,10 +929,127 @@ def dictation_config() -> dict:
     return d if isinstance(d, dict) else {}
 
 
-def supported() -> bool:
+def is_mlx() -> bool:
     """MLX: Apple Silicon only."""
     import platform
     return sys.platform == "darwin" and platform.machine() == "arm64"
+
+
+def is_gguf() -> bool:
+    """llama.cpp (Vulkan / CPU): Windows and Linux x86_64."""
+    import platform
+    return (sys.platform == "win32" or sys.platform.startswith("linux")) and platform.machine().lower() in ("amd64", "x86_64")
+
+
+def supported() -> bool:
+    """Local polish runs on Apple Silicon (MLX) and on Windows / Linux x64 (llama.cpp Vulkan / CPU)."""
+    return is_mlx() or is_gguf()
+
+
+def _has_vulkan() -> bool:
+    if os.environ.get("BLURT_NO_VULKAN") == "1":
+        return False
+    if sys.platform == "win32":
+        sysroot = Path(os.environ.get("SystemRoot") or r"C:\Windows")
+        return (sysroot / "System32" / "vulkan-1.dll").is_file()
+    if sys.platform.startswith("linux"):
+        import ctypes.util
+        return ctypes.util.find_library("vulkan") is not None
+    return False
+
+
+def _llama_dir(vulkan: bool | None = None) -> Path:
+    vk = _has_vulkan() if vulkan is None else vulkan
+    kind = "vulkan" if vk else "cpu"
+    home = Path(os.environ.get("BLURT_HOME") or BLURT_HOME)
+    return home / "bin" / "llama-cpp" / f"{LLAMA_TAG}-{kind}"
+
+
+def find_llama_server(vulkan: bool | None = None) -> Path | None:
+    exe = "llama-server.exe" if os.name == "nt" else "llama-server"
+    for vk in ([vulkan] if vulkan is not None else ([True, False] if _has_vulkan() else [False])):
+        d = _llama_dir(vk)
+        if d.is_dir():
+            hit = next(d.rglob(exe), None)
+            if hit and hit.is_file():
+                return hit
+    return None
+
+
+def _sha256_file(path: Path) -> str:
+    import hashlib
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        while chunk := fh.read(1 << 20):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def ensure_llama_server(vulkan: bool | None = None) -> Path:
+    """Ensure the pinned, SHA-256 verified llama-server binary is installed under $BLURT_HOME/bin/llama-cpp."""
+    vk = _has_vulkan() if vulkan is None else vulkan
+    found = find_llama_server(vk)
+    if found:
+        return found
+    if os.environ.get("BLURT_NO_DOWNLOAD"):
+        raise Fail("llama-server runtime is not downloaded (run polish.py setup --model ID)", "model_missing")
+    os_key = "win32" if sys.platform == "win32" else "linux"
+    fname, want_sha = LLAMA_BINS[(os_key, vk)]
+    dest = _llama_dir(vk)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    archive = dest.parent / fname
+    tmp = archive.with_name(fname + ".part")
+    url = f"https://github.com/ggml-org/llama.cpp/releases/download/{LLAMA_TAG}/{fname}"
+    urls = [f"https://ghfast.top/{url}", url] if mirror_on() else [url]
+    with download_lock(f"llama-cpp-{os_key}-{vk}"):
+        found = find_llama_server(vk)
+        if found:
+            return found
+        last_err = None
+        for u in urls:
+            try:
+                serve_said(f"downloading {fname}")
+                t0 = [time.time()]
+
+                def prog(done: int, total: int) -> None:
+                    if total and time.time() - t0[0] > 1:
+                        serve_said(progress_line(done, total, "runtime"))
+                        t0[0] = time.time()
+                fetch(u, tmp, progress=prog, timeout=30)
+                got_sha = _sha256_file(tmp)
+                if got_sha != want_sha:
+                    tmp.unlink(missing_ok=True)
+                    raise RuntimeError(f"SHA-256 mismatch for {fname}: got {got_sha[:12]}")
+                os.replace(tmp, archive)
+                break
+            except Exception as e:  # noqa: BLE001
+                last_err = e
+                serve_said(f"  runtime download failed: {e}")
+        else:
+            raise Fail(f"could not download llama-server ({fname}): {last_err}", "network")
+        import shutil
+        staging = dest.parent / f".{dest.name}.extract"
+        shutil.rmtree(staging, ignore_errors=True)
+        staging.mkdir(parents=True, exist_ok=True)
+        if fname.endswith(".zip"):
+            import zipfile
+            with zipfile.ZipFile(archive) as zf:
+                zf.extractall(staging)
+        else:
+            import tarfile
+            with tarfile.open(archive, "r:gz") as tf:
+                tf.extractall(staging, **({"filter": "data"} if sys.version_info >= (3, 12) else {}))
+        if os.name != "nt":
+            for f in staging.rglob("llama-*"):
+                if f.is_file():
+                    f.chmod(0o755)
+        shutil.rmtree(dest, ignore_errors=True)
+        os.replace(staging, dest)
+        archive.unlink(missing_ok=True)
+    found = find_llama_server(vk)
+    if not found:
+        raise Fail("llama-server archive extracted without llama-server executable", "model_missing")
+    return found
 
 
 def hardware() -> dict:
@@ -968,10 +1095,25 @@ def _complete(d: Path) -> bool:
         and not any(d.glob("*.part")) and not any(d.glob("*.incomplete"))
 
 
+def _gguf_dir() -> Path:
+    home = Path(os.environ.get("BLURT_HOME") or BLURT_HOME)
+    return home / "models" / "polish-gguf"
+
+
+def _polish_dir() -> Path:
+    home = Path(os.environ.get("BLURT_HOME") or BLURT_HOME)
+    return home / "models" / "polish"
+
+
 def model_path(m: dict) -> Path | None:
-    """The newest complete copy: our own download ($BLURT_HOME/models/polish/<name>: complete only once every file of
-    its manifest is in — folder_complete) or the Hugging Face cache."""
-    own = POLISH_DIR / m["repo"].split("/")[-1]
+    """The newest complete copy: on Windows/Linux a verified GGUF file ($BLURT_HOME/models/polish-gguf/<file>), or our
+    own MLX download ($BLURT_HOME/models/polish/<name>: complete only once every file of its manifest is in —
+    folder_complete) or the Hugging Face cache."""
+    if not is_mlx() and isinstance(m.get("gguf"), dict):
+        gf = _gguf_dir() / m["gguf"]["file"]
+        if gf.is_file() and gf.stat().st_size > 0 and not gf.with_name(gf.name + ".part").exists():
+            return gf
+    own = _polish_dir() / m["repo"].split("/")[-1]
     if folder_complete(own, legacy=_complete):
         return own
     root = hf_cache() / ("models--" + m["repo"].replace("/", "--"))
@@ -983,10 +1125,19 @@ def model_path(m: dict) -> Path | None:
 
 
 def selected() -> str | None:
-    """The model polish uses: the configured one, else the tier's recommendation — only when it is installed."""
-    want = dictation_config().get("polish_model") or recommended()
-    m = entry(want)
-    return want if m and model_path(m) else None
+    """The model polish uses: the configured one, else the tier's recommendation (or any installed local model when
+    Automatic) — only when it is installed."""
+    cfg_model = dictation_config().get("polish_model")
+    if cfg_model:
+        m = entry(cfg_model)
+        return cfg_model if m and model_path(m) else None
+    rec = recommended()
+    if rec and (m := entry(rec)) and model_path(m):
+        return rec
+    for m in registry()["models"]:
+        if (is_mlx() or isinstance(m.get("gguf"), dict)) and model_path(m):
+            return m["id"]
+    return None
 
 
 def polish_enabled() -> bool:
@@ -1002,15 +1153,14 @@ def timeout_s() -> float:
 
 # ------------------------------------------------------------------ packages, caps
 def ensure_mlx(stdin: str | None = None) -> None:
-    """mlx-lm is only needed to run a model: re-run this command under `uv run --with mlx-lm` when it is missing
-    (through a PyPI mirror when the download mirror is on). `stdin`: what this run already read from its stdin — the
-    re-run gets it as its own (an exec left it an empty stdin: `translate --stdin` answered ok with "", so ⌥T's first
-    use after every launch said "Couldn't translate")."""
+    """mlx-lm is only needed to run an MLX model on Apple Silicon; on Windows / Linux GGUF runs through llama-server."""
+    if is_gguf():
+        return
     import importlib.util
     if importlib.util.find_spec("mlx_lm") is not None:
         return
-    if not supported():
-        raise Fail("polish needs Apple Silicon (MLX)", "unsupported", 4)
+    if not is_mlx():
+        raise Fail("polish needs Apple Silicon (MLX) or x64 Windows/Linux (GGUF)", "unsupported", 4)
     import shutil
     uv = shutil.which("uv") or str(BLURT_HOME / "bin" / "uv")
     if os.environ.get("BLURT_POLISH_REEXEC") or not Path(uv).exists() or not sys.argv[0].endswith(".py"):
@@ -1127,6 +1277,9 @@ class Engine:
 
     def __init__(self):
         self.model = self.tok = self.model_id = None
+        self._llama_proc = None
+        self._llama_port: int | None = None
+        self._llama_secret: str = ""
         self.prefixes: dict[str, tuple[list[int], object]] = {}
         self.last = time.time()
         self.load_ms = 0
@@ -1179,6 +1332,11 @@ class Engine:
             raise Fail(f"{model_id} is not downloaded (polish.py setup --model {model_id})", "model_missing")
         self.unload()
         t0 = time.perf_counter()
+        if path.is_file() and path.suffix.lower() == ".gguf":
+            self._load_gguf(model_id, path)
+            self.load_ms = int((time.perf_counter() - t0) * 1000)
+            self.last = time.time()
+            return self
         ensure_mlx()
         cap_memory()
         from mlx_lm import load
@@ -1193,7 +1351,131 @@ class Engine:
         self.last = time.time()
         return self
 
+    def _load_gguf(self, model_id: str, path: Path) -> None:
+        import http.client
+        import secrets
+        import subprocess
+        srv_bin = ensure_llama_server()
+        threads = str(limits()["threads"])
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+        last_err = "llama-server exited"
+        for ngl in ("99", "0"):
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.bind(("127.0.0.1", 0))
+                port = s.getsockname()[1]
+            secret = secrets.token_hex(16)
+            argv = [
+                str(srv_bin), "-m", str(path), "--host", "127.0.0.1", "--port", str(port),
+                "--api-key", secret, "-ngl", ngl, "-c", "4096", "-np", "1",
+                "--cache-reuse", "128", "-t", threads, "--reasoning-budget", "0",
+            ]
+            proc = subprocess.Popen(
+                argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                cwd=str(srv_bin.parent), creationflags=flags,
+            )
+            deadline = time.time() + 45.0
+            ready = False
+            while time.time() < deadline:
+                if proc.poll() is not None:
+                    break
+                try:
+                    c = http.client.HTTPConnection("127.0.0.1", port, timeout=1.0)
+                    c.request("GET", "/health", headers={"Authorization": f"Bearer {secret}"})
+                    r = c.getresponse()
+                    r.read()
+                    c.close()
+                    if r.status == 200:
+                        ready = True
+                        break
+                except OSError:
+                    pass
+                time.sleep(0.1)
+            if ready:
+                self._llama_proc = proc
+                self._llama_port = port
+                self._llama_secret = secret
+                self.model = "gguf"
+                self.model_id = model_id
+                try:
+                    self._llama_chat(messages("好", mode="light"), max_tokens=1, deadline=time.time() + 10.0)
+                    self.prefixes["light"] = ([1], "llama-slot")
+                except Exception:  # noqa: BLE001
+                    pass
+                return
+            try:
+                if proc.poll() is None:
+                    proc.kill()
+                err_bytes = proc.stderr.read() if proc.stderr else b""
+                last_err = err_bytes.decode("utf-8", errors="replace").strip()[-300:] or last_err
+            except Exception:  # noqa: BLE001
+                pass
+        raise Fail(f"llama-server failed to load {model_id}: {last_err}", "error")
+
+    def _llama_chat(self, msgs: list[dict], max_tokens: int, deadline: float) -> tuple[str, bool]:
+        import http.client
+        if not self._llama_port or not self._llama_proc or self._llama_proc.poll() is not None:
+            raise RuntimeError("llama-server is not running")
+        wait = max(0.5, deadline - time.time())
+        payload = json.dumps({
+            "messages": msgs,
+            "temperature": 0.0,
+            "max_tokens": max_tokens,
+            "stream": True,
+            "cache_prompt": True,
+            "chat_template_kwargs": {"enable_thinking": False},
+        }, ensure_ascii=False).encode("utf-8")
+        conn = http.client.HTTPConnection("127.0.0.1", self._llama_port, timeout=min(wait + 2.0, 30.0))
+        out: list[str] = []
+        cut = False
+        try:
+            conn.request("POST", "/v1/chat/completions", body=payload, headers={
+                "Content-Type": "application/json; charset=utf-8",
+                "Authorization": f"Bearer {self._llama_secret}",
+            })
+            resp = conn.getresponse()
+            if resp.status != 200:
+                body = resp.read().decode("utf-8", errors="replace")[:200]
+                raise RuntimeError(f"llama-server HTTP {resp.status}: {body}")
+            while True:
+                if time.time() > deadline:
+                    cut = True
+                    break
+                raw_line = resp.fp.readline()
+                if not raw_line:
+                    break
+                line = raw_line.decode("utf-8", errors="replace").strip()
+                if not line.startswith("data:"):
+                    continue
+                data = line[5:].strip()
+                if data == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(data)
+                    delta = ((chunk.get("choices") or [{}])[0].get("delta") or {}).get("content")
+                    if delta:
+                        out.append(delta)
+                except ValueError:
+                    continue
+                if time.time() > deadline:
+                    cut = True
+                    break
+        finally:
+            conn.close()
+        return "".join(out), cut
+
     def unload(self):
+        if self._llama_proc is not None:
+            try:
+                self._llama_proc.terminate()
+                self._llama_proc.wait(timeout=3)
+            except Exception:  # noqa: BLE001
+                try:
+                    self._llama_proc.kill()
+                except Exception:  # noqa: BLE001
+                    pass
+            self._llama_proc = None
+            self._llama_port = None
+            self._llama_secret = ""
         self.model = self.tok = None
         self.model_id = None
         self.prefixes = {}
@@ -1242,6 +1524,11 @@ class Engine:
 
     def _generate_now(self, text: str, deadline: float, terms: list[dict] | None = None,
                       context: dict | str | None = None, mode: str = "light", variant: str | None = None) -> tuple[str, bool]:
+        if self._llama_port is not None:
+            msgs = messages(text, terms, context, mode, variant)
+            est = max(16, len(units(text)) + 8)
+            limit = int(est * 1.8) + 32 if mode == "light" else int(est * 2.2) + 64
+            return self._llama_chat(msgs, limit, deadline)
         import copy
         from mlx_lm import stream_generate
         from mlx_lm.sample_utils import make_sampler
@@ -1310,9 +1597,12 @@ class Engine:
 
     def _translate_now(self, text: str, target: str, deadline: float, terms: list[str] | None = None,
                        spoken: bool = False) -> tuple[str, bool]:
+        msgs = translate_messages(text, target, terms, spoken)
+        if self._llama_port is not None:
+            limit = max(32, len(units(text)) * 3 + 64)
+            return self._llama_chat(msgs, limit, deadline)
         from mlx_lm import stream_generate
         from mlx_lm.sample_utils import make_sampler
-        msgs = translate_messages(text, target, terms, spoken)
         try:
             prompt = self.tok.apply_chat_template(msgs, add_generation_prompt=True, tokenize=False, enable_thinking=False)
         except TypeError:
@@ -1333,6 +1623,8 @@ class Engine:
         return self.on_model_thread(self._scores_now, before, words)
 
     def _scores_now(self, before: str, words: list[str]) -> list[float]:
+        if self._llama_port is not None:
+            raise RuntimeError("gguf continuation scoring skipped")
         import mlx.core as mx
         bos = [self.tok.bos_token_id] if getattr(self.tok, "bos_token_id", None) is not None else []
         fulls = [bos + self.tok.encode(before + " " + w, add_special_tokens=False) for w in words]
@@ -1875,6 +2167,7 @@ def cmd_serve(a):
                 except OSError:
                     pass
     finally:
+        eng.unload()
         info = load_json(SERVE_FILE, None)
         if isinstance(info, dict) and info.get("pid") == os.getpid():
             SERVE_FILE.unlink(missing_ok=True)
@@ -1974,8 +2267,18 @@ def cmd_models(_a):
     rows = []
     for m in registry()["models"]:
         p = model_path(m)
-        rows.append({**m, "installed": p is not None, "path": str(p) if p else None, "recommended": m["id"] == rec})
-    emit({"ok": True, "supported": supported(), "tier": hw["tier"], "ram_gb": hw["ram_gb"], "recommended": rec,
+        gg = m.get("gguf") if not is_mlx() else None
+        sz = gg["size_mb"] if isinstance(gg, dict) and "size_mb" in gg else m["size_mb"]
+        rows.append({
+            **m,
+            "size_mb": sz,
+            "local_supported": is_mlx() or isinstance(m.get("gguf"), dict),
+            "installed": p is not None,
+            "path": str(p) if p else None,
+            "recommended": m["id"] == rec,
+        })
+    emit({"ok": True, "supported": supported(), "backend": "mlx" if is_mlx() else "gguf" if is_gguf() else None,
+          "tier": hw["tier"], "ram_gb": hw["ram_gb"], "recommended": rec,
           "configured": cfg.get("polish_model"), "selected": selected(), "polish": cfg.get("polish", "light"),
           "timeout_ms": int(timeout_s() * 1000), "mirror": mirror_on(), "models": rows})
 
@@ -2044,9 +2347,52 @@ def _huggingface(m: dict) -> Path:
         stop.set()
 
 
+def _download_gguf(m: dict) -> Path:
+    gg = m.get("gguf")
+    if not isinstance(gg, dict):
+        raise Fail(f"{m['id']} has no GGUF build for Windows / Linux", "unsupported")
+    ensure_llama_server()
+    dest_dir = _gguf_dir()
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest = dest_dir / gg["file"]
+    tmp = dest.with_name(dest.name + ".part")
+    repo, fname, want_sha = gg["repo"], gg["file"], gg.get("sha256")
+    hf_url = f"https://huggingface.co/{repo}/resolve/main/{fname}"
+    mirror_url = f"https://hf-mirror.com/{repo}/resolve/main/{fname}"
+    urls = [mirror_url, hf_url] if mirror_on() else [hf_url, mirror_url]
+    total_bytes = float(gg.get("size_mb") or m["size_mb"]) * 2**20
+    last_err: Exception | None = None
+    for url in urls:
+        try:
+            serve_said(f"downloading {repo}/{fname}")
+            t0 = [time.time()]
+
+            def prog(have: int, total: int) -> None:
+                if time.time() - t0[0] > 1:
+                    serve_said(progress_line(have, total or total_bytes))
+                    t0[0] = time.time()
+            fetch(url, tmp, progress=prog, timeout=30)
+            if want_sha:
+                got_sha = _sha256_file(tmp)
+                if got_sha != want_sha:
+                    tmp.unlink(missing_ok=True)
+                    raise RuntimeError(f"SHA-256 mismatch for {fname}: got {got_sha[:12]}")
+            os.replace(tmp, dest)
+            return dest
+        except Exception as e:  # noqa: BLE001
+            last_err = e
+            serve_said(f"  failed: {e}")
+    raise Fail(f"could not download {repo}/{fname}: {last_err}", "network")
+
+
 def _download(m: dict) -> None:
     """The mirror first when asked for (else Hugging Face first), the other one when that fails. Done only when a
     source finished and left a complete model; otherwise the last source's error — never "ok" on a partial folder."""
+    if is_gguf():
+        _download_gguf(m)
+        if model_path(m):
+            return
+        raise Fail(f"download finished for {m['id']} but GGUF file is missing", "network")
     sources = [_modelscope, _huggingface] if mirror_on() else [_huggingface, _modelscope]
     last: Exception | None = None
     for src in sources:
@@ -2068,8 +2414,14 @@ def cmd_setup(a):
     if not m:
         raise Fail(f"unknown polish model {a.model_id}", "usage")
     if not supported():
-        raise Fail("polish needs Apple Silicon (MLX)", "unsupported")
+        raise Fail("polish needs Apple Silicon (MLX) or x64 Windows/Linux (GGUF)", "unsupported")
+    if is_gguf() and model_path(m):
+        ensure_llama_server()
     if not model_path(m):
+        if is_mlx() and not mirror_on():
+            import importlib.util
+            if importlib.util.find_spec("huggingface_hub") is None:
+                ensure_mlx()
         # one download of a model at a time: a second setup waits, then finds it in
         with download_lock(m["id"]):
             if not model_path(m):

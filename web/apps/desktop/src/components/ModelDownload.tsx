@@ -3,7 +3,7 @@
 // download already under way — setup.rs starts the recommended model by itself at the first launch — shows as one,
 // never as a second Download.
 import { useCallback, useEffect, useState } from 'react';
-import { api, listen, type DictationModels, type ModelDownload } from '../api';
+import { api, listen, type DictationModels, type ModelDownload, type PolishModels } from '../api';
 import { i18n, t } from '../i18n';
 
 /** "950 MB", "1.6 GB" */
@@ -82,6 +82,63 @@ export function useDictationModels(): DictationModelsState {
     [load],
   );
   return { models, err, dl, failed, failedId, load, download };
+}
+
+export interface PolishModelsState {
+  polish: PolishModels | null;
+  dl: ModelDownload | null;
+  failed: boolean;
+  failedId: string | null;
+  load: () => Promise<PolishModels | null>;
+  download: (id: string) => Promise<void>;
+}
+
+export function usePolishModels(): PolishModelsState {
+  const [polish, setPolish] = useState<PolishModels | null>(null);
+  const [dl, setDl] = useState<ModelDownload | null>(null);
+  const [failed, setFailed] = useState(false);
+  const [failedId, setFailedId] = useState<string | null>(null);
+  const load = useCallback(
+    () =>
+      api.polishModels().then(
+        (m) => {
+          setPolish(m);
+          if (m.downloading) setDl((d) => (d?.id === m.downloading ? d : { id: m.downloading!, state: 'running', done_mb: 0, total_mb: 0 }));
+          return m;
+        },
+        () => null,
+      ),
+    [],
+  );
+  useEffect(() => {
+    load();
+    return listen<ModelDownload>('model-download', (p) => {
+      if (p.state === 'running') {
+        setDl(p);
+        setFailed(false);
+        setFailedId(null);
+      } else {
+        setDl(null);
+        setFailed(p.state === 'failed');
+        setFailedId(p.state === 'failed' ? p.id : null);
+        if (p.state === 'done') load();
+      }
+    });
+  }, [load]);
+  const download = useCallback(
+    async (id: string) => {
+      setFailed(false);
+      setDl({ id, state: 'running', done_mb: 0, total_mb: 0 });
+      try {
+        await api.polishModelDownload(id);
+      } catch (e) {
+        if (!String(e).includes('already running')) setDl(null);
+        load();
+      }
+    },
+    [load],
+  );
+  return { polish, dl, failed, failedId, load, download };
 }
 
 /** The one bar while a model comes down: "Connecting…" until the first megabytes, then "412 MB of 950 MB". `total`:

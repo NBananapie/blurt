@@ -273,13 +273,16 @@ fn translate_text(app: &AppHandle, text: &str) {
         .filter(|t| !t.is_empty() && *t != "auto")
         .map(str::to_owned);
     let target = fixed.as_ref().map_or_else(|| "auto".to_string(), |t| format!("{t}|keep"));
-    // Windows polishes and translates in the cloud only (no local polish model here): without one, say what it takes
-    let Some(c) = cloud::payload("translate").or_else(|| cloud::payload("polish")) else {
+    // Translate in the cloud when connected, or locally on the GPU when a local polish model is installed
+    let c = cloud::payload("translate").or_else(|| cloud::payload("polish"));
+    let local = crate::dictation::engine::has_local_polish();
+    if c.is_none() && !local {
         ins::set_text(text);
         return line(app, "capture.text.translate_needs_model", json!({}), 8000, None);
-    };
+    }
     let runner = app.state::<AppState>().runner();
-    if server::ensure(&runner, server::POLISH, "polish.py", &[]).is_err() || !server::wait_ready(server::POLISH, Duration::from_secs(20)) {
+    let polish_args: &[&str] = if local { &["--preload"] } else { &[] };
+    if server::ensure(&runner, server::POLISH, "polish.py", polish_args).is_err() || !server::wait_ready(server::POLISH, Duration::from_secs(30)) {
         return failed(app, text, "");
     }
     let req = json!({"cmd": "translate", "text": text, "target": target, "cloud": c});

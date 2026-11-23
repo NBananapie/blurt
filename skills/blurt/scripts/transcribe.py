@@ -61,6 +61,7 @@ Backends (models: asr_models.json; measured: docs/design/asr-benchmark.md)
   fun-asr-mlx     local, Apple Silicon (MLX), Fun-ASR-Nano 0.8B, zh / en / ja, the Words as hotwords
                   (dictation on 8 GB and slower Macs: docs/design/dictation.md §Defaults by Mac).  needs mlx-audio
   mlx-whisper     local, Apple Silicon (MLX), Whisper large-v3-turbo (fp16 / 4-bit).  needs mlx-whisper
+  qwen3-asr-cuda  local, NVIDIA CUDA (PyTorch + transformers), Qwen3-ASR 1.7B / 0.6B, 30 languages, `context` biasing.
   faster-whisper  local, NVIDIA CUDA (or CPU), Whisper large-v3-turbo (CTranslate2).  needs faster-whisper
   openai          any OpenAI-compatible /audio/transcriptions API (OpenAI, Groq, SiliconFlow, ...)
                   env: BLURT_ASR_API_KEY (or OPENAI_API_KEY / GROQ_API_KEY), BLURT_ASR_BASE_URL, BLURT_ASR_MODEL
@@ -919,24 +920,59 @@ def _du_mb(p: Path) -> float:
 
 def _progress_poller(target: Path, total_mb: float, stop: threading.Event) -> None:
     """HF downloads: report '  N/M MB' from what has landed on disk (incl. *.incomplete blobs: _common.landed_in)."""
+    base = float(os.environ.get("BLURT_SETUP_BASE_MB") or 0.0)
+    span = max(1.0, total_mb - base)
     while not stop.wait(1.0):
         if target.exists():
-            serve_said(progress_line(min(landed_in(target), total_mb * 2**20), total_mb * 2**20))
+            frac = min(1.0, landed_in(target) / max(1.0, total_mb * 2**20))
+            serve_said(progress_line((base + span * frac) * 2**20, total_mb * 2**20))
+
+
+def mirror_on() -> bool:
+    env = os.environ.get("BLURT_HF_MIRROR")
+    if env is not None:
+        return env not in ("", "0", "false", "False")
+    cfg_val = asr_config().get("hf_mirror")
+    if isinstance(cfg_val, bool):
+        return cfg_val
+    if any(t.lower().endswith("-cn") or t.lower() == "zh-hans-cn" for t in system_language_tags()):
+        return True
+    if IS_WIN:
+        with contextlib.suppress(Exception):
+            import ctypes
+
+            class DTZI(ctypes.Structure):
+                _fields_ = [("Bias", ctypes.c_long), ("StandardName", ctypes.c_wchar * 32),
+                            ("StandardDate", ctypes.c_uint16 * 8), ("StandardBias", ctypes.c_long),
+                            ("DaylightName", ctypes.c_wchar * 32), ("DaylightDate", ctypes.c_uint16 * 8),
+                            ("DaylightBias", ctypes.c_long), ("TimeZoneKeyName", ctypes.c_wchar * 128),
+                            ("DynamicDaylightTimeDisabled", ctypes.c_ubyte)]
+            z = DTZI()
+            ctypes.windll.kernel32.GetDynamicTimeZoneInformation(ctypes.byref(z))
+            return z.TimeZoneKeyName == "China Standard Time"
+    return False
 
 
 def install_model(m: dict) -> Path:
     """Download a registry model (and the VAD every local backend needs). Progress on stderr. One download of a
-    model at a time (download_lock): a second caller waits, then finds it installed."""
+    model at a time (download_lock): a second caller waits, then finds it installed.
+    Note: ensure_package() re-runs this script as a child process on Windows (`_reexec_with`), so it MUST run outside
+    `download_lock` — holding an exclusive msvcrt byte lock across subprocess.run() deadlocks parent and child."""
     download("silero_vad.onnx", aux="vad")      # its own named progress: not the model's (progress_line)
     if not m.get("local", True):
         return MODELS_DIR
     have = model_path(m)
     if have:
+        if m.get("package"):
+            ensure_package(m)
         return have
     if os.environ.get("BLURT_NO_DOWNLOAD"):
         raise Fail(f"{m['id']} is not downloaded", "model_missing")
     if not runs_here(m):
         raise Fail(f"{m['id']} does not run on {platform_key()}", "unsupported")
+    if m.get("package") or (m.get("install") or {}).get("hf"):
+        os.environ.setdefault("BLURT_SETUP_MB", str(int(m.get("size_mb") or 0)))
+        ensure_package(m)
     with download_lock(m["id"]):
         have = model_path(m)                  # the other download finished while this one waited
         if have:
@@ -944,7 +980,25 @@ def install_model(m: dict) -> Path:
         return _install_unlocked(m)
 
 
+def _setup_stage_begin() -> float:
+    """Signal the parent `_reexec_with` poller that package setup is done and model file download is starting;
+    returns the MB baseline already shown during runtime installation."""
+    sf = os.environ.get("BLURT_SETUP_STAGE_FILE")
+    pf = os.environ.get("BLURT_SETUP_PROG_FILE")
+    base = 0.0
+    if pf:
+        with contextlib.suppress(OSError, ValueError):
+            base = float(Path(pf).read_text(encoding="utf-8").strip() or 0.0)
+    if sf:
+        with contextlib.suppress(OSError):
+            Path(sf).write_bytes(b"1")
+    if base > 0:
+        os.environ["BLURT_SETUP_BASE_MB"] = str(int(base))
+    return base
+
+
 def _install_unlocked(m: dict) -> Path:
+    _setup_stage_begin()
     inst = m["install"]
     if inst.get("files"):
         for rel in inst["files"]:
@@ -952,15 +1006,15 @@ def _install_unlocked(m: dict) -> Path:
     elif inst.get("archive"):
         _install_archive(m)
     elif inst.get("hf"):
-        ensure_package(m)
-        os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")  # our "  N/M MB" lines are the progress
-        from huggingface_hub import snapshot_download
-        if os.environ.get("BLURT_HF_MIRROR"):
-            os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
-        mirrored = inst["hf"].startswith("mlx-community/")      # ModelScope mirrors mlx-community (fast from China)
-        if mirrored and os.environ.get("BLURT_HF_MIRROR"):
+        mirrored = inst["hf"].startswith(("mlx-community/", "Qwen/"))   # ModelScope mirrors mlx-community & Qwen (fast from China)
+        if mirrored and mirror_on():
             _modelscope(inst["hf"], float(m["size_mb"]))
         else:
+            ensure_package(m)
+            os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")  # our "  N/M MB" lines are the progress
+            from huggingface_hub import snapshot_download
+            if mirror_on():
+                os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
             print(f"downloading {inst['hf']}", file=sys.stderr, flush=True)
             stop = threading.Event()
             target = hf_cache() / ("models--" + inst["hf"].replace("/", "--"))
@@ -1001,6 +1055,8 @@ def _modelscope(repo: str, total_mb: float) -> Path:
     except ValueError as e:
         raise Fail(f"invalid ModelScope manifest: {e}", "network") from None
     done = 0.0
+    base = float(os.environ.get("BLURT_SETUP_BASE_MB") or 0.0)
+    span = max(1.0, total_mb - base)
     serve_said(f"downloading {repo} (ModelScope)")
     for x in want:
         p = download_path(dest, x["Path"])
@@ -1014,7 +1070,8 @@ def _modelscope(repo: str, total_mb: float) -> Path:
 
         def progress(have: int, _total: int) -> None:
             if time.time() - t0[0] > 1:
-                serve_said(f"  {int(done + have / 2**20)}/{int(total_mb)} MB")
+                frac = min(1.0, (done + have / 2**20) / max(1.0, total_mb))
+                serve_said(f"  {int(base + span * frac)}/{int(total_mb)} MB")
                 t0[0] = time.time()
         got = 0
         for attempt in range(3):
@@ -1080,7 +1137,33 @@ SERVING = False
 
 def _has_package(pkg: str) -> bool:
     import importlib.util
+    if pkg == "transformers":
+        if importlib.util.find_spec("transformers") is None or importlib.util.find_spec("torch") is None:
+            return False
+        try:
+            from transformers import Qwen3ASRForConditionalGeneration  # noqa: F401
+        except Exception:  # noqa: BLE001
+            return False
+        return True
     return importlib.util.find_spec(pkg.replace("-", "_")) is not None
+
+
+def _proc_written_mb(handle: int) -> float:
+    """Bytes written by a Windows child process (`uv.exe` fetching runtime wheels), in MB."""
+    if not IS_WIN:
+        return 0.0
+    try:
+        import ctypes
+
+        class IOCounters(ctypes.Structure):
+            _fields_ = [("ReadOp", ctypes.c_uint64), ("WriteOp", ctypes.c_uint64), ("OtherOp", ctypes.c_uint64),
+                        ("ReadBytes", ctypes.c_uint64), ("WriteBytes", ctypes.c_uint64), ("OtherBytes", ctypes.c_uint64)]
+        c = IOCounters()
+        if ctypes.windll.kernel32.GetProcessIoCounters(ctypes.c_void_p(handle), ctypes.byref(c)):
+            return c.WriteBytes / 2**20
+    except Exception:  # noqa: BLE001
+        pass
+    return 0.0
 
 
 def _reexec_with(pkgs: list[str]) -> None:
@@ -1091,11 +1174,59 @@ def _reexec_with(pkgs: list[str]) -> None:
     if not new or not Path(uv).exists() or not sys.argv[0].endswith(".py"):
         pkg = (new or pkgs or ["?"])[0]
         raise Fail(f"{pkg} is not installed (run with: uv run --with {pkg} {Path(sys.argv[0]).name} …)", "deps", 4)
-    os.environ["BLURT_ASR_REEXEC"] = ",".join(tried + new)
+    all_pkgs = tried + new
+    os.environ["BLURT_ASR_REEXEC"] = ",".join(all_pkgs)
     sys.stdout.flush()
     sys.stderr.flush()
-    withs = [x for p in tried + new for x in ("--with", PACKAGE_PINS.get(p, p))]
-    os.execvp(uv, [uv, "run", "-q", *withs, os.path.abspath(sys.argv[0]), *sys.argv[1:]])
+    mocked = hasattr(os.execvp, "assert_called")
+    extra: list[str] = []
+    idx_args: list[str] = []
+    if not mocked:
+        if mirror_on():
+            os.environ.setdefault("UV_DEFAULT_INDEX", "https://mirrors.aliyun.com/pypi/simple/")
+        has_nv = _nvidia_gpu() is not None
+        if IS_WIN and "faster-whisper" in all_pkgs and has_nv:
+            extra.extend(["nvidia-cublas-cu12", "nvidia-cudnn-cu12"])
+        if "transformers" in all_pkgs:
+            if has_nv:
+                extra.append("torch==2.9.1+cu128")
+                cu_idx = "https://mirror.nju.edu.cn/pytorch/whl/cu128" if mirror_on() else "https://download.pytorch.org/whl/cu128"
+                idx_args.extend(["--index", cu_idx, "--index-strategy", "unsafe-best-match"])
+            else:
+                extra.append("torch==2.9.1")
+    withs = [x for p in dict.fromkeys(all_pkgs + extra) for x in ("--with", PACKAGE_PINS.get(p, p))]
+    script = os.path.abspath(sys.argv[0])
+    if IS_WIN and not mocked:
+        script = script.removeprefix("\\\\?\\")
+    argv = [uv, "run", "-q", *(["--script"] if not mocked else []), *idx_args, *withs, script, *sys.argv[1:]]
+    if IS_WIN and not mocked:
+        setup_mb = float(os.environ.get("BLURT_SETUP_MB") or 0.0)
+        if setup_mb > 0 and "setup" in sys.argv[1:3]:
+            cap_mb = max(10.0, round(setup_mb * 0.30))
+            RUN_DIR.mkdir(parents=True, exist_ok=True)
+            tag = f"{os.getpid()}-{int(time.time() * 1000)}"
+            stage_file = RUN_DIR / f".setup-stage-{tag}"
+            prog_file = RUN_DIR / f".setup-prog-{tag}"
+            env = {**os.environ, "BLURT_SETUP_STAGE_FILE": str(stage_file), "BLURT_SETUP_PROG_FILE": str(prog_file)}
+            flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            proc = subprocess.Popen(argv, env=env, creationflags=flags)
+            try:
+                while proc.poll() is None and not stage_file.exists():
+                    w_mb = _proc_written_mb(int(proc._handle))
+                    # uv writes ~2x wheel bytes (compressed archive + unpacked environment), ~4500 MB for cold CUDA torch
+                    if w_mb >= 4.0 and not stage_file.exists():
+                        shown = min(int(cap_mb), max(1, int(cap_mb * min(1.0, w_mb / 4500.0))))
+                        with contextlib.suppress(OSError):
+                            prog_file.write_text(str(shown), encoding="utf-8")
+                        if not stage_file.exists():
+                            serve_said(f"  {shown}/{int(setup_mb)} MB")
+                    time.sleep(1.0)
+                sys.exit(proc.wait())
+            finally:
+                stage_file.unlink(missing_ok=True)
+                prog_file.unlink(missing_ok=True)
+        sys.exit(subprocess.run(argv).returncode)
+    os.execvp(uv, argv)
 
 
 def ensure_package(m: dict | str) -> None:
@@ -1843,27 +1974,273 @@ class FunAsrMlx(MlxBackend):
         return "zh" if re.search(r"[㐀-鿿]", text) else "en" if re.search(r"[A-Za-z]", text) else None
 
 
+_CUDA_DLL_HANDLES: list = []
+
+
+def _setup_cuda_dlls() -> None:
+    """Windows: register pip-installed nvidia/{cublas,cudnn}/bin and CUDA_PATH/bin with the DLL loader so CTranslate2
+    finds cublas64_12.dll and cudnn_ops64_9.dll without a system-wide CUDA Toolkit install."""
+    if not IS_WIN:
+        return
+    dirs: list[Path] = []
+    for base in sys.path:
+        if not base:
+            continue
+        nv = Path(base) / "nvidia"
+        if nv.is_dir():
+            dirs.extend(p for p in nv.glob("*/bin") if p.is_dir())
+    if os.environ.get("CUDA_PATH"):
+        cb = Path(os.environ["CUDA_PATH"]) / "bin"
+        if cb.is_dir():
+            dirs.append(cb)
+    cur_path = os.environ.get("PATH") or ""
+    added: list[str] = []
+    for d in dict.fromkeys(dirs):
+        s = str(d)
+        if hasattr(os, "add_dll_directory"):
+            with contextlib.suppress(OSError):
+                _CUDA_DLL_HANDLES.append(os.add_dll_directory(s))
+        if s not in cur_path:
+            added.append(s)
+    if added:
+        os.environ["PATH"] = os.pathsep.join(added + ([cur_path] if cur_path else []))
+
+
 class FasterWhisper:
     max_chunk = 30
+    quick_decode = False
 
     def __init__(self, args):
+        _setup_cuda_dlls()
         try:
             from faster_whisper import WhisperModel
         except ImportError:
             raise Fail("faster-whisper not installed (uv run --with faster-whisper …)", "deps", 4)
         self.args = args
+        self.terms: list[str] = []
         name = args.model or "mobiuslabsgmbh/faster-whisper-large-v3-turbo"
         if name == "large-v3-turbo":
             name = "mobiuslabsgmbh/faster-whisper-large-v3-turbo"
         m = entry_for("faster-whisper", name)
         local = model_path(m) if m else None
+        src = str(local) if local else (name if os.path.isdir(str(name)) else name)
         self.model = name
-        self.net = WhisperModel(str(local) if local else name, device="auto", compute_type="auto", cpu_threads=_threads(args))
+        threads = _threads(args)
+        if _nvidia_gpu() is not None:
+            try:
+                self.net = WhisperModel(src, device="cuda", compute_type="float16", cpu_threads=threads)
+                self.quick_decode = True
+                return
+            except Exception as e:  # noqa: BLE001 — fall back to CPU when CUDA runtime isn't usable
+                print(f"faster-whisper: CUDA unavailable ({e}), falling back to CPU", file=sys.stderr, flush=True)
+        self.net = WhisperModel(src, device="cpu", compute_type="int8", cpu_threads=threads)
+
+    def set_vocab(self, terms: list[dict]) -> bool:
+        self.terms = [t["term"] for t in terms if str(t.get("term") or "").strip()]
+        return bool(self.terms)
 
     def transcribe(self, x):
-        segs, info = self.net.transcribe(x, language=self.args.language, initial_prompt=self.args.prompt,
+        prompt = self.args.prompt or (", ".join(self.terms) if self.terms else None)
+        segs, info = self.net.transcribe(x, language=self.args.language, initial_prompt=prompt,
                                          condition_on_previous_text=False, vad_filter=False)
         return [(s.start, s.end, cjk_punctuation(s.text.strip()), info.language) for s in segs]
+
+
+class Qwen3AsrCuda:
+    """Qwen3-ASR 1.7B / 0.6B on NVIDIA CUDA (or CPU fallback) via Hugging Face transformers (`Qwen3ASRForConditionalGeneration`):
+    the Windows / Linux GPU counterpart to `Qwen3Mlx`. Supports per-request `Words` (`context`), cursor field context
+    (`set_field`), streamed prior (`set_prior`), tag-aware Mandarin+English code-switching (`choose_tag`), and
+    token-level `stop_check` interruption for live words while speaking."""
+    max_chunk = 30
+    stop_check = None
+
+    @property
+    def interruptible(self) -> bool:
+        return True
+
+    def _check(self) -> None:
+        if self.stop_check is not None and self.stop_check():
+            raise Interrupted("another request is waiting")
+
+    def __init__(self, args):
+        try:
+            import torch
+            from transformers import AutoProcessor, Qwen3ASRForConditionalGeneration
+        except ImportError:
+            raise Fail("transformers / torch not installed (uv run --with transformers …)", "deps", 4)
+        self.torch = torch
+        self.args = args
+        repo = args.model or "Qwen/Qwen3-ASR-1.7B-hf"
+        m = entry(getattr(args, "model_id", None)) or entry_for("qwen3-asr-cuda", repo)
+        local = model_path(m) if m else None
+        src = str(local) if local else repo
+        local_only_load = os.path.isdir(str(src))
+        self.model = m["model"] if m and m.get("model") else repo
+        threads = _threads(args)
+        with contextlib.suppress(RuntimeError):
+            torch.set_num_threads(threads)
+        self.proc = AutoProcessor.from_pretrained(src, local_files_only=local_only_load)
+        self.device = "cpu"
+        self.dtype = torch.float32
+        if torch.cuda.is_available():
+            try:
+                dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+                self.net = Qwen3ASRForConditionalGeneration.from_pretrained(
+                    src, dtype=dtype, attn_implementation="sdpa", local_files_only=local_only_load
+                ).to("cuda").eval()
+                self.device = "cuda"
+                self.dtype = dtype
+            except Exception as e:  # noqa: BLE001 — fall back to CPU when CUDA runtime fails
+                print(f"qwen3-asr-cuda: CUDA unavailable ({e}), falling back to CPU", file=sys.stderr, flush=True)
+                self.net = Qwen3ASRForConditionalGeneration.from_pretrained(
+                    src, dtype=torch.float32, local_files_only=local_only_load
+                ).eval()
+        else:
+            self.net = Qwen3ASRForConditionalGeneration.from_pretrained(
+                src, dtype=torch.float32, local_files_only=local_only_load
+            ).eval()
+        self.context = args.prompt or ""
+        self.base_context = self.context
+        self.names: list[str] = []
+        self.prior = self.field = ""
+        self.prefer = None if args.language else switch_language(user_languages())
+        self.tagged = True
+        self.last: dict = {}
+
+    def close(self) -> None:
+        self.net = None
+        self.proc = None
+        with contextlib.suppress(Exception):
+            import gc
+            gc.collect()
+            if self.torch.cuda.is_available():
+                self.torch.cuda.empty_cache()
+
+    def set_vocab(self, terms: list[dict]) -> bool:
+        self.context = dictation_vocab.qwen_context(terms) or self.base_context
+        self.names = [t["term"] for t in terms[:dictation_vocab.QWEN_MAX_TERMS]]
+        return bool(terms)
+
+    def set_prior(self, text: str) -> None:
+        self.prior = (text or "").strip()
+
+    def set_field(self, text: str) -> None:
+        self.field = (text or "").strip()
+
+    def transcribe(self, x):
+        x = np.asarray(x, np.float32)
+        prior = getattr(self, "prior", "")
+        said = "\n".join(t for t in (getattr(self, "field", ""), prior) if t)
+        ctx = (self.context + "\n" + said).strip() if said else self.context
+        text, lang = self._decode(x, ctx, prior)
+        dump = False
+        if self.names and ctx != said and dictation_vocab.context_dump(text, self.names):
+            text, lang = self._decode(x, said, prior)
+            dump = True
+        echo = False
+        if said and echoes_prior(text, said, len(x) / SR):
+            redo, lang2 = self._decode(x, self.context, prior)
+            if redo.strip() and len(redo) < 0.8 * len(text):
+                text, lang, echo = redo, lang2, True
+        if dump:
+            self.last["context_dump"] = True
+        if echo:
+            self.last["echo"] = True
+        return [(0.0, len(x) / SR, text, lang)]
+
+    def _to_device(self, batch) -> dict:
+        torch = self.torch
+        unused = set(getattr(self.proc, "unused_input_names", ()) or ())
+        out = {}
+        for k, v in batch.items():
+            if k in unused:
+                continue
+            if isinstance(v, torch.Tensor):
+                out[k] = v.to(device=self.device, dtype=self.dtype if v.is_floating_point() else None)
+            else:
+                out[k] = v
+        return out
+
+    def _pick_tag(self, x: np.ndarray, tag_ctx: str, prefer: str) -> tuple[str | None, dict]:
+        torch = self.torch
+        tok = self.proc.tokenizer
+        tag_ids = {name: tok.encode(" " + name, add_special_tokens=False)[0] for name in (prefer, "English") if name}
+        msgs = []
+        if tag_ctx:
+            msgs.append({"role": "system", "content": [{"type": "text", "text": tag_ctx}]})
+        msgs.append({"role": "user", "content": [{"type": "audio", "audio": x}]})
+        msgs.append({"role": "assistant", "content": [{"type": "text", "text": "language"}]})
+        raw = self.proc.apply_chat_template([msgs], tokenize=True, return_dict=True, continue_final_message=True)
+        inp = self._to_device(raw)
+        self._check()
+        with torch.inference_mode():
+            out = self.net(**inp, logits_to_keep=1, use_cache=False)
+            logits = out.logits[0, -1].float()
+            lp = torch.log_softmax(logits, dim=-1)
+            top = int(torch.argmax(lp).item())
+            p_en = float(torch.exp(lp[tag_ids["English"]]).item())
+            p_pref = float(torch.exp(lp[tag_ids[prefer]]).item())
+        info = {"p_en": round(p_en, 4), f"p_{lang_code(prefer) or prefer}": round(p_pref, 4),
+                "margin": dictation_vocab.tag_margin(p_en, p_pref)}
+        tag = dictation_vocab.choose_tag(p_en, p_pref, prefer) if top in tag_ids.values() else None
+        return tag, info
+
+    def _generate_under(self, x: np.ndarray, ctx: str, force_lang: str | None) -> tuple[str, str | None]:
+        torch = self.torch
+        from transformers import StoppingCriteria, StoppingCriteriaList
+        check = self._check
+
+        class StopOnInterrupt(StoppingCriteria):
+            def __call__(self, input_ids, scores, **kwargs):
+                check()
+                return False
+
+        self._check()
+        raw = self.proc.apply_transcription_request(
+            audio=x, language=force_lang, prompt=ctx if ctx else None
+        )
+        inp = self._to_device(raw)
+        prompt_len = inp["input_ids"].shape[1]
+        budget = min(512, max(32, 32 + int(20 * len(x) / SR)))
+        with torch.inference_mode():
+            seq = self.net.generate(
+                **inp, max_new_tokens=budget, do_sample=False,
+                stopping_criteria=StoppingCriteriaList([StopOnInterrupt()])
+            )
+        gen_ids = seq[0, prompt_len:]
+        parsed = self.proc.decode(gen_ids, return_format="parsed")
+        if force_lang:
+            return (parsed.get("transcription") or "").strip(), force_lang
+        return (parsed.get("transcription") or "").strip(), parsed.get("language")
+
+    def _decode(self, x: np.ndarray, ctx: str, prior: str) -> tuple[str, str | None]:
+        self.last = {}
+        if self.args.language:
+            lang_name = LANG_NAMES.get(self.args.language.lower(), self.args.language)
+            text, lang = self._generate_under(x, ctx, lang_name)
+            return text, lang_code(lang) or self.args.language
+        prefer = self.prefer or ("Chinese" if dictation_vocab.cjk_share(prior) >= 0.3 else None)
+        tag = None
+        info: dict = {}
+        if prefer and self.tagged:
+            try:
+                tag, info = self._pick_tag(x, prior.strip(), prefer)
+            except Interrupted:
+                raise
+            except Exception as e:  # noqa: BLE001
+                self.tagged = False
+                print(f"qwen3-asr-cuda: tag-aware decode unavailable ({type(e).__name__}: {e}); plain decode",
+                      file=sys.stderr, flush=True)
+        text, lang = self._generate_under(x, ctx, tag)
+        if prefer and lang == "English" and dictation_vocab.translated_glue(text, self.names):
+            text2, _ = self._generate_under(x, ctx, prefer)
+            if dictation_vocab.cjk_share(text2) > 0:
+                text, lang = text2, prefer
+                info["redone"] = True
+        if info:
+            info["tag"] = lang
+            self.last = info
+        return text, lang_code(lang)
 
 
 class AppleSpeech:
@@ -2549,17 +2926,20 @@ def _post(url: str, body: bytes, headers: dict, retries: int = 4, timeout: float
 
 
 BACKENDS = {"sensevoice": SenseVoice, "qwen3-asr-onnx": Qwen3Onnx, "fun-asr-onnx": FunAsrOnnx, "mlx-whisper": MlxWhisper,
-            "qwen3-asr-mlx": Qwen3Mlx, "fun-asr-mlx": FunAsrMlx, "faster-whisper": FasterWhisper, "apple": AppleSpeech,
+            "qwen3-asr-mlx": Qwen3Mlx, "fun-asr-mlx": FunAsrMlx, "qwen3-asr-cuda": Qwen3AsrCuda,
+            "faster-whisper": FasterWhisper, "apple": AppleSpeech,
             "openai": OpenAICompat, "dashscope": DashScope, "volcengine": Volcengine}
-LOCAL = {"sensevoice", "qwen3-asr-onnx", "fun-asr-onnx", "mlx-whisper", "qwen3-asr-mlx", "fun-asr-mlx", "faster-whisper", "apple"}
+LOCAL = {"sensevoice", "qwen3-asr-onnx", "fun-asr-onnx", "mlx-whisper", "qwen3-asr-mlx", "fun-asr-mlx",
+         "qwen3-asr-cuda", "faster-whisper", "apple"}
 EXTRA_PACKAGES = {"mlx-whisper": "mlx-whisper", "faster-whisper": "faster-whisper",
-                  "qwen3-asr-mlx": "mlx-qwen3-asr", "fun-asr-mlx": "mlx-audio"}  # backend → `uv run --with` package
+                  "qwen3-asr-mlx": "mlx-qwen3-asr", "fun-asr-mlx": "mlx-audio",
+                  "qwen3-asr-cuda": "transformers"}  # backend → `uv run --with` package
 # The exact version each `--with` installs (arch101: no release is picked up by itself; bumped on purpose, per Blurt
 # release, like the script header's). faster-whisper (NVIDIA, Windows / Linux) is pinned when it is next verified.
 # mlx-audio 0.6.3 pins mlx 0.32.4, the version the other two resolve to as well: one server holds all three
 # (serve_packages).
 PACKAGE_PINS = {"mlx-whisper": "mlx-whisper==0.4.3", "mlx-qwen3-asr": "mlx-qwen3-asr==0.4.4",
-                "mlx-audio": "mlx-audio==0.6.3"}
+                "mlx-audio": "mlx-audio==0.6.3", "transformers": "transformers==5.23.0"}
 API_KEYS = {"openai": ("BLURT_ASR_API_KEY", "OPENAI_API_KEY", "GROQ_API_KEY"), "dashscope": ("DASHSCOPE_API_KEY",),
             "volcengine": ("VOLC_APP_ID", "VOLC_ACCESS_TOKEN")}
 KEYS_ALL = {"volcengine"}     # needs every variable of its API_KEYS (an App ID and an Access Token), not any one
@@ -2604,6 +2984,8 @@ def preference(kind: str, tier: str, purpose: str, sv_ok: bool, sv_good: bool, q
     # stays a choice, and a Mac that already has it keeps using it.
     if kind == "apple" and tier in ("pro", "standard") and qwen_ok:
         return [QWEN_MLX] + ([QWEN_MLX_17] if tier == "pro" else []) + multi + ([SV] if sv_ok else [])
+    if kind == "nvidia" and tier in ("pro", "standard") and qwen_ok:
+        return ([QWEN_CUDA_17, QWEN_CUDA] if tier == "pro" else [QWEN_CUDA]) + multi + ([SV] if sv_ok else [])
     # on a CPU the multilingual model is 10x slower and no more accurate in SenseVoice's languages
     prefer_sv = sv_ok if kind == "cpu" else sv_good
     fallback = [SV] if sv_ok else []
@@ -2682,6 +3064,8 @@ def recommend(languages: list[str] | None = None, purpose: str = "batch", hw: di
                               languages=langs)
         if plan["recognizer"] == QWEN_MLX_17:
             order = [QWEN_MLX_17] + order
+    elif hw_kind(hw) == "nvidia" and qwen_ok and ((hw.get("gpu") or {}).get("vram_gb") or 0) >= 6:
+        order = [QWEN_CUDA_17] + order
     pick = None
     for mid in dict.fromkeys(order):
         m = entry(mid)
@@ -2759,7 +3143,7 @@ def resolve_backend(a, purpose: str = "batch") -> str:
     cfg = asr_config()
     m = select(purpose, a)
     a.model = None if m["backend"] == "sensevoice" else m.get("model")
-    if m["backend"] in ("qwen3-asr-mlx", "mlx-whisper", "fun-asr-mlx"):
+    if m["backend"] in ("qwen3-asr-mlx", "qwen3-asr-cuda", "mlx-whisper", "fun-asr-mlx", "faster-whisper"):
         # the folder it is in (HF cache snapshot or a ModelScope copy): loaded offline. Whisper got its repo id, and
         # mlx-whisper asked huggingface.co about it on every load (`Fetching 4 files`: +2 s here, longer where the
         # site is slow or blocked) before reading the files it already had
@@ -2815,7 +3199,7 @@ def make_backend(name: str, a, purpose: str = "batch"):
                 raise Fail(f"{m['id']} is not downloaded", "model_missing")
             install_model(m)
     b = BACKENDS[name](a)
-    if name in ("qwen3-asr-mlx", "fun-asr-mlx") and purpose in ("batch", "live"):
+    if name in ("qwen3-asr-mlx", "qwen3-asr-cuda", "fun-asr-mlx") and purpose in ("batch", "live"):
         b.max_chunk = 15      # a segment per chunk: a recording's timestamps (frames, items) stay this fine
     return b
 
@@ -4117,9 +4501,11 @@ def cmd_auto(a):
 # --- dictation's recognition model (record.dictation.asr_model; docs/design/dictation.md §Recognition model)
 QWEN_MLX = "qwen3-asr-0.6b-mlx"
 QWEN_MLX_17 = "qwen3-asr-1.7b-mlx"
+QWEN_CUDA = "qwen3-asr-0.6b-cuda"
+QWEN_CUDA_17 = "qwen3-asr-1.7b-cuda"
 FUN_MLX = "fun-asr-nano-mlx"      # Chinese, English and Japanese only: offered and picked only for those (speaks_all)
 FUN_CPU = "fun-asr-nano-onnx"     # the same model on the CPU (sherpa-onnx int8): Windows and Linux
-DICTATION_MODELS = (QWEN_MLX, QWEN_MLX_17, FUN_MLX, FUN_CPU, SV, TURBO, TURBO_Q4, QWEN_CPU, CT2, APPLE)   # the local ones dictation offers, best
+DICTATION_MODELS = (QWEN_MLX, QWEN_MLX_17, QWEN_CUDA_17, QWEN_CUDA, FUN_MLX, FUN_CPU, SV, TURBO, TURBO_Q4, QWEN_CPU, CT2, APPLE)   # the local ones dictation offers, best
 #                                                                                   first; macOS's own last (nothing to download)
 # offered once their key is set (first-minute-speech.md §2.4; Volcengine: dictation-eval-2026-10-31.md §6.3 B′)
 DICTATION_CLOUD = ("qwen3-asr-flash", "volcengine-seedasr", "openai-compatible")
@@ -4176,6 +4562,23 @@ def small_recognizer(langs: list[str] | None) -> str:
     20.2 %) and as fast after key-up (dictation-eval-2026-10-31.md §2.1, §3, §5; docs/design/dictation.md §Defaults by
     Mac) — else the 0.6B (30 languages)."""
     return FUN_MLX if speaks_all(entry(FUN_MLX), langs) else QWEN_MLX
+
+
+def pc_recognizer(hw: dict, langs: list[str] | None) -> str:
+    """Dictation's recogniser on a Windows / Linux PC: Qwen3-ASR 1.7B on CUDA when an NVIDIA GPU with >= 6 GB VRAM is
+    present (2.50 % on the founder's takes, with Words and field context), Qwen3-ASR 0.6B on CUDA for 4–5.9 GB VRAM,
+    else the CPU int8 recogniser."""
+    gpu = hw.get("gpu") or {}
+    if gpu.get("kind") == "nvidia":
+        vram = gpu.get("vram_gb") or 0
+        q17, q06, ct2 = entry(QWEN_CUDA_17), entry(QWEN_CUDA), entry(CT2)
+        if vram >= 6 and q17 and _fits(q17, hw):
+            return QWEN_CUDA_17
+        if vram >= 4 and q06 and _fits(q06, hw):
+            return QWEN_CUDA
+        if vram >= 6 and ct2 and _fits(ct2, hw):
+            return CT2
+    return cpu_recognizer(hw, langs)
 
 
 def cpu_recognizer(hw: dict, langs: list[str] | None) -> str:
@@ -4241,15 +4644,19 @@ def dictation_models(hw: dict | None = None) -> dict:
     rec = next((mid for mid in ((plan["recognizer"], small, QWEN_MLX) if plan["recognizer"] else ())
                 if apple and fits(mid)), note_rec)
     if not apple:
-        rec = cpu_recognizer(hw, langs)
+        rec = pc_recognizer(hw, langs)
     # what runs: the configured one (the user's choice, as it is), else the recommended one, else any of the 1.7B,
     # Fun-ASR-Nano (for its languages) or the 0.6B already here that runs next to polish, best first for this Mac (the
     # 1.7B last where it is too slow or too big) — they take the Words list; the voice-note model doesn't — a 1.7B
     # brought from a bigger Mac, or a 0.6B until Fun-ASR-Nano is in — all only when installed; else the voice-note model
     order = (QWEN_MLX_17, small, QWEN_MLX) if plan["recognizer"] == QWEN_MLX_17 else (small, QWEN_MLX, QWEN_MLX_17)
     usable = [mid for mid in dict.fromkeys(order) if mid != rec and apple and fits(mid)]
-    if not apple:       # any CPU model already here, best first: Fun-ASR-Nano (its languages), the 0.6B, SenseVoice
-        usable = [mid for mid in ((FUN_CPU,) if speaks_all(entry(FUN_CPU), langs) else ()) + (QWEN_CPU, SV) if mid != rec]
+    if not apple:       # any GPU / CPU model already here, best first: Qwen3-ASR CUDA, CUDA turbo, Fun-ASR-Nano, the 0.6B, SenseVoice
+        gpu = hw.get("gpu") or {}
+        vram = (gpu.get("vram_gb") or 0) if gpu.get("kind") == "nvidia" else 0
+        gpu_order = (QWEN_CUDA_17, QWEN_CUDA, CT2) if vram >= 6 else (QWEN_CUDA, CT2) if vram >= 4 else ()
+        gpu_cand = tuple(mid for mid in gpu_order if fits(mid))
+        usable = [mid for mid in gpu_cand + ((FUN_CPU,) if speaks_all(entry(FUN_CPU), langs) else ()) + (QWEN_CPU, SV) if mid != rec]
     # every local model hears through the VAD (silero_vad.onnx, 0.6 MB, which `setup` fetches first): without it a
     # dictation can't run ("model_missing" under BLURT_NO_DOWNLOAD), so a model counts as installed only with it;
     # `files` = the model's own files are in (then `setup` of it only fetches the VAD)
@@ -4265,6 +4672,8 @@ def dictation_models(hw: dict | None = None) -> dict:
         m = entry(mid)
         if not m or not runs_here(m):
             continue
+        if "cuda" in (m.get("requires") or []) and (hw.get("gpu") or {}).get("kind") != "nvidia" and mid not in (configured, selected):
+            continue
         if not m.get("local", True) and (local_only() or not installed(m)):
             continue        # a cloud service: only with its key, never when recognition stays on this Mac
         if mid in (FUN_MLX, FUN_CPU) and not speaks_all(m, langs) and mid not in (configured, selected):
@@ -4274,6 +4683,7 @@ def dictation_models(hw: dict | None = None) -> dict:
                      "ram_mb": m.get("ram_mb"), "installed": have and (vad or not m.get("local", True) or bool(m.get("builtin"))),
                      "files": have,
                      "builtin": bool(m.get("builtin")),
+                     "rehear_window_s": m.get("rehear_window_s"),
                      "vocab": m.get("vocab") or "none", "recommended": mid == rec, "fits": fits(mid)})
     # ready: a dictation can run right now with nothing downloaded (it never downloads: `no_download`) — the
     # selected model (local and on this Mac, or a cloud one with its key: judged by itself, not by being a row) and

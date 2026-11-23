@@ -21,7 +21,7 @@ import { OkMark } from './Welcome';
 import '../settings/settings.css';
 import { AgentAppsSheet } from './AgentAppsSheet';
 import { AgentsPane } from './AgentsSettings';
-import { DictationPane, ModelsPane, ScreenTextPane } from './DictationSettings';
+import { DictationPane, dictationKeyLabel, ModelsPane, ScreenTextPane } from './DictationSettings';
 import { StoragePane } from './StorageSettings';
 import { PhonePane } from '../settings/PhonePane';
 
@@ -226,7 +226,7 @@ export function SettingsView({ status: given, onToast, onLang, onWelcome, onBack
       </nav>
       {searching ? (
         <SearchResults query={query} groups={groups} stops={stops} sel={sel} setSel={setSel} open={open} clear={() => setQuery('')} setQuery={setQuery} hotkeys={s.hotkeys}
-          counts={counts} dictKey={portal ? portalKey || S('dictation.key.portal.unset') : S(`dictation.key.${s.config.record?.dictation?.key === 'either_option' ? 'either_option' : 'right_option'}`)} />
+          counts={counts} dictKey={portal ? portalKey || S('dictation.key.portal.unset') : dictationKeyLabel(s.config.record?.dictation?.key)} />
       ) : cur === 'general' ? (
         <GeneralPane status={status} cfg={cfg} save={save} onToast={onToast} onLang={onLang} onWelcome={onWelcome} checkUpdates={checkUpdates} />
       ) : cur === 'dictation' ? (
@@ -657,7 +657,6 @@ function ShortcutsPane({ s, status, reload, goDictation }: { s: Settings; status
     await reload();
   };
   const d = s.config.record?.dictation ?? {};
-  const dkey = d.key === 'either_option' ? 'either_option' : 'right_option';
   const win = status.platform === 'win';
   const { dictation, screenText, portalKey } = builds(status);
   return (
@@ -671,7 +670,7 @@ function ShortcutsPane({ s, status, reload, goDictation }: { s: Settings; status
           <Group key={sec.section} id={sec.section}>
             {sec.section === 'shortcuts.dictation' && (
               <Row id="shortcuts.dictation_key" detail={<TextLink ink onClick={goDictation}>{S('win.keys.dictation')}</TextLink>}>
-                <span className="st-key static"><KeyCaps label={portalKey !== null ? portalKey || S('dictation.key.portal.unset') : S(`dictation.key.${dkey}`)} /></span>
+                <span className="st-key static"><KeyCaps label={portalKey !== null ? portalKey || S('dictation.key.portal.unset') : dictationKeyLabel(d.key)} /></span>
               </Row>
             )}
             {actions.map((a) => {

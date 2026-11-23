@@ -224,9 +224,21 @@ class Recommend(unittest.TestCase):
         cpu = hw("linux", "x86_64", 16, None, 8, 0)
         self.assertEqual(self.pick(cpu, ["zh", "en"]), "sensevoice-small")
         self.assertEqual(self.pick(cpu, ["de"]), "qwen3-asr-0.6b-onnx")
-        nv = hw("windows", "x86_64", 32, {"kind": "nvidia", "name": "RTX", "vram_gb": 12}, 8, 0)
+        d_cpu = T.dictation_models(cpu)
+        self.assertNotIn("qwen3-asr-1.7b-cuda", [m["id"] for m in d_cpu["models"]])
+        self.assertNotIn("qwen3-asr-0.6b-cuda", [m["id"] for m in d_cpu["models"]])
+        nv = hw("windows", "x86_64", 32, {"kind": "nvidia", "name": "RTX 4070", "vram_gb": 8}, 8, 0)
         self.assertEqual(self.pick(nv, ["ja", "en"]), "whisper-large-v3-turbo-ct2")
         self.assertEqual(self.pick(nv, ["ja", "en"], "note"), "sensevoice-small")
+        for purpose in ("batch", "live", "note"):
+            self.assertEqual(self.pick(nv, ["zh", "en"], purpose), "qwen3-asr-1.7b-cuda")
+        d_nv = T.dictation_models(nv)
+        self.assertEqual(d_nv["recommended"], "qwen3-asr-1.7b-cuda")
+        row_17 = next(m for m in d_nv["models"] if m["id"] == "qwen3-asr-1.7b-cuda")
+        self.assertEqual(row_17["rehear_window_s"], 30)
+        nv4 = hw("windows", "x86_64", 16, {"kind": "nvidia", "name": "RTX 3050", "vram_gb": 4}, 8, 0)
+        self.assertEqual(T.dictation_models(nv4)["recommended"], "qwen3-asr-0.6b-cuda")
+        self.assertEqual(self.pick(nv4, ["zh", "en"], "batch"), "qwen3-asr-0.6b-cuda")
 
     def test_never_an_mlx_model_off_apple_silicon(self):
         for h in (hw("linux", "x86_64", 64, None, 16, 0), hw("darwin", "x86_64", 32, {"kind": "none"}, 8, 0)):

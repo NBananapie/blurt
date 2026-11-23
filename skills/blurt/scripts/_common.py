@@ -90,10 +90,22 @@ def die(msg: str, code: int = 1) -> None:
 
 def ffmpeg_bin(name: str = "ffmpeg") -> str:
     path = shutil.which(name)
-    if not path:
-        hint = "brew install ffmpeg" if IS_MAC else "winget install Gyan.FFmpeg" if IS_WIN else "sudo apt install ffmpeg"
-        die(f"{name} not found on PATH. Install it first: {hint}")
-    return path
+    if path:
+        return path
+    exe = f"{name}.exe" if IS_WIN else name
+    cands = [blurt_home() / "bin" / exe]
+    if IS_WIN and os.environ.get("LOCALAPPDATA"):
+        la = Path(os.environ["LOCALAPPDATA"])
+        cands.append(la / "Microsoft" / "WinGet" / "Links" / exe)
+        pkgs = la / "Microsoft" / "WinGet" / "Packages"
+        if pkgs.is_dir():
+            cands.extend(pkgs.glob(f"*FFmpeg*/**/bin/{exe}"))
+    found = next((str(p) for p in cands if p.is_file()), None)
+    if found:
+        return found
+    hint = "brew install ffmpeg" if IS_MAC else "winget install Gyan.FFmpeg" if IS_WIN else "sudo apt install ffmpeg"
+    die(f"{name} not found on PATH. Install it first: {hint}")
+    return name
 
 
 def run(cmd: list[str], check: bool = True, capture: bool = True, **kw) -> subprocess.CompletedProcess:

@@ -199,5 +199,51 @@ class FunASRNano(unittest.TestCase):
             self.assertEqual(T.collapse_repeats(said), said)
 
 
+class Qwen3AsrCudaAndSetupLock(unittest.TestCase):
+    """Windows / Linux CUDA Qwen3-ASR + regression test against the Windows msvcrt download_lock self-deadlock."""
+
+    def test_qwen3_cuda_package_and_folder(self):
+        m = T.entry("qwen3-asr-1.7b-cuda")
+        self.assertEqual(m["backend"], "qwen3-asr-cuda")
+        self.assertEqual(m["package"], "transformers")
+        self.assertEqual(m["field_context_chars"], 300)
+        self.assertEqual(m["rehear_window_s"], 30)
+        self.assertEqual(T.PACKAGE_PINS["transformers"], "transformers==5.23.0")
+        a = argparse.Namespace(backend=None, model=None, model_id="qwen3-asr-1.7b-cuda", language=None, prompt=None)
+        snap = Path("/tmp/models/asr/Qwen3-ASR-1.7B-hf")
+        with mock.patch.object(T, "select", return_value=m), mock.patch.object(T, "model_path", return_value=snap):
+            self.assertEqual(T.resolve_backend(a, "note"), "qwen3-asr-cuda")
+        self.assertEqual(a.model, str(snap))
+
+    def test_ensure_package_runs_outside_download_lock(self):
+        events: list[str] = []
+
+        @T.contextlib.contextmanager
+        def fake_lock(_mid):
+            events.append("lock_enter")
+            try:
+                yield
+            finally:
+                events.append("lock_exit")
+
+        m = T.entry("qwen3-asr-1.7b-cuda")
+        with mock.patch.object(T, "download"), \
+                mock.patch.object(T, "runs_here", return_value=True), \
+                mock.patch.object(T, "model_path", side_effect=[None, None, Path("/tmp/ok")]), \
+                mock.patch.object(T, "download_lock", side_effect=fake_lock), \
+                mock.patch.object(T, "ensure_package", side_effect=lambda _m: events.append("ensure_package")), \
+                mock.patch.object(T, "_install_unlocked", side_effect=lambda _m: (events.append("install_unlocked"), Path("/tmp/ok"))[1]):
+            T.install_model(m)
+        self.assertEqual(events, ["ensure_package", "lock_enter", "install_unlocked", "lock_exit"])
+
+    def test_qwen_repo_uses_modelscope_when_mirror_is_on(self):
+        m = T.entry("qwen3-asr-1.7b-cuda")
+        with mock.patch.dict(T.os.environ, {"BLURT_HF_MIRROR": "1"}), \
+                mock.patch.object(T, "_modelscope", return_value=Path("/tmp/ok")) as ms, \
+                mock.patch.object(T, "model_path", return_value=Path("/tmp/ok")):
+            T._install_unlocked(m)
+        ms.assert_called_once_with("Qwen/Qwen3-ASR-1.7B-hf", float(m["size_mb"]))
+
+
 if __name__ == "__main__":
     unittest.main()

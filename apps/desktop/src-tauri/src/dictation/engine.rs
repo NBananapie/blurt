@@ -82,6 +82,8 @@ enum Msg {
     Frame(Vec<f32>),
     /// a job came back from the speech server: (take, slot, text or error code, ms)
     Heard(u64, Slot, Result<String, String>, u64),
+    /// an interim live-word pass on the open utterance: (take, next_start, text or error code)
+    Interim(u64, usize, Result<String, String>),
     /// the field around the cursor, read at the take's start
     Context(u64, Option<Context>),
     /// the other dictation apps running now (Typeless, Wispr Flow)
@@ -162,6 +164,8 @@ static TEXTS: Mutex<VecDeque<(String, String)>> = Mutex::new(VecDeque::new());
 static LAST_TOAST: Mutex<Option<(Instant, u64)>> = Mutex::new(None);
 /// The speech server is starting and loading its model (a CPU load is ~17 s): a take waiting now says so.
 static ASR_LOADING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// An interim live-word decode is currently running on the warm speech server.
+static INTERIM_BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// The warm speech server's arguments (every start: the prewarm at launch, a key-down, a take, a stream).
 const ASR_ARGS: [&str; 4] = ["--preload", "--purpose", "dictation", "--no-download"];
 
@@ -291,6 +295,11 @@ struct Take {
     duration: f64,
     /// takes the start's peep back out of what the mic records (cue_eraser.rs): armed when `sound("start")` played
     cue: Option<CueEraser>,
+    /// live words decoded from the open utterance while speaking (GPU Whisper / SenseVoice)
+    interim: String,
+    interim_at: Instant,
+    interim_len: usize,
+    no_interim: bool,
 }
 
 impl Take {
@@ -320,11 +329,26 @@ impl Take {
         pieces || self.windows.iter().any(|(_, r)| r.is_none()) || self.whole == Some(None)
     }
 
-    /// The text heard so far for the live panel: the pieces' transcripts in order, up to the first not back.
+    /// The text heard so far for the live panel: the pieces' transcripts in order, up to the first not back, plus any
+    /// interim decode of the open utterance.
     fn live(&self) -> String {
-        let shown: Vec<String> = self.texts.iter().map_while(|x| x.clone()).collect();
+        let mut shown: Vec<String> = self.texts.iter().map_while(|x| x.clone()).collect();
+        let all_in = shown.len() == self.texts.len();
         let pauses = self.seg.pauses();
-        stitch::join_pieces(&shown, &pauses[..shown.len().min(pauses.len())])
+        let mut p: Vec<Option<f64>> = pauses[..shown.len().min(pauses.len())].to_vec();
+        if all_in && !self.interim.is_empty() {
+            let tail = match (self.hard.last(), shown.last()) {
+                (Some(true), Some(prev)) => stitch::drop_overlap(prev, &self.interim),
+                _ => self.interim.clone(),
+            };
+            if !tail.trim().is_empty() {
+                shown.push(tail);
+            }
+        }
+        if p.len() < shown.len().saturating_sub(1) {
+            p.resize(shown.len().saturating_sub(1), Some(0.4));
+        }
+        stitch::join_pieces(&shown, &p)
     }
 
     fn pauses(&self) -> Vec<Option<f64>> {
@@ -475,6 +499,24 @@ pub fn enabled() -> bool {
         .unwrap_or(true)
 }
 
+/// Whether a local polish model is installed and not turned off (`record.dictation.polish_model != "off"`).
+pub fn has_local_polish() -> bool {
+    if cfg().get("polish_model").and_then(Value::as_str) == Some("off") {
+        return false;
+    }
+    if let Some(ready) = *super::commands::POLISH_READY.lock().unwrap() {
+        return ready;
+    }
+    std::fs::read_dir(paths::blurt_home().join("models").join("polish-gguf"))
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .any(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            name.ends_with(".gguf") && !e.path().with_file_name(format!("{name}.part")).exists()
+        })
+}
+
 fn audio_dir() -> PathBuf {
     paths::blurt_home().join("dictation").join("audio")
 }
@@ -485,7 +527,14 @@ fn key_label(k: Key) -> String {
     match (k, zh) {
         (Key::RightAlt, false) => "Right Alt".into(),
         (Key::RightAlt, true) => "右 Alt".into(),
-        (_, _) => "Alt".into(),
+        (Key::EitherAlt, _) => "Alt".into(),
+        (Key::RightCtrl, false) => "Right Ctrl".into(),
+        (Key::RightCtrl, true) => "右 Ctrl".into(),
+        (Key::RightShift, false) => "Right Shift".into(),
+        (Key::RightShift, true) => "右 Shift".into(),
+        (Key::CtrlWin, _) => "Ctrl+Win".into(),
+        (Key::CapsLock, _) => "Caps Lock".into(),
+        (Key::Custom(vk), _) => Key::vk_name(vk),
     }
 }
 
@@ -764,6 +813,7 @@ pub fn start(app: &AppHandle) -> Result<(), String> {
     let prefs = Prefs::from_json(&cfg());
     let t = make_trigger(&prefs);
     keys_win::CANCEL_MODS.store(cancel_mods(&prefs), SeqCst);
+    keys_win::set_trigger_key(prefs.key, prefs.enabled);
     let mut e = Engine {
         app: app.clone(),
         tx: tx.clone(),
@@ -805,6 +855,7 @@ pub fn start(app: &AppHandle) -> Result<(), String> {
         let runner = app.state::<AppState>().runner();
         std::thread::spawn(move || {
             super::commands::refresh_ready(&runner);
+            super::commands::refresh_polish_ready(&runner);
             prewarm(&runner);
         });
     }
@@ -827,20 +878,35 @@ pub fn start(app: &AppHandle) -> Result<(), String> {
 /// first take after starting Blurt waited ~20 s for it (dogfood 11-02). Only when dictation is on, a local model is
 /// here (ready) and chosen — a cloud model has nothing to load.
 fn prewarm(runner: &crate::scripts::Runner) {
-    if !enabled() || *super::commands::READY.lock().unwrap() != Some(true) || server::running(server::ASR) {
+    if !enabled() {
         return;
     }
-    let cloud = super::commands::MODELS.lock().unwrap().as_ref().is_some_and(super::flow::speech_models::selected_cloud);
-    if cloud {
-        return;
+    if *super::commands::READY.lock().unwrap() == Some(true) && !server::running(server::ASR) {
+        let cloud = super::commands::MODELS
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(super::flow::speech_models::selected_cloud);
+        if !cloud {
+            ASR_LOADING.store(true, SeqCst);
+            let t0 = Instant::now();
+            if server::ensure(runner, server::ASR, "transcribe.py", &ASR_ARGS).is_ok() {
+                let ok = server::wait_ready(server::ASR, Duration::from_secs(120));
+                eprintln!("dictation: speech model prewarmed ({ok}) in {:.1} s", t0.elapsed().as_secs_f64());
+            }
+            ASR_LOADING.store(false, SeqCst);
+        }
     }
-    ASR_LOADING.store(true, SeqCst);
-    let t0 = Instant::now();
-    if server::ensure(runner, server::ASR, "transcribe.py", &ASR_ARGS).is_ok() {
-        let ok = server::wait_ready(server::ASR, Duration::from_secs(120));
-        eprintln!("dictation: speech model prewarmed ({ok}) in {:.1} s", t0.elapsed().as_secs_f64());
+    if has_local_polish()
+        && cfg().get("polish").and_then(Value::as_str) != Some("off")
+        && !server::running(server::POLISH)
+    {
+        let t0 = Instant::now();
+        if server::ensure(runner, server::POLISH, "polish.py", &["--preload"]).is_ok() {
+            let ok = server::wait_ready(server::POLISH, Duration::from_secs(60));
+            eprintln!("dictation: polish model prewarmed ({ok}) in {:.1} s", t0.elapsed().as_secs_f64());
+        }
     }
-    ASR_LOADING.store(false, SeqCst);
 }
 
 /// The trigger as the settings say (key, mode, double-tap send, Shift / Ctrl single or double).
@@ -887,8 +953,13 @@ impl Engine {
                     }
                     let ours = self.trigger.key.codes().contains(&k.code);
                     if ours {
-                        self.key_down = k.down;
-                        crate::onboarding::dictation_key(&self.app, k.down); // the Welcome's "press it" check
+                        let active_down = if self.trigger.key == Key::CtrlWin {
+                            k.down && keys_win::held(0x11) && (keys_win::held(0x5B) || keys_win::held(0x5C))
+                        } else {
+                            k.down
+                        };
+                        self.key_down = active_down;
+                        crate::onboarding::dictation_key(&self.app, active_down); // the Welcome's "press it" check
                     } else if k.down {
                         self.last_key = k.code;
                         self.key_after_copy = true;
@@ -926,6 +997,23 @@ impl Engine {
                 }
                 Ok(Msg::Frame(f)) => self.frame(f),
                 Ok(Msg::Heard(n, slot, r, ms)) => self.heard(n, slot, r, ms),
+                Ok(Msg::Interim(n, start, r)) => {
+                    if let Some(t) = self.take.as_mut().filter(|t| t.n == n) {
+                        match r {
+                            Ok(s) if t.next_start == start => {
+                                t.interim = s;
+                                let live = t.live();
+                                crate::remote::live(&live);
+                                island::send(&self.app, json!({"op": "live", "text": live}));
+                            }
+                            Ok(_) => {}
+                            Err(code) if code == "interim_unsupported" => {
+                                t.no_interim = true;
+                            }
+                            Err(_) => {}
+                        }
+                    }
+                }
                 Ok(Msg::Context(n, c)) => {
                     if let Some(t) = self.take.as_mut().filter(|t| t.n == n) {
                         if let Some(s) = &t.stream {
@@ -984,6 +1072,7 @@ impl Engine {
         let key_changed = new.key != self.prefs.key;
         self.prefs = new;
         keys_win::CANCEL_MODS.store(cancel_mods(&self.prefs), SeqCst);
+        keys_win::set_trigger_key(self.prefs.key, self.prefs.enabled);
         if rebuild {
             if self.take.is_some() && key_changed {
                 self.trigger.reset(false, false);
@@ -1010,6 +1099,7 @@ impl Engine {
             self.apply(out);
         }
         self.missed();
+        self.poll_interim();
         if let Some(at) = self.miss_hold_at {
             if at.elapsed().as_secs_f64() >= self.trigger.double_tap_window + 0.15 {
                 self.miss_hold_at = None;
@@ -1097,6 +1187,84 @@ impl Engine {
     /// A press this mode doesn't use: how it starts. Tap mode's held press is said at once, while the key is still
     /// down, so the user lets go before talking into nothing; hold mode's tap once a day, after the double-tap window
     /// (it may be a double tap's first tap).
+    /// Periodically decode the open utterance (`t.audio[t.next_start..]`) with `interim: true` so fast GPU models
+    /// (`whisper-large-v3-turbo-ct2` on CUDA, `sensevoice-small`) stream live words onto the island while speaking.
+    fn poll_interim(&mut self) {
+        if INTERIM_BUSY.load(SeqCst) || ASR_LOADING.load(SeqCst) || !server::running(server::ASR) {
+            return;
+        }
+        if settings::read_config()
+            .pointer("/record/live_text")
+            .and_then(Value::as_bool)
+            == Some(false)
+        {
+            return;
+        }
+        let Some(t) = &mut self.take else { return };
+        if t.cloud
+            || t.stream.is_some()
+            || t.no_interim
+            || !t.seg.piece_has_speech()
+            || t.interim_at.elapsed() < Duration::from_millis(850)
+        {
+            return;
+        }
+        let open_end = t.audio.len();
+        let open_start = t.next_start.min(open_end);
+        // need at least 0.5 s of open audio, and at least 0.35 s of new audio since the last interim pass
+        if open_end < open_start + SR / 2 || open_end < t.interim_len + SR / 3 {
+            return;
+        }
+        t.interim_at = Instant::now();
+        t.interim_len = open_end;
+        let max_samples = SR * 12;
+        let slice_start = open_start.max(open_end.saturating_sub(max_samples));
+        let samples = &t.audio[slice_start..open_end];
+        let dir = audio_dir().join("pieces");
+        let _ = std::fs::create_dir_all(&dir);
+        let wav = dir.join(format!("{}-interim.wav", t.id));
+        if mic::write_wav(&wav, samples).is_err() {
+            return;
+        }
+        let n = t.n;
+        let next_start = t.next_start;
+        let prior = t.prior(t.pieces.len());
+        let field = t.before();
+        let tx = self.tx.clone();
+        INTERIM_BUSY.store(true, SeqCst);
+        std::thread::spawn(move || {
+            let language = cfg()
+                .get("language")
+                .and_then(Value::as_str)
+                .unwrap_or("auto")
+                .to_string();
+            let mut req = json!({
+                "cmd": "note",
+                "wav": wav.to_string_lossy(),
+                "interim": true,
+                "purpose": "dictation",
+                "language": language,
+                "vocab": true,
+                "no_download": true,
+                "prior": prior,
+            });
+            for (k, v) in [("before", &field.before), ("hint", &field.hint), ("app", &field.app)] {
+                if !v.is_empty() {
+                    req[k] = json!(v);
+                }
+            }
+            let give_up = || dropped(n);
+            let r = match server::call(server::ASR, &req, Duration::from_millis(2500), Some(&give_up)) {
+                Some(v) if v["ok"] == json!(true) => Ok(v["text"].as_str().unwrap_or("").trim().to_string()),
+                Some(v) => Err(v["code"].as_str().unwrap_or("error").to_string()),
+                None => Err("timeout".into()),
+            };
+            let _ = std::fs::remove_file(&wav);
+            INTERIM_BUSY.store(false, SeqCst);
+            let _ = tx.send(Msg::Interim(n, next_start, r));
+        });
+    }
+
     fn missed(&mut self) {
         match self.trigger.take_miss() {
             Some(Miss::HeldInTapMode) => {
@@ -1118,9 +1286,7 @@ impl Engine {
                 Output::Cancel => self.cancel(sends),
                 Output::Send => self.send(),
                 Output::Style => {
-                    if self.take.is_some() && super::cloud::payload("polish").is_none() {
-                        // nothing can make a list (Windows has no local polish model): say what it takes instead of
-                        // switching to a style that would come out as said (the Mac's sayStylesNeedModel)
+                    if self.take.is_some() && super::cloud::payload("polish").is_none() && !has_local_polish() {
                         say(&self.app, "dictation.style.needs_cloud", json!({}), keys::STYLE, 6000,
                             Some(("dictation.cloud".to_string(), "dictation.translate.toast.setup")), false);
                     } else if let Some(t) = &mut self.take {
@@ -1135,9 +1301,8 @@ impl Engine {
                 Output::Translate => {
                     if self.take.is_some()
                         && super::cloud::payload("translate").or_else(|| super::cloud::payload("polish")).is_none()
+                        && !has_local_polish()
                     {
-                        // no service translates: say so (with Set Up…) and leave it off — never typed raw and then
-                        // remembered as "translate stays on" (dogfood 11-02)
                         say(&self.app, "dictation.translate.toast.unavailable", json!({}), keys::STYLE, 6000,
                             Some(("dictation.cloud".to_string(), "dictation.translate.toast.setup")), false);
                     } else if let Some(t) = &mut self.take {
@@ -1244,8 +1409,12 @@ impl Engine {
                     self.remote_press = true;
                     self.remote_mic = phone_mic;
                 }
-                let codes = self.trigger.key.codes();
-                let code = codes[codes.len() - 1];
+                let code = if self.trigger.key == Key::CtrlWin {
+                    super::trigger::CHORD_CTRL_WIN
+                } else {
+                    let codes = self.trigger.key.codes();
+                    codes[codes.len() - 1]
+                };
                 self.key_down = down;
                 let out = self.trigger.handle(Event::Key { code, down, time: keys_win::now() });
                 self.apply(out);
@@ -1286,6 +1455,9 @@ impl Engine {
         let runner = st.runner();
         std::thread::spawn(move || {
             let _ = server::ensure(&runner, server::ASR, "transcribe.py", &ASR_ARGS);
+            if has_local_polish() && cfg().get("polish").and_then(Value::as_str) != Some("off") {
+                let _ = server::ensure(&runner, server::POLISH, "polish.py", &["--preload"]);
+            }
         });
     }
 
@@ -1328,9 +1500,19 @@ impl Engine {
         let base = self.prefs.styles.base(exe.as_deref());
         let translate_cfg = cfg().get("translate").cloned();
         let translate = !stem.is_empty() && super::prefs::remember::translates(translate_cfg.as_ref(), &stem);
-        let (cloud, streams, model) = super::commands::MODELS.lock().unwrap().as_ref().map_or((false, false, None), |v| {
-            (super::flow::speech_models::selected_cloud(v), super::flow::speech_models::streams(v), v["selected"].as_str().map(String::from))
+        let (cloud, streams, model, model_win) = super::commands::MODELS.lock().unwrap().as_ref().map_or((false, false, None, None), |v| {
+            (
+                super::flow::speech_models::selected_cloud(v),
+                super::flow::speech_models::streams(v),
+                v["selected"].as_str().map(String::from),
+                super::flow::speech_models::rehear_window_s(v),
+            )
         });
+        let rehear_win = if cfg().get("rehear_window_s").is_some() {
+            self.prefs.rehear_window
+        } else {
+            model_win.unwrap_or(self.prefs.rehear_window)
+        };
         // Volcengine hears the take while it is said: the pre-roll goes now, the field's text when it is read
         let stream = streams.then(|| {
             let (tx, rx) = channel::<StreamMsg>();
@@ -1358,7 +1540,7 @@ impl Engine {
             next_start: 0,
             texts: vec![],
             covered_last: false,
-            planner: Planner::new(self.prefs.rehear_window, SR as f64),
+            planner: Planner::new(rehear_win, SR as f64),
             windows: vec![],
             whole: None,
             asr_ms: 0,
@@ -1380,6 +1562,10 @@ impl Engine {
             context: None,
             duration: 0.0,
             cue: start_clip(&self.app).map(|c| CueEraser::new(c.to_vec(), SR as f64)),
+            interim: String::new(),
+            interim_at: Instant::now(),
+            interim_len: 0,
+            no_interim: false,
         });
         // Esc is Blurt's while the take listens
         keys_win::ESC_DICTATION.store(true, SeqCst);
@@ -1485,6 +1671,8 @@ impl Engine {
         for c in cuts.into_iter().filter(|_| !t.cloud) {
             let start = t.next_start.min(c.end);
             t.next_start = c.next_start;
+            t.interim.clear();
+            t.interim_len = 0;
             t.pieces.push((start, c.end));
             t.hard.push(c.hard);
             t.texts.push(None);
@@ -1989,6 +2177,10 @@ impl Engine {
             context: None,
             duration: m.duration,
             cue: None,
+            interim: String::new(),
+            interim_at: Instant::now(),
+            interim_len: 0,
+            no_interim: true,
         };
         let _ = self.asr.send(Job { n, slot: Slot::Whole, wav, prior: String::new(), before: AsrCtx::default(), temp: false });
         self.flight.push_back(t);
@@ -2351,7 +2543,7 @@ impl Engine {
     fn remind_cloud(&mut self, takes: i64, d: &Delivered) {
         let c = cfg();
         let shown = c.get("cloud_hint_shown").and_then(Value::as_bool) == Some(true) || c.get("cloud_hint").and_then(Value::as_bool) == Some(false);
-        let cloud = super::cloud::payload("polish").is_some();
+        let cloud = super::cloud::payload("polish").is_some() || has_local_polish();
         let in_blurt = d.exe.as_deref().is_some_and(|e| apps::stem(e) == apps::stem(&std::env::current_exe().map(|p| p.to_string_lossy().to_string()).unwrap_or_default()));
         if !super::flow::CloudReminder::due(takes, shown, cloud, in_blurt, d.had_line, toast_idle() && self.take.is_none()) {
             return;
@@ -3450,17 +3642,21 @@ fn polish_full(
         translate_error: None,
     };
     // Verbatim types what the speech model wrote (record.dictation.polish off is Verbatim everywhere)
-    let polish_on = cfg().get("polish").and_then(Value::as_str) != Some("off") && style.polishes();
+    let polish_on = cfg().get("polish").and_then(Value::as_str) != Some("off")
+        && style.polishes()
+        && !stitch::nothing_to_polish(raw);
+    let local = has_local_polish();
     let cloud = super::cloud::payload("polish");
     let tcloud = super::cloud::payload("translate").or_else(|| cloud.clone());
-    if (cloud.is_none() || !polish_on) && !(translate && tcloud.is_some()) {
-        // translate asked with no service to do it (Ctrl-Ctrl is refused then, but a remembered "translate" can start
-        // a take): typed as said, and the island says why
-        let translate_error = (translate && tcloud.is_none()).then(|| "unavailable".to_string());
+    let can_polish = cloud.is_some() || local;
+    let can_translate = tcloud.is_some() || local;
+    if (!can_polish || !polish_on) && !(translate && can_translate) {
+        let translate_error = (translate && !can_translate).then(|| "unavailable".to_string());
         return Polished { translate_error, ..plain };
     }
-    if server::ensure(runner, server::POLISH, "polish.py", &[]).is_err()
-        || !server::wait_ready(server::POLISH, Duration::from_secs(20))
+    let polish_args: &[&str] = if local { &["--preload"] } else { &[] };
+    if server::ensure(runner, server::POLISH, "polish.py", polish_args).is_err()
+        || !server::wait_ready(server::POLISH, Duration::from_secs(30))
     {
         return Polished {
             fell_back: true,
@@ -3486,18 +3682,18 @@ fn polish_full(
         context_used: context.is_some_and(|c| !c.is_empty()),
         ..plain
     };
-    if let (Some(c), true) = (&cloud, polish_on) {
+    if polish_on && can_polish {
         let ask = |structure: bool| -> Result<Value, String> {
             let mut req = if structure {
-                json!({"cmd": "structure", "text": raw, "timeout": budget * 2.0, "vocab": vocab(), "context": ctx, "cloud": c, "local_fallback": false})
+                json!({"cmd": "structure", "text": raw, "timeout": budget * 2.0, "vocab": vocab(), "context": ctx, "cloud": cloud, "local_fallback": local})
             } else {
-                // no local model to fall back on (Windows): the cloud's failure is the reason (polish.py `local_fallback`)
-                json!({"cmd": "polish", "text": raw, "timeout": budget, "vocab": vocab(), "context": ctx, "cloud": c, "local_fallback": false})
+                json!({"cmd": "polish", "text": raw, "timeout": budget, "vocab": vocab(), "context": ctx, "cloud": cloud, "local_fallback": local})
             };
             if let (Some(v), false) = (variant, structure) {
                 req["variant"] = json!(v);
             }
-            let wait = if structure { budget * 2.0 } else { budget } + 3.0;
+            let headroom = if local { 15.0 } else { 3.0 };
+            let wait = (if structure { budget * 2.0 } else { budget }) + headroom;
             match server::call(server::POLISH, &req, Duration::from_secs_f64(wait), give_up) {
                 Some(v) if v["ok"] == json!(true) && !v["text"].as_str().unwrap_or("").trim().is_empty() => Ok(v),
                 Some(v) => Err(v["code"].as_str().or(v["reason"].as_str()).unwrap_or("error").to_string()),
@@ -3520,7 +3716,9 @@ fn polish_full(
             match ask(true) {
                 Ok(v) => {
                     take(&mut out, &v);
-                    structured = v["text"].as_str().map(String::from);
+                    if !out.fell_back && v["reason"] != json!("short") {
+                        structured = v["text"].as_str().map(String::from);
+                    }
                 }
                 Err(why) => {
                     out.fell_back = style == Style::Structured;
@@ -3533,19 +3731,19 @@ fn polish_full(
         if structured.is_some() && (style == Style::Structured || list) {
             text = picked;
             out.polished = Some(text.clone());
-        } else if !skipped() {
+        } else if !skipped() && style != Style::Structured {
             match ask(false) {
                 Ok(v) => {
                     take(&mut out, &v);
                     text = v["text"].as_str().unwrap_or("").to_string();
-                    if !out.fell_back {
+                    if !out.fell_back && !v["polished"].is_null() {
                         out.polished = Some(text.clone());
                     }
                 }
                 Err(why) => {
                     out.fell_back = true;
                     let code = why.trim_start_matches("cloud_").to_string();
-                    if code != "skipped" {
+                    if code != "skipped" && cloud.is_some() {
                         out.cloud_error = Some(code);
                     }
                     out.reason = Some(why);
@@ -3554,15 +3752,16 @@ fn polish_full(
         }
     }
     if translate && !skipped() {
-        if let Some(c) = &tcloud {
+        if can_translate {
             let target = cfg()
                 .get("translate_target")
                 .and_then(Value::as_str)
                 .unwrap_or("auto")
                 .to_string();
+            let wait = if local { 35 } else { 20 };
             // `check`: polish.py's guard looks at the answer and says why it fell back (the Mac's request)
-            let req = json!({"cmd": "translate", "text": text, "target": target, "cloud": c, "spoken": true, "vocab": vocab(), "check": true});
-            match server::call(server::POLISH, &req, Duration::from_secs(20), give_up) {
+            let req = json!({"cmd": "translate", "text": text, "target": target, "cloud": tcloud, "spoken": true, "vocab": vocab(), "check": true});
+            match server::call(server::POLISH, &req, Duration::from_secs(wait), give_up) {
                 Some(v) if v["ok"] == json!(true) && v["fell_back"] != json!(true) => {
                     if let Some(t) = v["text"].as_str().filter(|t| !t.trim().is_empty()) {
                         if t != text {

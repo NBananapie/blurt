@@ -723,7 +723,7 @@ pub fn storage_scan(app: AppHandle) -> Value {
         if name.starts_with('.') {
             continue;
         }
-        if name == "asr" || name == "polish" {
+        if name == "asr" || name == "polish" || name == "polish-gguf" {
             for m in std::fs::read_dir(&e).into_iter().flatten().filter_map(Result::ok).map(|x| x.path()) {
                 if !m.file_name().is_some_and(|n| n.to_string_lossy().starts_with('.')) {
                     models.push(json!({"path": scripts::s(&m), "folder": m.file_name().map(|n| n.to_string_lossy().into_owned()), "bytes": disk_size(&m)}));

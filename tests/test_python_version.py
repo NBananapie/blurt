@@ -41,6 +41,10 @@ def test_fits_every_script():
 
 
 def test_ships_with_the_desktop_app():
-    conf = json.loads((ROOT / "apps" / "desktop" / "src-tauri" / "tauri.conf.json").read_text())
+    conf = json.loads((ROOT / "apps" / "desktop" / "src-tauri" / "tauri.conf.json").read_text(encoding="utf-8"))
     res = conf["bundle"]["resources"]
-    assert res.get("../../../skills/blurt/scripts/.python-version") == "scripts/.python-version"
+    assert res.get("../../../skills/blurt/scripts/.python-version") in (
+        "skill/scripts/.python-version",
+        "scripts/.python-version",
+    )
+    assert res.get("../../../skills/blurt/SKILL.md") == "skill/SKILL.md"

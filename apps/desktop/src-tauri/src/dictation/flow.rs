@@ -626,6 +626,18 @@ pub mod speech_models {
     pub fn streams(v: &Value) -> bool {
         selected_cloud(v) && v["selected"].as_str() == Some(STREAMS)
     }
+
+    /// The selected model's rehear window length (`asr_models.json` `rehear_window_s`: 30 s for Qwen3-ASR 1.7B, 20 s for 0.6B).
+    pub fn rehear_window_s(v: &Value) -> Option<f64> {
+        let sel = v["selected"].as_str()?;
+        v["models"]
+            .as_array()?
+            .iter()
+            .find(|r| r["id"].as_str() == Some(sel))?
+            .get("rehear_window_s")?
+            .as_f64()
+            .filter(|&w| w > 0.0)
+    }
 }
 
 /// The cloud-polish reminder (the Mac's DictationCloudReminder): once ever, after `AFTER_TAKES` dictations that went

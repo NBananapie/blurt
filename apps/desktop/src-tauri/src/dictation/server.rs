@@ -253,8 +253,8 @@ pub fn call(
     s.set_read_timeout(Some(slice.min(timeout))).ok()?;
     let t0 = Instant::now();
     let deadline = t0 + timeout;
-    // the hang check (not for a ping: `health` judges those)
-    let watch = r.pid.filter(|_| req["cmd"] != json!("ping"));
+    // the hang check (not for a ping: `health` judges those; not for polish: llama-server GPU or HTTPS uses 0 Python CPU)
+    let watch = r.pid.filter(|_| req["cmd"] != json!("ping") && name != POLISH);
     let mut cpu_last = watch.and_then(cpu_seconds);
     let mut still_since = Instant::now();
     let mut rd = BufReader::new(s);
